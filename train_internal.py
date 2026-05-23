@@ -10,16 +10,16 @@ from datasets.tau_sparse_dataset import TauSparseDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.physics_loss import PhysicsInformedLoss
 
-VERSION = "v2.3"
+VERSION = "v2.4"
 
 # ---- Hyperparameters -------------------------------------------------------
-EPOCHS          = 100
+EPOCHS          = 400
 BATCH_SIZE      = 4
 LEARNING_RATE   = 1e-4
 PATCH_SIZE      = 64
 NUM_TAU_CH      = 8
 MAX_TAU         = 64
-TRAIN_RATIO     = 0.02   # 2% sparse pixels (was 0.10; 0.005 is too aggressive)
+TRAIN_RATIO     = 0.05   # 5% sparse pixels
 RANDOM_TAU      = True   # randomly sample tau delays each step
 CHECKPOINT_DIR  = "./checkpoint"
 RESULT_DIR      = "./result"

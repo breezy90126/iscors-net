@@ -10,7 +10,7 @@ from datasets.tau_sparse_dataset import TauSparseDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.physics_loss import PhysicsInformedLoss
 
-VERSION = "v2.4"
+VERSION = "v2.5"
 
 # ---- Hyperparameters -------------------------------------------------------
 EPOCHS          = 400
@@ -19,7 +19,8 @@ LEARNING_RATE   = 1e-4
 PATCH_SIZE      = 64
 NUM_TAU_CH      = 8
 MAX_TAU         = 64
-TRAIN_RATIO     = 0.05   # 5% sparse pixels
+TRAIN_RATIO     = 0.02   # 2% — 5% with 400ep caused overfitting; TV reg handles it
+LAMBDA_TV       = 0.05   # Total Variation regularization weight
 RANDOM_TAU      = True   # randomly sample tau delays each step
 CHECKPOINT_DIR  = "./checkpoint"
 RESULT_DIR      = "./result"
@@ -61,7 +62,7 @@ def train_internal_learning():
     # ---- Model & Loss --------------------------------------------------------
     model     = PISSLTauEncoder(num_tau_channels=NUM_TAU_CH).to(device)
     criterion = PhysicsInformedLoss(lambda_gamma=1.0, lambda_alpha=1.0)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
     # ---- Training Loop -------------------------------------------------------
@@ -85,6 +86,15 @@ def train_internal_learning():
 
             # Masked loss — only center 3x3 pixels are supervised
             loss, loss_gamma, loss_alpha = criterion(preds, targets, mask)
+
+            # Total Variation regularization: penalise abrupt spatial changes.
+            # Diffusion parameters are physically smooth within each cell region,
+            # so TV discourages the model from overfitting individual training points.
+            tv = (
+                (preds[:, :, 1:, :] - preds[:, :, :-1, :]).abs().mean()
+                + (preds[:, :, :, 1:] - preds[:, :, :, :-1]).abs().mean()
+            )
+            loss = loss + LAMBDA_TV * tv
             loss.backward()
             optimizer.step()
 
@@ -95,6 +105,7 @@ def train_internal_learning():
                 "L":  f"{loss.item():.4f}",
                 "G":  f"{loss_gamma.item():.4f}",
                 "A":  f"{loss_alpha.item():.4f}",
+                "TV": f"{tv.item():.4f}",
             })
 
         n = len(train_loader)

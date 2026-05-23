@@ -1,0 +1,115 @@
+import torch
+import torch.nn as nn
+
+class DoubleConv(nn.Module):
+    """(convolution => [BN] => ReLU) * 2"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+
+class SubPixelConvUp(nn.Module):
+    """
+    Sub-Pixel Convolution (PixelShuffle) for upsampling.
+    Avoids the checkerboard artifacts commonly caused by ConvTranspose2d.
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # Expand channels by 4 for r=2 PixelShuffle
+        self.conv = nn.Conv2d(in_channels, out_channels * 4, kernel_size=1)
+        self.pixel_shuffle = nn.PixelShuffle(2)
+
+    def forward(self, x):
+        return self.pixel_shuffle(self.conv(x))
+
+class PISSLTauEncoder(nn.Module):
+    """
+    A 2D U-Net architecture specifically designed for Physics-Informed Temporal Sampling.
+    The input channels represent fixed exponential time delays (tau).
+    """
+    def __init__(self, num_tau_channels=8):
+        super(PISSLTauEncoder, self).__init__()
+        
+        # 1. Encoder (Downsampling)
+        # Input channels = number of tau slices (e.g., 8)
+        self.inc = DoubleConv(num_tau_channels, 64)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512))
+        
+        # 2. Decoder (Upsampling) with PixelShuffle
+        self.up1 = SubPixelConvUp(512, 256)
+        self.conv_up1 = DoubleConv(512, 256) # 256 + skip 256
+        
+        self.up2 = SubPixelConvUp(256, 128)
+        self.conv_up2 = DoubleConv(256, 128)
+        
+        self.up3 = SubPixelConvUp(128, 64)
+        self.conv_up3 = DoubleConv(128, 64)
+        
+        # 3. Physics-Guided Latent Projection Layer
+        # Maps the high-dimensional features (64 channels) to exactly 2 parameter maps:
+        # Channel 0: Gamma (Diffusion coefficient)
+        # Channel 1: Alpha (Anomalous exponent)
+        self.physics_projection = nn.Conv2d(64, 2, kernel_size=1)
+        
+        # Optional activations to enforce physical constraints:
+        # Gamma > 0 (Softplus ensures positivity without hard thresholding)
+        self.gamma_activation = nn.Softplus()
+        # Alpha is typically between 0.0 and 2.0. A scaled sigmoid can enforce this bound.
+        self.alpha_activation = nn.Sigmoid()
+
+    def forward(self, x):
+        # x shape: (B, num_tau_channels, H, W)
+        
+        # Encode
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        
+        # Decode with skip connections
+        u1 = self.up1(x4)
+        u1 = torch.cat([x3, u1], dim=1)
+        u1 = self.conv_up1(u1)
+        
+        u2 = self.up2(u1)
+        u2 = torch.cat([x2, u2], dim=1)
+        u2 = self.conv_up2(u2)
+        
+        u3 = self.up3(u2)
+        u3 = torch.cat([x1, u3], dim=1)
+        u3 = self.conv_up3(u3)
+        
+        # Physical Projection
+        # physics_maps shape: (B, 2, H, W)
+        physics_maps = self.physics_projection(u3)
+        
+        # Enforce physical constraints on the two channels
+        gamma_map = self.gamma_activation(physics_maps[:, 0:1, :, :])
+        # Scale alpha to be strictly between 0 and 2 (or customize limits based on theory)
+        alpha_map = self.alpha_activation(physics_maps[:, 1:2, :, :]) * 2.0 
+        
+        # Return as (B, 2, H, W)
+        return torch.cat([gamma_map, alpha_map], dim=1)
+
+if __name__ == "__main__":
+    # Test the model structure
+    # Batch size 4, 8 Tau channels, 64x64 patch
+    dummy_input = torch.randn(4, 8, 64, 64)
+    model = PISSLTauEncoder(num_tau_channels=8)
+    output = model(dummy_input)
+    
+    print(f"Input shape (B, Tau, H, W): {dummy_input.shape}")
+    print(f"Output shape (B, Gamma/Alpha, H, W): {output.shape}")
+    print(f"Gamma Map range: [{output[:,0].min().item():.3f}, {output[:,0].max().item():.3f}]")
+    print(f"Alpha Map range: [{output[:,1].min().item():.3f}, {output[:,1].max().item():.3f}]")

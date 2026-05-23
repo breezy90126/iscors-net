@@ -10,7 +10,7 @@ from datasets.tau_sparse_dataset import TauSparseDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.physics_loss import PhysicsInformedLoss
 
-VERSION = "v2.5"
+VERSION = "v2.6"
 
 # ---- Hyperparameters -------------------------------------------------------
 EPOCHS          = 400
@@ -19,9 +19,8 @@ LEARNING_RATE   = 1e-4
 PATCH_SIZE      = 64
 NUM_TAU_CH      = 8
 MAX_TAU         = 64
-TRAIN_RATIO     = 0.10   # 10% sparse pixels (TV + pretrain handle overfitting)
+TRAIN_RATIO     = 0.10   # 10% sparse pixels (TV + weight_decay handle overfitting)
 LAMBDA_TV       = 0.05   # Total Variation regularization weight
-PRETRAIN_PATH   = "./checkpoint/pissl_pretrained.pth"
 RANDOM_TAU      = True   # randomly sample tau delays each step
 CHECKPOINT_DIR  = "./checkpoint"
 RESULT_DIR      = "./result"
@@ -61,13 +60,7 @@ def train_internal_learning():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     # ---- Model & Loss --------------------------------------------------------
-    model = PISSLTauEncoder(num_tau_channels=NUM_TAU_CH).to(device)
-    if os.path.exists(PRETRAIN_PATH):
-        model.load_state_dict(torch.load(PRETRAIN_PATH, map_location=device))
-        print(f"Loaded pretrained weights from {PRETRAIN_PATH}")
-    else:
-        print("No pretrained weights found — training from scratch.")
-
+    model     = PISSLTauEncoder(num_tau_channels=NUM_TAU_CH).to(device)
     criterion = PhysicsInformedLoss(lambda_gamma=1.0, lambda_alpha=1.0)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)

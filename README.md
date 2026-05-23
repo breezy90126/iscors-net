@@ -92,5 +92,31 @@ python train_internal.py              # 訓練
 
 | 版本 | 變更 |
 |---|---|
+| **v2.1** | 修正 3 個訓練失敗根本原因（GT 過濾、輸入 normalization、bilinear 取代 PixelShuffle、Gamma bounded） |
 | **v2.0** | FFT+Hann 自相關、隨機 tau、center 3×3 masked loss、train_ratio=0.02 |
 | v1.x | 舊 zip 上傳流程、固定 tau、無 mask（已廢棄） |
+
+---
+
+## 模擬影片設計說明
+
+`utils/generate_test_video.py` 生成三個擴散區域 + 靜態背景：
+
+| 區域 | Gamma | Alpha | 說明 |
+|---|---|---|---|
+| 細胞本體（大圓） | 0.1 | 1.0 | 正常擴散 |
+| 細胞器 1（左上小圓） | 0.5 | 1.5 | 快速異常擴散 |
+| 細胞器 2（右下小圓） | 0.05 | 0.5 | 慢速次擴散 |
+| 背景 | 0.0 | 0.0 | 近靜態（std=0.05）|
+
+### 為什麼背景要近靜態（std=0.05）
+
+舊版：`gamma=0` → `generate_signal_with_autocorr` 返回白噪音，variance=10，CV≈3.2%，與細胞像素相同 → curve fitting 跑出亂的 gamma 值（可能很大），汙染 GT。
+
+新版：背景 std=0.05，CV=0.05% << 細胞 CV 3.2%。`fit_physical_parameters` 用 CV < 0.5% 作為靜態判斷，直接返回 (0,0)，不跑 fitting。
+
+### 為什麼 T=500（舊版 T=200）
+
+`max_tau=64` 需要計算到 G(tau=64)，每個 lag 的統計樣本數 = T - tau。
+- T=200：最大 lag 的樣本數 = 200-64 = **136**（統計不足）
+- T=500：最大 lag 的樣本數 = 500-64 = **436**（穩定）

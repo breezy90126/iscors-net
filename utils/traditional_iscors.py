@@ -47,14 +47,20 @@ def theoretical_g_tau(tau, gamma, alpha, amplitude):
 
 def fit_physical_parameters(trace, max_tau=64):
     """
-    Given a single pixel's time trace (e.g., 500 frames), compute the 
-    autocorrelation and fit it to extract Gamma and Alpha.
-    
-    Returns:
-        gamma, alpha
+    Compute autocorrelation of a pixel trace and fit gamma / alpha.
+
+    Background detection uses coefficient of variation (CV = std/mean):
+        - Near-static background: CV < 0.5%  → return (0.0, 0.0)
+        - Cell pixels:            CV ≈ 3%    → proceed with fitting
+    This replaces the old `np.var < 1e-8` check, which missed background
+    pixels generated with white noise (variance=10, so var >> 1e-8).
     """
-    if np.var(trace) < 1e-8:
-        # Static background, no dynamics
+    mean_I = np.mean(trace)
+    if mean_I == 0:
+        return 0.0, 0.0
+
+    cv = np.std(trace) / (mean_I + 1e-10)
+    if cv < 0.005:   # CV < 0.5% → near-static, no dynamics to fit
         return 0.0, 0.0
         
     # 1. Compute empirical G_rough(tau)

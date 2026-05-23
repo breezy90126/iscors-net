@@ -3,25 +3,34 @@ from scipy.optimize import curve_fit
 
 def compute_autocorrelation(trace):
     """
-    Computes the temporal autocorrelation of a 1D intensity trace.
-    Uses numpy.correlate for efficiency.
+    FFT-based autocorrelation with Hann windowing (Wiener-Khinchin theorem).
+    Hann window reduces spectral leakage; FFT gives O(N log N) vs O(N^2).
+    Window bias is corrected by dividing by the window self-correlation per lag.
     """
-    # Normalize trace by subtracting mean
+    N = len(trace)
     mean_I = np.mean(trace)
     if mean_I == 0:
-        return np.zeros(len(trace) // 2)
-        
+        return np.zeros(N // 2)
+
     fluct = trace - mean_I
-    # Full cross-correlation of fluct with itself
-    corr = np.correlate(fluct, fluct, mode='full')
-    # Take the second half (tau >= 0)
-    corr = corr[len(corr)//2:]
-    
-    # Normalize by the number of overlapping points and mean intensity squared
-    N = len(trace)
-    lags = np.arange(len(corr))
+
+    # Hann window to reduce spectral leakage
+    window = np.hanning(N)
+    fluct_w = fluct * window
+
+    # Zero-pad to next power of 2 for FFT efficiency
+    fft_len = int(2 ** np.ceil(np.log2(2 * N)))
+
+    # Autocorrelation via Wiener-Khinchin: IFFT(|FFT(x)|^2)
+    F = np.fft.rfft(fluct_w, n=fft_len)
+    corr = np.fft.irfft(F * np.conj(F), n=fft_len)[:N].real
+
+    # Window bias correction: divide by window self-correlation at each lag
+    W = np.fft.rfft(window, n=fft_len)
+    w_corr = np.fft.irfft(W * np.conj(W), n=fft_len)[:N].real
+
     # G(tau) = <dI(t)dI(t+tau)> / <I>^2
-    g_tau = corr / ((N - lags) * (mean_I ** 2) + 1e-10)
+    g_tau = corr / (w_corr * mean_I ** 2 + 1e-10)
     return g_tau
 
 def theoretical_g_tau(tau, gamma, alpha, amplitude):

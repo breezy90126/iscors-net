@@ -6,144 +6,153 @@ import numpy as np
 import tqdm
 import matplotlib.pyplot as plt
 
-# Import our newly created modules
 from datasets.tau_sparse_dataset import TauSparseDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.physics_loss import PhysicsInformedLoss
 
+VERSION = "v2.0"
+
+# ---- Hyperparameters -------------------------------------------------------
+EPOCHS          = 30
+BATCH_SIZE      = 4
+LEARNING_RATE   = 1e-4
+PATCH_SIZE      = 64
+NUM_TAU_CH      = 8
+MAX_TAU         = 64
+TRAIN_RATIO     = 0.02   # 2% sparse pixels (was 0.10; 0.005 is too aggressive)
+RANDOM_TAU      = True   # randomly sample tau delays each step
+CHECKPOINT_DIR  = "./checkpoint"
+RESULT_DIR      = "./result"
+# ----------------------------------------------------------------------------
+
+
 def train_internal_learning():
-    # ==========================================
-    # 1. Configuration
-    # ==========================================
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    epochs = 30
-    batch_size = 4
-    learning_rate = 1e-4
-    tau_delays = (0, 1, 2, 4, 8, 16, 32, 64)
-    patch_size = 64
-    
-    checkpoint_dir = './checkpoint'
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    # ==========================================
-    # 2. Data Preparation
-    # ==========================================
-    print("Loading 'Real' Cell Video (Generated test video)...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[{VERSION}] Using device: {device}")
+
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(RESULT_DIR, exist_ok=True)
+
+    # ---- Data ----------------------------------------------------------------
+    print("Loading cell video...")
     import tifffile
     video_path = "./data/test_synthetic_cell.tif"
     if not os.path.exists(video_path):
-        print(f"Error: {video_path} not found. Please run utils/generate_test_video.py first.")
+        print(f"Error: {video_path} not found. Run utils/generate_test_video.py first.")
         return
-        
+
     video_matrix = tifffile.imread(video_path).astype(np.float32)
     T, H, W = video_matrix.shape
-    print(f"Loaded video with shape: (T={T}, H={H}, W={W})")
-    
-    # We create the dataset. This dataset will automatically sample 1% of the pixels
-    # and provide dummy GT for them.
+    print(f"Video shape: T={T}, H={H}, W={W}")
+
     train_dataset = TauSparseDataset(
         video_tensor=video_matrix,
-        tau_delays=tau_delays,
-        patch_size=patch_size,
-        mode='train',
-        train_ratio=0.10  # 10% internal learning for higher quality
+        tau_delays=tuple(sorted(range(0, MAX_TAU + 1, MAX_TAU // (NUM_TAU_CH - 1)))[:NUM_TAU_CH]),
+        patch_size=PATCH_SIZE,
+        mode="train",
+        train_ratio=TRAIN_RATIO,
+        random_tau=RANDOM_TAU,
+        num_tau_channels=NUM_TAU_CH,
+        max_tau=MAX_TAU,
     )
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    
-    # ==========================================
-    # 3. Model & Loss Setup
-    # ==========================================
-    model = PISSLTauEncoder(num_tau_channels=len(tau_delays)).to(device)
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    # ---- Model & Loss --------------------------------------------------------
+    model     = PISSLTauEncoder(num_tau_channels=NUM_TAU_CH).to(device)
     criterion = PhysicsInformedLoss(lambda_gamma=1.0, lambda_alpha=1.0)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    
-    # ==========================================
-    # 4. Training Loop (Internal Learning)
-    # ==========================================
-    print(f"Starting Internal Learning on 10% sparse data ({len(train_dataset)} patches/epoch)...")
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    # ---- Training Loop -------------------------------------------------------
+    print(f"Starting Internal Learning [{VERSION}]: {len(train_dataset)} patches/epoch, "
+          f"train_ratio={TRAIN_RATIO}, random_tau={RANDOM_TAU}")
+
     model.train()
-    
-    for epoch in range(epochs):
-        epoch_loss = 0.0
-        epoch_gamma_loss = 0.0
-        epoch_alpha_loss = 0.0
-        
-        pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
-        for inputs, targets in pbar:
-            # inputs: (B, 8, P, P)
-            # targets: (B, 2, P, P) - Channel 0 is Gamma, 1 is Alpha
-            inputs, targets = inputs.to(device), targets.to(device)
-            
+    history = {"loss": [], "gamma": [], "alpha": []}
+
+    for epoch in range(EPOCHS):
+        epoch_loss = epoch_gamma = epoch_alpha = 0.0
+        pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+
+        for inputs, targets, mask in pbar:
+            inputs  = inputs.to(device)
+            targets = targets.to(device)
+            mask    = mask.to(device)
+
             optimizer.zero_grad()
-            
-            # Forward pass
             preds = model(inputs)
-            
-            # Calculate Physics Loss
-            loss, loss_gamma, loss_alpha = criterion(preds, targets)
-            
-            # Backward pass
+
+            # Masked loss — only center 3x3 pixels are supervised
+            loss, loss_gamma, loss_alpha = criterion(preds, targets, mask)
             loss.backward()
             optimizer.step()
-            
-            epoch_loss += loss.item()
-            epoch_gamma_loss += loss_gamma.item()
-            epoch_alpha_loss += loss_alpha.item()
-            
-            pbar.set_postfix({'Loss': loss.item(), 'G': loss_gamma.item(), 'A': loss_alpha.item()})
-            
-        avg_loss = epoch_loss / len(train_loader)
-        print(f"Epoch [{epoch+1}/{epochs}] Average Loss: {avg_loss:.4f}")
-        
-    # Save the internally trained model
-    save_path = os.path.join(checkpoint_dir, 'pissl_internal_model.pth')
-    torch.save(model.state_dict(), save_path)
-    print(f"Training complete. Model saved to {save_path}")
-    
-    # ==========================================
-    # 5. Full Frame Inference Demonstration
-    # ==========================================
-    print("\n--- Starting Full Frame Inference ---")
+
+            epoch_loss  += loss.item()
+            epoch_gamma += loss_gamma.item()
+            epoch_alpha += loss_alpha.item()
+            pbar.set_postfix({
+                "L":  f"{loss.item():.4f}",
+                "G":  f"{loss_gamma.item():.4f}",
+                "A":  f"{loss_alpha.item():.4f}",
+            })
+
+        n = len(train_loader)
+        history["loss"].append(epoch_loss / n)
+        history["gamma"].append(epoch_gamma / n)
+        history["alpha"].append(epoch_alpha / n)
+        print(f"Epoch [{epoch+1}/{EPOCHS}] "
+              f"Loss={epoch_loss/n:.4f}  Gamma={epoch_gamma/n:.4f}  Alpha={epoch_alpha/n:.4f}")
+
+    # ---- Save checkpoint -----------------------------------------------------
+    ckpt_path = os.path.join(CHECKPOINT_DIR, f"pissl_internal_{VERSION}.pth")
+    torch.save(model.state_dict(), ckpt_path)
+    print(f"Model saved → {ckpt_path}")
+
+    # ---- Loss curve ----------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(history["loss"],  label="Total")
+    ax.plot(history["gamma"], label="Gamma")
+    ax.plot(history["alpha"], label="Alpha")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title(f"Internal Learning Loss [{VERSION}]")
+    ax.legend()
+    loss_fig_path = os.path.join(RESULT_DIR, f"loss_curve_{VERSION}.png")
+    fig.savefig(loss_fig_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Loss curve saved → {loss_fig_path}")
+
+    # ---- Full-frame inference ------------------------------------------------
+    print("\n--- Full Frame Inference ---")
     model.eval()
-    
-    # We create an inference dataset (fetches the full frame instead of patches)
+
     inference_dataset = TauSparseDataset(
         video_tensor=video_matrix,
-        tau_delays=tau_delays,
-        mode='inference'
+        tau_delays=(0, 9, 18, 27, 36, 45, 54, 64),
+        mode="inference",
     )
-    
-    # The dataset returns a single tensor of shape (8, H, W)
-    full_frame_input = inference_dataset[0].unsqueeze(0).to(device) # Add batch dim: (1, 8, H, W)
-    
+
+    full_input = inference_dataset[0].unsqueeze(0).to(device)
     with torch.no_grad():
-        preds_full = model(full_frame_input) # Output: (1, 2, H, W)
-        
-    gamma_map = preds_full[0, 0, :, :].cpu().numpy()
-    alpha_map = preds_full[0, 1, :, :].cpu().numpy()
-    
-    print(f"Inference complete!")
-    print(f"Gamma Map shape: {gamma_map.shape}, mean: {gamma_map.mean():.3f}")
-    print(f"Alpha Map shape: {alpha_map.shape}, mean: {alpha_map.mean():.3f}")
-    
-    # Optional: Save dummy visualization
-    plt.figure(figsize=(10, 4))
-    plt.subplot(1, 2, 1)
-    plt.imshow(gamma_map, cmap='magma')
-    plt.title('Predicted Gamma Map')
-    plt.colorbar()
-    
-    plt.subplot(1, 2, 2)
-    plt.imshow(alpha_map, cmap='viridis')
-    plt.title('Predicted Alpha Map')
-    plt.colorbar()
-    
-    os.makedirs('./result', exist_ok=True)
-    plt.savefig('./result/inference_maps.png')
-    print("Saved inference visualization to ./result/inference_maps.png")
+        preds_full = model(full_input)
+
+    gamma_map = preds_full[0, 0].cpu().numpy()
+    alpha_map = preds_full[0, 1].cpu().numpy()
+    print(f"Gamma map: mean={gamma_map.mean():.3f}")
+    print(f"Alpha map: mean={alpha_map.mean():.3f}")
+
+    fig2, axes = plt.subplots(1, 2, figsize=(10, 4))
+    im0 = axes[0].imshow(gamma_map, cmap="magma")
+    axes[0].set_title(f"Gamma Map [{VERSION}]")
+    plt.colorbar(im0, ax=axes[0])
+    im1 = axes[1].imshow(alpha_map, cmap="viridis")
+    axes[1].set_title(f"Alpha Map [{VERSION}]")
+    plt.colorbar(im1, ax=axes[1])
+    inf_path = os.path.join(RESULT_DIR, f"inference_maps_{VERSION}.png")
+    fig2.savefig(inf_path, dpi=120, bbox_inches="tight")
+    plt.close(fig2)
+    print(f"Inference maps saved → {inf_path}")
+
 
 if __name__ == "__main__":
     train_internal_learning()

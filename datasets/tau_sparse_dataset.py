@@ -137,6 +137,10 @@ class TauSparseDataset(Dataset):
             t = 0
             frames = [self.video[t + tau] for tau in self.tau_delays]
             sparse_tensor = np.stack(frames, axis=0).astype(np.float32)
+            # Same normalization as training — critical to avoid distribution mismatch
+            mu = sparse_tensor.mean()
+            sig = sparse_tensor.std() + 1e-8
+            sparse_tensor = (sparse_tensor - mu) / sig
             return torch.from_numpy(sparse_tensor)
 
 

@@ -10,10 +10,15 @@ class TauSparseDataset(Dataset):
     Dataset for Internal Learning on a single video.
     Physics-Informed Temporal Sampling with optional random tau selection
     and center 3x3 supervised mask for sparse pixel supervision.
+
+    When gt_npz_path is provided (synthetic validation), GT is loaded directly
+    from the perfect simulation labels — no curve fitting needed.
+    When gt_npz_path is None (real data), GT is estimated per-pixel via curve fitting.
     """
     def __init__(self, video_tensor, tau_delays=(0, 1, 2, 4, 8, 16, 32, 64),
                  patch_size=64, mode='train', train_ratio=0.01,
-                 random_tau=True, num_tau_channels=8, max_tau=64):
+                 random_tau=True, num_tau_channels=8, max_tau=64,
+                 gt_npz_path=None):
         """
         Args:
             video_tensor: (T, H, W) float array.
@@ -52,30 +57,42 @@ class TauSparseDataset(Dataset):
         self.gt_alpha = {}
 
         if self.mode == 'train':
-            print(f"Pre-calculating GT for {len(self.train_coords)} sparse pixels ({train_ratio*100:.1f}%)...")
-            for coord in tqdm(self.train_coords):
-                y, x = coord
-                trace = self.video[:, y, x]
-                gamma_val, alpha_val = fit_physical_parameters(trace, max_tau=self.max_tau)
-                self.gt_gamma[coord] = gamma_val
-                self.gt_alpha[coord] = alpha_val
-            print("GT pre-calculation complete!")
+            if gt_npz_path is not None:
+                # Perfect GT from simulation — zero noise, no curve fitting needed
+                print(f"Loading perfect GT from {gt_npz_path} ...")
+                gt = np.load(gt_npz_path)
+                gt_gamma_map = gt["gamma"]
+                gt_alpha_map = gt["alpha"]
+                for coord in self.train_coords:
+                    y, x = coord
+                    self.gt_gamma[coord] = float(gt_gamma_map[y, x])
+                    self.gt_alpha[coord] = float(gt_alpha_map[y, x])
+                print(f"Perfect GT loaded for {len(self.train_coords)} pixels.")
+            else:
+                # Real data: estimate GT per-pixel via curve fitting
+                print(f"Pre-calculating GT for {len(self.train_coords)} sparse pixels ({train_ratio*100:.1f}%)...")
+                for coord in tqdm(self.train_coords):
+                    y, x = coord
+                    trace = self.video[:, y, x]
+                    gamma_val, alpha_val = fit_physical_parameters(trace, max_tau=self.max_tau)
+                    self.gt_gamma[coord] = gamma_val
+                    self.gt_alpha[coord] = alpha_val
+                print("GT pre-calculation complete!")
 
-            # Keep two classes of pixels:
-            #   1. Background (gamma==0, alpha==0): CV filter returned (0,0) → GT is correct,
-            #      model learns to predict zero for near-static pixels.
-            #   2. Cell (0 < gamma <= MAX_GAMMA, 0 < alpha <= 2): valid diffusion parameters.
-            # Reject only genuinely failed fits (e.g. gamma > MAX_GAMMA from old noisy fitting).
-            MAX_GAMMA = 2.0
-            valid = [c for c in self.train_coords
-                     if (self.gt_gamma[c] == 0.0 and self.gt_alpha[c] == 0.0)          # background
-                     or (0 < self.gt_gamma[c] <= MAX_GAMMA and 0 < self.gt_alpha[c] <= 2.0)]  # cell
-            n_bg   = sum(1 for c in valid if self.gt_gamma[c] == 0.0)
-            n_cell = len(valid) - n_bg
-            print(f"Valid GT pixels: {len(valid)}/{len(self.train_coords)}  "
-                  f"(background={n_bg}, cell={n_cell})")
-            if valid:
-                self.train_coords = valid
+                # Keep two classes of pixels:
+                #   1. Background (gamma==0, alpha==0): CV filter returned (0,0).
+                #   2. Cell (0 < gamma <= MAX_GAMMA, 0 < alpha <= 2): valid diffusion.
+                # Reject genuinely failed fits.
+                MAX_GAMMA = 2.0
+                valid = [c for c in self.train_coords
+                         if (self.gt_gamma[c] == 0.0 and self.gt_alpha[c] == 0.0)
+                         or (0 < self.gt_gamma[c] <= MAX_GAMMA and 0 < self.gt_alpha[c] <= 2.0)]
+                n_bg   = sum(1 for c in valid if self.gt_gamma[c] == 0.0)
+                n_cell = len(valid) - n_bg
+                print(f"Valid GT pixels: {len(valid)}/{len(self.train_coords)}  "
+                      f"(background={n_bg}, cell={n_cell})")
+                if valid:
+                    self.train_coords = valid
 
             gamma_vals = [self.gt_gamma[c] for c in self.train_coords]
             alpha_vals = [self.gt_alpha[c] for c in self.train_coords]

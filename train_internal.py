@@ -10,7 +10,7 @@ from datasets.tau_sparse_dataset import TauSparseDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.physics_loss import PhysicsInformedLoss
 
-VERSION = "v2.6"
+VERSION = "v2.7"
 
 # ---- Hyperparameters -------------------------------------------------------
 EPOCHS          = 400
@@ -46,6 +46,15 @@ def train_internal_learning():
     T, H, W = video_matrix.shape
     print(f"Video shape: T={T}, H={H}, W={W}")
 
+    # Use perfect GT from simulation when available (synthetic validation).
+    # For real data (no _gt.npz), set gt_npz_path=None to use curve fitting.
+    gt_npz_path = video_path.replace(".tif", "_gt.npz")
+    if os.path.exists(gt_npz_path):
+        print(f"Perfect GT found: {gt_npz_path} — skipping curve fitting.")
+    else:
+        gt_npz_path = None
+        print("No perfect GT found — will estimate GT via curve fitting.")
+
     train_dataset = TauSparseDataset(
         video_tensor=video_matrix,
         tau_delays=tuple(sorted(range(0, MAX_TAU + 1, MAX_TAU // (NUM_TAU_CH - 1)))[:NUM_TAU_CH]),
@@ -55,6 +64,7 @@ def train_internal_learning():
         random_tau=RANDOM_TAU,
         num_tau_channels=NUM_TAU_CH,
         max_tau=MAX_TAU,
+        gt_npz_path=gt_npz_path,
     )
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)

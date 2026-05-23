@@ -10,7 +10,7 @@ from datasets.tau_sparse_dataset import TauSparseDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.physics_loss import PhysicsInformedLoss
 
-VERSION = "v2.0"
+VERSION = "v2.1"
 
 # ---- Hyperparameters -------------------------------------------------------
 EPOCHS          = 30

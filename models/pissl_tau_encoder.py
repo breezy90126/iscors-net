@@ -17,19 +17,18 @@ class DoubleConv(nn.Module):
     def forward(self, x):
         return self.double_conv(x)
 
-class SubPixelConvUp(nn.Module):
+class BilinearUp(nn.Module):
     """
-    Sub-Pixel Convolution (PixelShuffle) for upsampling.
-    Avoids the checkerboard artifacts commonly caused by ConvTranspose2d.
+    Bilinear upsampling + 1x1 conv. No checkerboard artifacts.
+    PixelShuffle without ICNR initialisation produces 2x2 grid artifacts.
     """
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        # Expand channels by 4 for r=2 PixelShuffle
-        self.conv = nn.Conv2d(in_channels, out_channels * 4, kernel_size=1)
-        self.pixel_shuffle = nn.PixelShuffle(2)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
     def forward(self, x):
-        return self.pixel_shuffle(self.conv(x))
+        return self.conv(self.up(x))
 
 class PISSLTauEncoder(nn.Module):
     """
@@ -47,13 +46,13 @@ class PISSLTauEncoder(nn.Module):
         self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512))
         
         # 2. Decoder (Upsampling) with PixelShuffle
-        self.up1 = SubPixelConvUp(512, 256)
+        self.up1 = BilinearUp(512, 256)
         self.conv_up1 = DoubleConv(512, 256) # 256 + skip 256
         
-        self.up2 = SubPixelConvUp(256, 128)
+        self.up2 = BilinearUp(256, 128)
         self.conv_up2 = DoubleConv(256, 128)
         
-        self.up3 = SubPixelConvUp(128, 64)
+        self.up3 = BilinearUp(128, 64)
         self.conv_up3 = DoubleConv(128, 64)
         
         # 3. Physics-Guided Latent Projection Layer
@@ -62,10 +61,10 @@ class PISSLTauEncoder(nn.Module):
         # Channel 1: Alpha (Anomalous exponent)
         self.physics_projection = nn.Conv2d(64, 2, kernel_size=1)
         
-        # Optional activations to enforce physical constraints:
-        # Gamma > 0 (Softplus ensures positivity without hard thresholding)
-        self.gamma_activation = nn.Softplus()
-        # Alpha is typically between 0.0 and 2.0. A scaled sigmoid can enforce this bound.
+        # Gamma ∈ (0, 1.0)  — GT max is 0.5, Sigmoid keeps prediction in range
+        # Softplus was unbounded and caused gamma_pred to drift to ~7.7 (no convergence)
+        self.gamma_activation = nn.Sigmoid()
+        # Alpha ∈ (0, 2.0)
         self.alpha_activation = nn.Sigmoid()
 
     def forward(self, x):
@@ -95,9 +94,8 @@ class PISSLTauEncoder(nn.Module):
         physics_maps = self.physics_projection(u3)
         
         # Enforce physical constraints on the two channels
-        gamma_map = self.gamma_activation(physics_maps[:, 0:1, :, :])
-        # Scale alpha to be strictly between 0 and 2 (or customize limits based on theory)
-        alpha_map = self.alpha_activation(physics_maps[:, 1:2, :, :]) * 2.0 
+        gamma_map = self.gamma_activation(physics_maps[:, 0:1, :, :])          # (0, 1)
+        alpha_map = self.alpha_activation(physics_maps[:, 1:2, :, :]) * 2.0   # (0, 2)
         
         # Return as (B, 2, H, W)
         return torch.cat([gamma_map, alpha_map], dim=1)

@@ -61,6 +61,24 @@ class TauSparseDataset(Dataset):
                 self.gt_alpha[coord] = alpha_val
             print("GT pre-calculation complete!")
 
+            # Filter out pixels where fitting failed or gave physically unreasonable values.
+            # Background (white noise) pixels typically return gamma >> 1 or exactly 0.0.
+            MAX_GAMMA = 2.0
+            valid = [c for c in self.train_coords
+                     if 0 < self.gt_gamma[c] <= MAX_GAMMA and 0 < self.gt_alpha[c] <= 2.0]
+            print(f"Valid GT pixels: {len(valid)}/{len(self.train_coords)} "
+                  f"({100*len(valid)/max(1,len(self.train_coords)):.1f}%)")
+            if valid:
+                self.train_coords = valid
+
+            gamma_vals = [self.gt_gamma[c] for c in self.train_coords]
+            alpha_vals = [self.gt_alpha[c] for c in self.train_coords]
+            import statistics
+            print(f"GT Gamma — mean={statistics.mean(gamma_vals):.3f}  "
+                  f"min={min(gamma_vals):.3f}  max={max(gamma_vals):.3f}")
+            print(f"GT Alpha — mean={statistics.mean(alpha_vals):.3f}  "
+                  f"min={min(alpha_vals):.3f}  max={max(alpha_vals):.3f}")
+
     def _sample_taus(self):
         """Randomly sample num_tau_channels unique tau values from [0, max_tau]."""
         pool = range(0, self.max_tau + 1)
@@ -94,6 +112,11 @@ class TauSparseDataset(Dataset):
 
             # (num_tau_channels, P, P)
             sparse_tensor = np.stack(frames, axis=0).astype(np.float32)
+
+            # Normalize per-sample so the network sees fluctuations, not DC level
+            mu = sparse_tensor.mean()
+            sig = sparse_tensor.std() + 1e-8
+            sparse_tensor = (sparse_tensor - mu) / sig
 
             gamma_gt = self.gt_gamma[(y, x)]
             alpha_gt = self.gt_alpha[(y, x)]

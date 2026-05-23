@@ -61,13 +61,19 @@ class TauSparseDataset(Dataset):
                 self.gt_alpha[coord] = alpha_val
             print("GT pre-calculation complete!")
 
-            # Filter out pixels where fitting failed or gave physically unreasonable values.
-            # Background (white noise) pixels typically return gamma >> 1 or exactly 0.0.
+            # Keep two classes of pixels:
+            #   1. Background (gamma==0, alpha==0): CV filter returned (0,0) → GT is correct,
+            #      model learns to predict zero for near-static pixels.
+            #   2. Cell (0 < gamma <= MAX_GAMMA, 0 < alpha <= 2): valid diffusion parameters.
+            # Reject only genuinely failed fits (e.g. gamma > MAX_GAMMA from old noisy fitting).
             MAX_GAMMA = 2.0
             valid = [c for c in self.train_coords
-                     if 0 < self.gt_gamma[c] <= MAX_GAMMA and 0 < self.gt_alpha[c] <= 2.0]
-            print(f"Valid GT pixels: {len(valid)}/{len(self.train_coords)} "
-                  f"({100*len(valid)/max(1,len(self.train_coords)):.1f}%)")
+                     if (self.gt_gamma[c] == 0.0 and self.gt_alpha[c] == 0.0)          # background
+                     or (0 < self.gt_gamma[c] <= MAX_GAMMA and 0 < self.gt_alpha[c] <= 2.0)]  # cell
+            n_bg   = sum(1 for c in valid if self.gt_gamma[c] == 0.0)
+            n_cell = len(valid) - n_bg
+            print(f"Valid GT pixels: {len(valid)}/{len(self.train_coords)}  "
+                  f"(background={n_bg}, cell={n_cell})")
             if valid:
                 self.train_coords = valid
 

@@ -142,15 +142,15 @@ def train_internal_learning():
     gamma_map = preds_full[0, 0].cpu().numpy()
     alpha_map = preds_full[0, 1].cpu().numpy()
 
-    # Background mask: pixels with temporal CV < 0.5% are static (background)
-    # Zero them out — the model was never trained on these pixels
-    temporal_std  = video_matrix.std(axis=0)   # (H, W)
+    # Background mask via temporal CV (safety net only — model is now trained on background
+    # pixels with GT=(0,0), so it should predict near-zero without this mask)
+    temporal_std  = video_matrix.std(axis=0)
     temporal_mean = video_matrix.mean(axis=0)
-    cv_map = temporal_std / (temporal_mean + 1e-10)
-    bg_mask = cv_map < 0.005                   # True = background
+    cv_map  = temporal_std / (temporal_mean + 1e-10)
+    bg_mask = cv_map < 0.005
     gamma_map[bg_mask] = 0.0
     alpha_map[bg_mask] = 0.0
-    print(f"Background pixels masked: {bg_mask.sum()} / {bg_mask.size}")
+    print(f"Background pixels (CV<0.5%): {bg_mask.sum()} / {bg_mask.size}")
     print(f"Gamma map: mean={gamma_map[~bg_mask].mean():.3f}  (cell pixels only)")
     print(f"Alpha map: mean={alpha_map[~bg_mask].mean():.3f}  (cell pixels only)")
 

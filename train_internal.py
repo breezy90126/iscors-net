@@ -10,10 +10,10 @@ from datasets.tau_sparse_dataset import TauSparseDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.physics_loss import PhysicsInformedLoss
 
-VERSION = "v2.2"
+VERSION = "v2.3"
 
 # ---- Hyperparameters -------------------------------------------------------
-EPOCHS          = 50
+EPOCHS          = 100
 BATCH_SIZE      = 4
 LEARNING_RATE   = 1e-4
 PATCH_SIZE      = 64
@@ -62,6 +62,7 @@ def train_internal_learning():
     model     = PISSLTauEncoder(num_tau_channels=NUM_TAU_CH).to(device)
     criterion = PhysicsInformedLoss(lambda_gamma=1.0, lambda_alpha=1.0)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
     # ---- Training Loop -------------------------------------------------------
     print(f"Starting Internal Learning [{VERSION}]: {len(train_dataset)} patches/epoch, "
@@ -97,11 +98,13 @@ def train_internal_learning():
             })
 
         n = len(train_loader)
+        scheduler.step()
         history["loss"].append(epoch_loss / n)
         history["gamma"].append(epoch_gamma / n)
         history["alpha"].append(epoch_alpha / n)
         print(f"Epoch [{epoch+1}/{EPOCHS}] "
-              f"Loss={epoch_loss/n:.4f}  Gamma={epoch_gamma/n:.4f}  Alpha={epoch_alpha/n:.4f}")
+              f"Loss={epoch_loss/n:.4f}  Gamma={epoch_gamma/n:.4f}  Alpha={epoch_alpha/n:.4f}  "
+              f"LR={scheduler.get_last_lr()[0]:.2e}")
 
     # ---- Save checkpoint -----------------------------------------------------
     ckpt_path = os.path.join(CHECKPOINT_DIR, f"pissl_internal_{VERSION}.pth")
@@ -138,16 +141,46 @@ def train_internal_learning():
 
     gamma_map = preds_full[0, 0].cpu().numpy()
     alpha_map = preds_full[0, 1].cpu().numpy()
-    print(f"Gamma map: mean={gamma_map.mean():.3f}")
-    print(f"Alpha map: mean={alpha_map.mean():.3f}")
 
-    fig2, axes = plt.subplots(1, 2, figsize=(10, 4))
-    im0 = axes[0].imshow(gamma_map, cmap="magma")
-    axes[0].set_title(f"Gamma Map [{VERSION}]")
+    # Background mask: pixels with temporal CV < 0.5% are static (background)
+    # Zero them out — the model was never trained on these pixels
+    temporal_std  = video_matrix.std(axis=0)   # (H, W)
+    temporal_mean = video_matrix.mean(axis=0)
+    cv_map = temporal_std / (temporal_mean + 1e-10)
+    bg_mask = cv_map < 0.005                   # True = background
+    gamma_map[bg_mask] = 0.0
+    alpha_map[bg_mask] = 0.0
+    print(f"Background pixels masked: {bg_mask.sum()} / {bg_mask.size}")
+    print(f"Gamma map: mean={gamma_map[~bg_mask].mean():.3f}  (cell pixels only)")
+    print(f"Alpha map: mean={alpha_map[~bg_mask].mean():.3f}  (cell pixels only)")
+
+    # Load perfect GT if available for side-by-side comparison
+    gt_path = "./data/test_synthetic_cell_gt.npz"
+    has_gt = os.path.exists(gt_path)
+    if has_gt:
+        gt = np.load(gt_path)
+        gt_gamma, gt_alpha = gt["gamma"], gt["alpha"]
+
+    ncols = 4 if has_gt else 2
+    fig2, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 4))
+
+    im0 = axes[0].imshow(gamma_map, cmap="magma", vmin=0, vmax=1.0)
+    axes[0].set_title(f"Pred Gamma [{VERSION}]")
     plt.colorbar(im0, ax=axes[0])
-    im1 = axes[1].imshow(alpha_map, cmap="viridis")
-    axes[1].set_title(f"Alpha Map [{VERSION}]")
+
+    im1 = axes[1].imshow(alpha_map, cmap="viridis", vmin=0, vmax=2.0)
+    axes[1].set_title(f"Pred Alpha [{VERSION}]")
     plt.colorbar(im1, ax=axes[1])
+
+    if has_gt:
+        im2 = axes[2].imshow(gt_gamma, cmap="magma", vmin=0, vmax=1.0)
+        axes[2].set_title("GT Gamma")
+        plt.colorbar(im2, ax=axes[2])
+        im3 = axes[3].imshow(gt_alpha, cmap="viridis", vmin=0, vmax=2.0)
+        axes[3].set_title("GT Alpha")
+        plt.colorbar(im3, ax=axes[3])
+
+    fig2.tight_layout()
     inf_path = os.path.join(RESULT_DIR, f"inference_maps_{VERSION}.png")
     fig2.savefig(inf_path, dpi=120, bbox_inches="tight")
     plt.close(fig2)

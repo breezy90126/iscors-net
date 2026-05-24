@@ -90,8 +90,46 @@ def fit_physical_parameters(trace, max_tau=64):
     except Exception:
         return 0.0, 0.0, 0.0
 
+def compute_g_empirical_map(video, taus, min_cv=0.005):
+    """
+    Vectorised autocorrelation G(τ) for every pixel at a chosen set of τ lags.
+    Used for self-supervised Physics Reconstruction training (v3.0+).
+
+    G(τ; y,x) = <δI(t)·δI(t+τ)>_t / <I>²
+
+    Args:
+        video:  (T, H, W) float array.
+        taus:   list/array of integer τ lags (e.g. [1,2,4,8,16,32,48,64]).
+        min_cv: temporal CV threshold; pixels below this are flagged background
+                and their G(τ) is forced to 0.
+
+    Returns:
+        g_map     : (H, W, len(taus)) float32 — empirical G(τ) per pixel.
+        cell_mask : (H, W) bool — True where CV ≥ min_cv (cell pixels).
+    """
+    video = video.astype(np.float32)
+    T, H, W = video.shape
+
+    mean_I = video.mean(axis=0)                       # (H, W)
+    std_I  = video.std(axis=0)
+    cv_map = std_I / (mean_I + 1e-10)
+    cell_mask = cv_map >= min_cv
+
+    delta_I = video - mean_I                          # (T, H, W)
+    denom = (mean_I ** 2) + 1e-10                     # (H, W)
+
+    g_map = np.zeros((H, W, len(taus)), dtype=np.float32)
+    for i, tau in enumerate(taus):
+        n = T - int(tau)
+        # <δI(t)·δI(t+τ)> averaged over valid t
+        g_map[:, :, i] = (delta_I[:n] * delta_I[int(tau):]).mean(axis=0) / denom
+
+    # Background pixels: G(τ) is meaningless — set to 0
+    g_map[~cell_mask] = 0.0
+    return g_map, cell_mask
+
+
 if __name__ == "__main__":
-    # Test the traditional algorithm
     t = np.arange(500)
     # Generate a dummy trace with some decay-like correlation 
     # (just random walk to simulate Brownian-ish motion)

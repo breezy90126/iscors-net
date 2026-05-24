@@ -175,12 +175,55 @@ def train_internal_learning():
     print(f"Gamma map: mean={gamma_map[~bg_mask].mean():.3f}  (cell pixels only)")
     print(f"Alpha map: mean={alpha_map[~bg_mask].mean():.3f}  (cell pixels only)")
 
-    # Load perfect GT if available for side-by-side comparison
+    # Load perfect GT if available for quantitative evaluation + side-by-side comparison
     gt_path = "./data/test_synthetic_cell_gt.npz"
     has_gt = os.path.exists(gt_path)
     if has_gt:
         gt = np.load(gt_path)
         gt_gamma, gt_alpha = gt["gamma"], gt["alpha"]
+
+        # ---- Seen vs Unseen generalisation check --------------------------------
+        # Build a boolean mask of which pixels were used as training supervision.
+        # If the model only memorised training points, seen_mae << unseen_mae.
+        # If it learned the autocorrelation physics, both should be comparable.
+        seen_mask = np.zeros((H, W), dtype=bool)
+        for (y, x) in train_dataset.train_coords:
+            seen_mask[y, x] = True
+        cell_mask = ~bg_mask  # evaluate on cell pixels only (BG is trivially zero)
+
+        seen_cell   = seen_mask & cell_mask
+        unseen_cell = (~seen_mask) & cell_mask
+
+        def mae(pred, gt, mask):
+            return np.abs(pred[mask] - gt[mask]).mean() if mask.any() else float("nan")
+
+        print("\n=== Generalisation Report ===")
+        print(f"  Training pixels (seen)  : {seen_cell.sum()}")
+        print(f"  Unseen cell pixels      : {unseen_cell.sum()}")
+        print(f"  Gamma MAE — seen   : {mae(gamma_map, gt_gamma, seen_cell):.4f}")
+        print(f"  Gamma MAE — unseen : {mae(gamma_map, gt_gamma, unseen_cell):.4f}")
+        print(f"  Alpha MAE — seen   : {mae(alpha_map, gt_alpha, seen_cell):.4f}")
+        print(f"  Alpha MAE — unseen : {mae(alpha_map, gt_alpha, unseen_cell):.4f}")
+        ratio_g = mae(gamma_map, gt_gamma, unseen_cell) / (mae(gamma_map, gt_gamma, seen_cell) + 1e-10)
+        ratio_a = mae(alpha_map, gt_alpha, unseen_cell) / (mae(alpha_map, gt_alpha, seen_cell) + 1e-10)
+        print(f"  Unseen/Seen ratio — Gamma: {ratio_g:.2f}  Alpha: {ratio_a:.2f}")
+        print(f"  (ratio ≈ 1 → model generalises; ratio >> 1 → memorisation)")
+        print("=============================\n")
+
+        # Save generalisation report as text
+        report_path = os.path.join(RESULT_DIR, f"generalisation_{VERSION}.txt")
+        with open(report_path, "w") as f:
+            f.write(f"=== Generalisation Report [{VERSION}] ===\n")
+            f.write(f"Training pixels (seen)  : {seen_cell.sum()}\n")
+            f.write(f"Unseen cell pixels      : {unseen_cell.sum()}\n")
+            f.write(f"Gamma MAE — seen   : {mae(gamma_map, gt_gamma, seen_cell):.4f}\n")
+            f.write(f"Gamma MAE — unseen : {mae(gamma_map, gt_gamma, unseen_cell):.4f}\n")
+            f.write(f"Alpha MAE — seen   : {mae(alpha_map, gt_alpha, seen_cell):.4f}\n")
+            f.write(f"Alpha MAE — unseen : {mae(alpha_map, gt_alpha, unseen_cell):.4f}\n")
+            f.write(f"Unseen/Seen ratio — Gamma: {ratio_g:.2f}  Alpha: {ratio_a:.2f}\n")
+            f.write("ratio ≈ 1 → generalises to unseen pixels\n")
+            f.write("ratio >> 1 → memorisation, not learning\n")
+        print(f"Generalisation report saved → {report_path}")
 
     ncols = 4 if has_gt else 2
     fig2, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 4))

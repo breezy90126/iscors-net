@@ -82,10 +82,13 @@ def fit_physical_parameters(trace, max_tau=64):
     try:
         popt, pcov = curve_fit(theoretical_g_tau, taus_to_fit, g_to_fit, p0=p0, bounds=bounds, maxfev=1000)
         gamma_fit, alpha_fit, amp_fit = popt
-        return gamma_fit, alpha_fit
-    except Exception as e:
-        # If curve fitting fails (e.g., too noisy or flat), return safe defaults
-        return 0.0, 0.0
+        y_pred  = theoretical_g_tau(taus_to_fit, *popt)
+        ss_res  = np.sum((g_to_fit - y_pred) ** 2)
+        ss_tot  = np.sum((g_to_fit - g_to_fit.mean()) ** 2)
+        r2      = float(1.0 - ss_res / (ss_tot + 1e-10))
+        return gamma_fit, alpha_fit, r2
+    except Exception:
+        return 0.0, 0.0, 0.0
 
 if __name__ == "__main__":
     # Test the traditional algorithm
@@ -94,5 +97,5 @@ if __name__ == "__main__":
     # (just random walk to simulate Brownian-ish motion)
     trace = np.cumsum(np.random.randn(500)) + 1000 
     
-    gamma, alpha = fit_physical_parameters(trace)
-    print(f"Fitted Gamma: {gamma:.4f}, Fitted Alpha: {alpha:.4f}")
+    gamma, alpha, r2 = fit_physical_parameters(trace)
+    print(f"Fitted Gamma: {gamma:.4f}, Fitted Alpha: {alpha:.4f}, R²: {r2:.4f}")

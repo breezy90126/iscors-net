@@ -1,14 +1,15 @@
 """
-v3.0 — Self-supervised Physics Reconstruction training.
+v3.2 — Amplitude-aware Physics Reconstruction training.
 
-Replaces the curve-fit sparse-label paradigm with G(τ) reconstruction:
-    G_theory(τ; γ, α) = 1/(1 + γ·τ^α)   must match precomputed G_empirical(τ).
-
-Key differences vs train_internal.py (v2.x):
-  • No curve fitting, no _gt.npz, no PhysicsInformedLoss(MSE on γ,α).
-  • G_empirical(τ) is computed once from the same video — fully self-supervised.
-  • 80% of cell pixels supervised, 20% held out for generalisation MAE.
-  • Loss = MSE(G_theory, G_empirical) over supervised pixels + Huber-TV.
+Changes vs v3.1:
+  • Model outputs 3 channels (γ, α, A) instead of 2 (γ, α).
+  • Loss = MSE(A/(1+γτ^α), G_empirical) — no shape normalisation.
+    This restores the amplitude information that v3.1's τ-anchor normalisation
+    discarded, fixing cell-body γ→0 collapse.
+  • Huber-TV disabled by default (λ=0). v3.1.1 showed TV was a counter-force
+    against real spatial structure; U-Net's own convs provide enough smoothing.
+  • Optional LOG_SPACE flag: loss in log-G domain → equal per-τ weight, helps
+    α gradient when γ is small.
 """
 
 import os
@@ -23,7 +24,7 @@ from datasets.phys_recon_dataset import PhysReconDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.phys_recon_loss import PhysicsReconLoss
 
-VERSION = "v3.1"
+VERSION = "v3.2"
 
 # ---- Hyperparameters -------------------------------------------------------
 EPOCHS          = 200
@@ -33,9 +34,10 @@ PATCH_SIZE      = 64
 NUM_TAU_CH      = 8
 MAX_TAU         = 64
 TRAIN_FRACTION  = 0.80           # 80/20 hold-out split on cell pixels
-LAMBDA_TV       = 0.05           # Huber-TV regularisation weight
-HUBER_DELTA     = 0.05           # gradient threshold for edge-preserving TV
-RECON_TAUS      = (1, 2, 4, 8, 16, 32, 48, 64)   # τ values for G(τ) reconstruction target
+LAMBDA_TV       = 0.00           # v3.2: Huber-TV off (v3.1.1 showed it was counter-productive)
+HUBER_DELTA     = 0.05
+LOG_SPACE       = False          # flip to True for log-MSE (better α gradient when γ small)
+RECON_TAUS      = (1, 2, 4, 8, 16, 32, 48, 64)
 CHECKPOINT_DIR  = "./checkpoint"
 RESULT_DIR      = "./result"
 # ----------------------------------------------------------------------------
@@ -81,21 +83,22 @@ def train_physics_reconstruction():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     # ---- Model & Loss --------------------------------------------------------
-    model     = PISSLTauEncoder(num_tau_channels=NUM_TAU_CH).to(device)
-    criterion = PhysicsReconLoss(recon_taus=RECON_TAUS).to(device)
+    model     = PISSLTauEncoder(num_tau_channels=NUM_TAU_CH, predict_amplitude=True).to(device)
+    criterion = PhysicsReconLoss(recon_taus=RECON_TAUS, log_space=LOG_SPACE).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
     # ---- Training Loop -------------------------------------------------------
     print(f"Starting Physics Reconstruction [{VERSION}]: "
           f"{len(train_dataset)} supervised patches/epoch, "
-          f"recon_τ={RECON_TAUS}, train_fraction={TRAIN_FRACTION}")
+          f"recon_τ={RECON_TAUS}, train_fraction={TRAIN_FRACTION}, "
+          f"log_space={LOG_SPACE}, λ_TV={LAMBDA_TV}")
     history = {"loss": [], "tv": [], "phys": []}
 
     model.train()
     for epoch in range(EPOCHS):
         epoch_loss = epoch_phys = epoch_tv = 0.0
-        gamma_sum = alpha_sum = pix_count = 0.0
+        gamma_sum = alpha_sum = amp_sum = pix_count = 0.0
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         for inputs, g_empirical, train_mask in pbar:
             inputs       = inputs.to(device)
@@ -103,32 +106,37 @@ def train_physics_reconstruction():
             train_mask   = train_mask.to(device)
 
             optimizer.zero_grad()
-            preds = model(inputs)                        # (B, 2, P, P)
+            preds = model(inputs)                        # (B, 3, P, P)
 
             loss_phys = criterion(preds, g_empirical, train_mask)
-            loss_tv   = huber_tv(preds)
-            loss = loss_phys + LAMBDA_TV * loss_tv
+            if LAMBDA_TV > 0:
+                loss_tv = huber_tv(preds)
+                loss = loss_phys + LAMBDA_TV * loss_tv
+                epoch_tv += loss_tv.item()
+            else:
+                loss = loss_phys
             loss.backward()
             optimizer.step()
 
             epoch_loss += loss.item()
             epoch_phys += loss_phys.item()
-            epoch_tv   += loss_tv.item()
 
-            # Track mean predicted (γ, α) on supervised pixels — detects mode collapse
+            # Mean predicted (γ, α, A) on supervised pixels — detects collapse
             with torch.no_grad():
                 m = train_mask.unsqueeze(1)  # (B,1,P,P)
                 gamma_sum += (preds[:, 0:1] * m).sum().item()
                 alpha_sum += (preds[:, 1:2] * m).sum().item()
+                amp_sum   += (preds[:, 2:3] * m).sum().item()
                 pix_count += m.sum().item()
                 mean_g = gamma_sum / (pix_count + 1e-10)
                 mean_a = alpha_sum / (pix_count + 1e-10)
+                mean_A = amp_sum   / (pix_count + 1e-10)
 
             pbar.set_postfix({
-                "L":    f"{loss.item():.5f}",
-                "Phys": f"{loss_phys.item():.5f}",
-                "γ̄":  f"{mean_g:.3f}",
-                "ᾱ":  f"{mean_a:.3f}",
+                "L":   f"{loss.item():.5f}",
+                "γ̄": f"{mean_g:.3f}",
+                "ᾱ": f"{mean_a:.3f}",
+                "Ā":  f"{mean_A:.2e}",
             })
 
         n = len(train_loader)
@@ -138,9 +146,11 @@ def train_physics_reconstruction():
         history["tv"].append(epoch_tv / n)
         mean_g = gamma_sum / (pix_count + 1e-10)
         mean_a = alpha_sum / (pix_count + 1e-10)
+        mean_A = amp_sum   / (pix_count + 1e-10)
         print(f"Epoch [{epoch+1}/{EPOCHS}] "
-              f"Loss={epoch_loss/n:.5f}  Phys={epoch_phys/n:.5f}  TV={epoch_tv/n:.5f}  "
-              f"γ̄={mean_g:.3f}  ᾱ={mean_a:.3f}  LR={scheduler.get_last_lr()[0]:.2e}")
+              f"Loss={epoch_loss/n:.5e}  Phys={epoch_phys/n:.5e}  "
+              f"γ̄={mean_g:.3f}  ᾱ={mean_a:.3f}  Ā={mean_A:.2e}  "
+              f"LR={scheduler.get_last_lr()[0]:.2e}")
 
     # ---- Save checkpoint + loss curve ----------------------------------------
     ckpt_path = os.path.join(CHECKPOINT_DIR, f"pissl_phys_recon_{VERSION}.pth")
@@ -150,7 +160,8 @@ def train_physics_reconstruction():
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(history["loss"], label="Total")
     ax.plot(history["phys"], label="Phys recon")
-    ax.plot(history["tv"],   label="Huber-TV")
+    if LAMBDA_TV > 0:
+        ax.plot(history["tv"], label="Huber-TV")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.set_title(f"Physics Reconstruction Loss [{VERSION}]")
@@ -178,12 +189,16 @@ def train_physics_reconstruction():
 
     gamma_map = preds_full[0, 0].cpu().numpy()
     alpha_map = preds_full[0, 1].cpu().numpy()
+    amp_map   = preds_full[0, 2].cpu().numpy()
 
     # Background safety net: zero out near-static pixels
     bg_mask = ~train_dataset.cell_mask
     gamma_map[bg_mask] = 0.0
     alpha_map[bg_mask] = 0.0
+    amp_map[bg_mask]   = 0.0
     print(f"Background pixels: {bg_mask.sum()} / {bg_mask.size}")
+    print(f"Predicted A — cell  : mean={amp_map[~bg_mask].mean():.3e}  "
+          f"min={amp_map[~bg_mask].min():.3e}  max={amp_map[~bg_mask].max():.3e}")
 
     # ---- Generalisation evaluation (held-out 20%) ----------------------------
     gt_path = "./data/test_synthetic_cell_gt.npz"
@@ -191,22 +206,22 @@ def train_physics_reconstruction():
         gt = np.load(gt_path)
         gt_gamma, gt_alpha = gt["gamma"], gt["alpha"]
 
-        seen_mask     = train_dataset.supervised_mask.astype(bool)  # 80% supervised
-        held_out_mask = train_dataset.held_out_mask                 # 20% held-out
+        seen_mask     = train_dataset.supervised_mask.astype(bool)
+        held_out_mask = train_dataset.held_out_mask
 
         def mae(pred, gt, mask):
             return float(np.abs(pred[mask] - gt[mask]).mean()) if mask.any() else float("nan")
 
-        print("\n=== Generalisation Report (v3.0 self-supervised) ===")
+        print(f"\n=== Generalisation Report [{VERSION}] ===")
         print(f"  Supervised (80%) pixels : {seen_mask.sum()}")
         print(f"  Held-out  (20%) pixels  : {held_out_mask.sum()}")
         gG_seen = mae(gamma_map, gt_gamma, seen_mask)
         gG_held = mae(gamma_map, gt_gamma, held_out_mask)
         aA_seen = mae(alpha_map, gt_alpha, seen_mask)
         aA_held = mae(alpha_map, gt_alpha, held_out_mask)
-        print(f"  Gamma MAE — seen   : {gG_seen:.4f}")
+        print(f"  Gamma MAE — seen    : {gG_seen:.4f}")
         print(f"  Gamma MAE — held-out: {gG_held:.4f}")
-        print(f"  Alpha MAE — seen   : {aA_seen:.4f}")
+        print(f"  Alpha MAE — seen    : {aA_seen:.4f}")
         print(f"  Alpha MAE — held-out: {aA_held:.4f}")
         rG = gG_held / (gG_seen + 1e-10)
         rA = aA_held / (aA_seen + 1e-10)
@@ -216,7 +231,7 @@ def train_physics_reconstruction():
 
         report_path = os.path.join(RESULT_DIR, f"generalisation_{VERSION}.txt")
         with open(report_path, "w") as f:
-            f.write(f"=== Generalisation Report [{VERSION}] (self-supervised) ===\n")
+            f.write(f"=== Generalisation Report [{VERSION}] (amplitude-aware) ===\n")
             f.write(f"Supervised (80%) pixels: {seen_mask.sum()}\n")
             f.write(f"Held-out  (20%) pixels : {held_out_mask.sum()}\n")
             f.write(f"Gamma MAE — seen      : {gG_seen:.4f}\n")
@@ -224,27 +239,44 @@ def train_physics_reconstruction():
             f.write(f"Alpha MAE — seen      : {aA_seen:.4f}\n")
             f.write(f"Alpha MAE — held-out  : {aA_held:.4f}\n")
             f.write(f"Held-out/Seen ratio — Gamma: {rG:.2f}  Alpha: {rA:.2f}\n")
+            f.write(f"Pred A (cell): mean={amp_map[~bg_mask].mean():.3e}  "
+                    f"min={amp_map[~bg_mask].min():.3e}  max={amp_map[~bg_mask].max():.3e}\n")
         print(f"Generalisation report saved → {report_path}")
     else:
         gt_gamma = gt_alpha = None
 
     # ---- Inference maps figure -----------------------------------------------
     has_gt = gt_gamma is not None
-    ncols = 4 if has_gt else 2
-    fig2, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 4))
-    im0 = axes[0].imshow(gamma_map, cmap="magma", vmin=0, vmax=1.0)
-    axes[0].set_title(f"Pred Gamma [{VERSION}]")
-    plt.colorbar(im0, ax=axes[0])
-    im1 = axes[1].imshow(alpha_map, cmap="viridis", vmin=0, vmax=2.0)
-    axes[1].set_title(f"Pred Alpha [{VERSION}]")
-    plt.colorbar(im1, ax=axes[1])
+    # Layout: row 1 = [γ_pred, α_pred, A_pred]; row 2 = [γ_gt, α_gt, blank] if GT present
     if has_gt:
-        im2 = axes[2].imshow(gt_gamma, cmap="magma", vmin=0, vmax=1.0)
-        axes[2].set_title("GT Gamma")
+        fig2, axes = plt.subplots(2, 3, figsize=(15, 8))
+        im0 = axes[0, 0].imshow(gamma_map, cmap="magma", vmin=0, vmax=1.0)
+        axes[0, 0].set_title(f"Pred Gamma [{VERSION}]")
+        plt.colorbar(im0, ax=axes[0, 0])
+        im1 = axes[0, 1].imshow(alpha_map, cmap="viridis", vmin=0, vmax=2.0)
+        axes[0, 1].set_title(f"Pred Alpha [{VERSION}]")
+        plt.colorbar(im1, ax=axes[0, 1])
+        im2 = axes[0, 2].imshow(amp_map, cmap="cividis")
+        axes[0, 2].set_title(f"Pred Amplitude [{VERSION}]")
+        plt.colorbar(im2, ax=axes[0, 2])
+        im3 = axes[1, 0].imshow(gt_gamma, cmap="magma", vmin=0, vmax=1.0)
+        axes[1, 0].set_title("GT Gamma")
+        plt.colorbar(im3, ax=axes[1, 0])
+        im4 = axes[1, 1].imshow(gt_alpha, cmap="viridis", vmin=0, vmax=2.0)
+        axes[1, 1].set_title("GT Alpha")
+        plt.colorbar(im4, ax=axes[1, 1])
+        axes[1, 2].axis("off")
+    else:
+        fig2, axes = plt.subplots(1, 3, figsize=(15, 4))
+        im0 = axes[0].imshow(gamma_map, cmap="magma", vmin=0, vmax=1.0)
+        axes[0].set_title(f"Pred Gamma [{VERSION}]")
+        plt.colorbar(im0, ax=axes[0])
+        im1 = axes[1].imshow(alpha_map, cmap="viridis", vmin=0, vmax=2.0)
+        axes[1].set_title(f"Pred Alpha [{VERSION}]")
+        plt.colorbar(im1, ax=axes[1])
+        im2 = axes[2].imshow(amp_map, cmap="cividis")
+        axes[2].set_title(f"Pred Amplitude [{VERSION}]")
         plt.colorbar(im2, ax=axes[2])
-        im3 = axes[3].imshow(gt_alpha, cmap="viridis", vmin=0, vmax=2.0)
-        axes[3].set_title("GT Alpha")
-        plt.colorbar(im3, ax=axes[3])
     fig2.tight_layout()
     inf_path = os.path.join(RESULT_DIR, f"inference_maps_{VERSION}.png")
     fig2.savefig(inf_path, dpi=120, bbox_inches="tight")

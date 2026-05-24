@@ -10,7 +10,7 @@ from datasets.tau_sparse_dataset import TauSparseDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.physics_loss import PhysicsInformedLoss
 
-VERSION = "v2.8"
+VERSION = "v2.9"
 
 # ---- Hyperparameters -------------------------------------------------------
 EPOCHS          = 400
@@ -20,7 +20,8 @@ PATCH_SIZE      = 64
 NUM_TAU_CH      = 8
 MAX_TAU         = 64
 TRAIN_RATIO     = 0.10   # 10% sparse pixels (TV + weight_decay handle overfitting)
-LAMBDA_TV       = 0.01   # Total Variation regularization weight (reduced to preserve region edges)
+LAMBDA_TV       = 0.05   # Huber-TV weight (pseudo-Huber matches L1 at large grads, so use higher lambda)
+HUBER_DELTA     = 0.05   # gradient threshold: |g|<delta → quadratic, |g|>=delta → linear (edge-preserving)
 RANDOM_TAU      = True   # randomly sample tau delays each step
 CHECKPOINT_DIR  = "./checkpoint"
 RESULT_DIR      = "./result"
@@ -97,13 +98,19 @@ def train_internal_learning():
             # Masked loss — only center 3x3 pixels are supervised
             loss, loss_gamma, loss_alpha = criterion(preds, targets, mask)
 
-            # Total Variation regularization: penalise abrupt spatial changes.
-            # Diffusion parameters are physically smooth within each cell region,
-            # so TV discourages the model from overfitting individual training points.
-            tv = (
-                (preds[:, :, 1:, :] - preds[:, :, :-1, :]).abs().mean()
-                + (preds[:, :, :, 1:] - preds[:, :, :, :-1]).abs().mean()
-            )
+            # Huber-TV regularization: edge-preserving spatial smoothness.
+            # Small gradients (within homogeneous regions) → quadratic penalty → smoothed.
+            # Large gradients (true region boundaries)      → linear penalty   → preserved.
+            # Pseudo-Huber form: 0.5*g²/delta if |g|<delta, else |g|-0.5*delta.
+            # Matches L1-TV at large g, but relaxes within-region noise penalty.
+            gy = preds[:, :, 1:, :] - preds[:, :, :-1, :]
+            gx = preds[:, :, :, 1:] - preds[:, :, :, :-1]
+            def _huber(g, delta=HUBER_DELTA):
+                absg = g.abs()
+                return torch.where(absg < delta,
+                                   0.5 * g.pow(2) / delta,
+                                   absg - 0.5 * delta)
+            tv = _huber(gy).mean() + _huber(gx).mean()
             loss = loss + LAMBDA_TV * tv
             loss.backward()
             optimizer.step()

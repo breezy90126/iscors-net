@@ -17,11 +17,12 @@ class PhysicsReconLoss(nn.Module):
         recon_taus: 1D tensor of τ lags used for reconstruction (e.g. [1,2,4,8,16,32,48,64]).
     """
 
-    def __init__(self, recon_taus):
+    def __init__(self, recon_taus, normalize=True):
         super().__init__()
         taus = torch.as_tensor(recon_taus, dtype=torch.float32)
         # Shape (1, 1, 1, K) so it broadcasts over (B, H, W, K)
         self.register_buffer("taus", taus.view(1, 1, 1, -1))
+        self.normalize = normalize
 
     def forward(self, preds, g_empirical, train_mask):
         """
@@ -38,6 +39,20 @@ class PhysicsReconLoss(nn.Module):
 
         # Differentiable G_theory; taus≥1 so no division-by-zero risk.
         g_theory = 1.0 / (1.0 + gamma * torch.pow(self.taus, alpha))   # (B, H, W, K)
+
+        if self.normalize:
+            # iSCORS amplitude depends on particle concentration (1/N) and is NOT
+            # encoded by (γ,α) — they only control the *shape* of the decay.
+            # G_empirical in our pipeline is Var(I)/<I>² · 1/(1+γτ^α), so its scale
+            # (~1e-3 for our synthetic data) is far below G_theory (~1).  Without
+            # normalising, the loss drives γ,α to their Sigmoid bounds trying to
+            # match the absolute amplitude — pure shape information is lost.
+            #
+            # Fix: anchor both curves at τ = recon_taus[0] so they start at 1,
+            # then MSE compares only the relative decay shape.
+            eps = 1e-10
+            g_theory    = g_theory    / (g_theory[..., 0:1] + eps)
+            g_empirical = g_empirical / (g_empirical[..., 0:1].abs() + eps)
 
         sq_err = (g_theory - g_empirical) ** 2        # (B, H, W, K)
         mask4d = train_mask.unsqueeze(-1)             # (B, H, W, 1)

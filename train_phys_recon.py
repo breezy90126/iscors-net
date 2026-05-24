@@ -23,7 +23,7 @@ from datasets.phys_recon_dataset import PhysReconDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.phys_recon_loss import PhysicsReconLoss
 
-VERSION = "v3.0"
+VERSION = "v3.1"
 
 # ---- Hyperparameters -------------------------------------------------------
 EPOCHS          = 200
@@ -95,6 +95,7 @@ def train_physics_reconstruction():
     model.train()
     for epoch in range(EPOCHS):
         epoch_loss = epoch_phys = epoch_tv = 0.0
+        gamma_sum = alpha_sum = pix_count = 0.0
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         for inputs, g_empirical, train_mask in pbar:
             inputs       = inputs.to(device)
@@ -113,10 +114,21 @@ def train_physics_reconstruction():
             epoch_loss += loss.item()
             epoch_phys += loss_phys.item()
             epoch_tv   += loss_tv.item()
+
+            # Track mean predicted (γ, α) on supervised pixels — detects mode collapse
+            with torch.no_grad():
+                m = train_mask.unsqueeze(1)  # (B,1,P,P)
+                gamma_sum += (preds[:, 0:1] * m).sum().item()
+                alpha_sum += (preds[:, 1:2] * m).sum().item()
+                pix_count += m.sum().item()
+                mean_g = gamma_sum / (pix_count + 1e-10)
+                mean_a = alpha_sum / (pix_count + 1e-10)
+
             pbar.set_postfix({
                 "L":    f"{loss.item():.5f}",
                 "Phys": f"{loss_phys.item():.5f}",
-                "TV":   f"{loss_tv.item():.5f}",
+                "γ̄":  f"{mean_g:.3f}",
+                "ᾱ":  f"{mean_a:.3f}",
             })
 
         n = len(train_loader)
@@ -124,9 +136,11 @@ def train_physics_reconstruction():
         history["loss"].append(epoch_loss / n)
         history["phys"].append(epoch_phys / n)
         history["tv"].append(epoch_tv / n)
+        mean_g = gamma_sum / (pix_count + 1e-10)
+        mean_a = alpha_sum / (pix_count + 1e-10)
         print(f"Epoch [{epoch+1}/{EPOCHS}] "
-              f"Loss={epoch_loss/n:.5f}  Phys={epoch_phys/n:.5f}  "
-              f"TV={epoch_tv/n:.5f}  LR={scheduler.get_last_lr()[0]:.2e}")
+              f"Loss={epoch_loss/n:.5f}  Phys={epoch_phys/n:.5f}  TV={epoch_tv/n:.5f}  "
+              f"γ̄={mean_g:.3f}  ᾱ={mean_a:.3f}  LR={scheduler.get_last_lr()[0]:.2e}")
 
     # ---- Save checkpoint + loss curve ----------------------------------------
     ckpt_path = os.path.join(CHECKPOINT_DIR, f"pissl_phys_recon_{VERSION}.pth")

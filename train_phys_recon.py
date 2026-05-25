@@ -1,15 +1,17 @@
 """
-v3.2 — Amplitude-aware Physics Reconstruction training.
+v3.3 — Spatial blind-spot Physics Reconstruction training.
 
-Changes vs v3.1:
-  • Model outputs 3 channels (γ, α, A) instead of 2 (γ, α).
-  • Loss = MSE(A/(1+γτ^α), G_empirical) — no shape normalisation.
-    This restores the amplitude information that v3.1's τ-anchor normalisation
-    discarded, fixing cell-body γ→0 collapse.
-  • Huber-TV disabled by default (λ=0). v3.1.1 showed TV was a counter-force
-    against real spatial structure; U-Net's own convs provide enough smoothing.
-  • Optional LOG_SPACE flag: loss in log-G domain → equal per-τ weight, helps
-    α gradient when γ is small.
+Changes vs v3.2:
+  • Model input is masked G_empirical(τ) map instead of raw tau-slices.
+    - 80% of cell pixels: G_empirical visible in input, loss applied.
+    - 20% of cell pixels: G_empirical zeroed in input, excluded from loss.
+    Model must infer (γ,α,A) at held-out pixels from spatial neighbours
+    (spatial redundancy / FAST-style blind-spot on G maps).
+  • This restores a meaningful 80/20 generalization test: held-out pixels
+    are truly hidden from the model, unlike v3.0–v3.2 where raw-frame input
+    still contained temporal info from all pixels.
+  • Input channels = K = len(RECON_TAUS) (unchanged at 8).
+  • Loss, model architecture, and amplitude output unchanged from v3.2.
 """
 
 import os
@@ -24,20 +26,19 @@ from datasets.phys_recon_dataset import PhysReconDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.phys_recon_loss import PhysicsReconLoss
 
-VERSION = "v3.2"
+VERSION = "v3.3"
 
 # ---- Hyperparameters -------------------------------------------------------
 EPOCHS          = 200
 BATCH_SIZE      = 4
 LEARNING_RATE   = 1e-4
 PATCH_SIZE      = 64
-NUM_TAU_CH      = 8
-MAX_TAU         = 64
 TRAIN_FRACTION  = 0.80           # 80/20 hold-out split on cell pixels
-LAMBDA_TV       = 0.00           # v3.2: Huber-TV off (v3.1.1 showed it was counter-productive)
+LAMBDA_TV       = 0.00           # Huber-TV off
 HUBER_DELTA     = 0.05
-LOG_SPACE       = False          # flip to True for log-MSE (better α gradient when γ small)
+LOG_SPACE       = False          # flip to True for log-MSE
 RECON_TAUS      = (1, 2, 4, 8, 16, 32, 48, 64)
+NUM_TAU_CH      = len(RECON_TAUS)   # input channels = K (masked G channels)
 CHECKPOINT_DIR  = "./checkpoint"
 RESULT_DIR      = "./result"
 # ----------------------------------------------------------------------------
@@ -76,9 +77,6 @@ def train_physics_reconstruction():
         patch_size=PATCH_SIZE,
         mode="train",
         train_fraction=TRAIN_FRACTION,
-        random_tau=True,
-        num_tau_channels=NUM_TAU_CH,
-        max_tau=MAX_TAU,
     )
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
@@ -180,8 +178,6 @@ def train_physics_reconstruction():
         recon_taus=RECON_TAUS,
         patch_size=PATCH_SIZE,
         mode="inference",
-        num_tau_channels=NUM_TAU_CH,
-        max_tau=MAX_TAU,
     )
     full_input = infer_dataset[0].unsqueeze(0).to(device)
     with torch.no_grad():

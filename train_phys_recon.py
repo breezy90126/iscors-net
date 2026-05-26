@@ -1,30 +1,25 @@
 """
-v3.5 — Shape-only Physics Reconstruction + log-MSE + weak Huber-TV.
+v3.6 — log-MSE + scaled Huber-TV + slope channels (Dir.A) + ELU-α (Dir.D).
 
-v3.4 confirmed the framework works (healthy loss descent, no mean-regression).
-Three remaining problems addressed here:
+v3.5 post-mortem:
+  • λ_TV=0.01 was ~0.7% of log-MSE loss (~0.6) → TV did nothing.
+  • log-MSE with noisy G_empirical at large τ introduced unstable gradients.
 
-  Problem 1 – Graininess (no spatial regularity)
-    Fix: weak Huber-TV (λ=0.01) on predicted γ and α maps.
-         Much smaller than v3.1's λ=0.05 — enough to suppress salt-and-pepper
-         noise without flattening real structure.
+v3.6 fixes:
+  • LAMBDA_TV = 0.5  (scaled to log-MSE magnitude; TV now ~40% of physics loss)
+  • Direction A: K-1 log-log slope channels appended to input.
+      Δ_k = Δlog(G_norm)/Δlog(τ) → -α at large τ, independent of γ.
+      Gives the model a direct per-pixel α signal; contrast between α=0.2
+      and α=1.0 is 24× larger in slope space than in G_norm space at τ=128.
+  • Direction D: α head uses ELU+1 instead of Sigmoid×2.
+      ELU+1: linear gradient for α>1 (no saturation), non-zero gradient
+      down to α→0. Sigmoid×2 has vanishing gradient near both ends.
+  • Input channels: K G_norm + K-1 slopes = 2K-1 = 19 (K=10 taus)
 
-  Problem 2 – Alpha blurry / weak gradient
-    Fix: log-space MSE loss.
-         ∂G/∂α ∝ γ·log(τ): at small γ (outer circle) α gradient is small.
-         Log-MSE re-weights by 1/G² → amplifies large-τ signal where the
-         α-dependent decay is most pronounced, without changing G_theory.
-
-  Problem 3 – Lower-left sub-diffusion spot unclear (α=0.2, G_norm≈1 at all τ)
-    Fix: extend RECON_TAUS to include τ=96,128 — at these delays,
-         sub-diffusion (α=0.2) stays ≈0.99 while normal diffusion (α=1)
-         drops to ≈0.35, making the contrast larger for the model to detect.
-         Combined with log-MSE, the remaining signal is amplified.
-
-Components inherited from v3.4 (unchanged):
-  • Input : per-pixel normalised G_empirical (K channels, 20% spatial blind-spot)
-  • Output: (γ, α) 2 channels — amplitude removed entirely
-  • Loss  : shape_only + log_space MSE at visible pixels + weak TV
+Inherited from v3.4/v3.5 (unchanged):
+  • Per-pixel normalised G_empirical as input; 20% spatial blind-spot
+  • (γ, α) 2-channel output; amplitude removed entirely
+  • shape_only + log_space MSE at visible pixels
 """
 
 import os
@@ -40,7 +35,7 @@ from datasets.phys_recon_dataset import PhysReconDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.phys_recon_loss import PhysicsReconLoss
 
-VERSION = "v3.5"
+VERSION = "v3.6"
 
 # ---- Hyperparameters -------------------------------------------------------
 EPOCHS          = 200
@@ -48,10 +43,11 @@ BATCH_SIZE      = 4
 LEARNING_RATE   = 1e-4
 PATCH_SIZE      = 64
 TRAIN_FRACTION  = 0.80
-RECON_TAUS      = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)   # extended large-τ
-NUM_TAU_CH      = len(RECON_TAUS)
-LAMBDA_TV       = 0.01    # weak Huber-TV; 0 to disable
-LOG_SPACE       = True    # log-MSE to amplify large-τ α signal
+RECON_TAUS      = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)   # K=10
+_K              = len(RECON_TAUS)
+NUM_TAU_CH      = 2 * _K - 1   # K G_norm + K-1 slope channels = 19
+LAMBDA_TV       = 0.5     # scaled to log-MSE magnitude (~0.6)
+LOG_SPACE       = True    # log-MSE
 CHECKPOINT_DIR  = "./checkpoint"
 RESULT_DIR      = "./result"
 # ----------------------------------------------------------------------------

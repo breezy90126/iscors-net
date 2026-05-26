@@ -1,25 +1,35 @@
 """
-v3.4 — Shape-only Physics Reconstruction with spatial blind-spot.
+v3.5 — Shape-only Physics Reconstruction + log-MSE + weak Huber-TV.
 
-v3.1 loss  +  v3.3 masked-G input  =  v3.4
+v3.4 confirmed the framework works (healthy loss descent, no mean-regression).
+Three remaining problems addressed here:
 
-v3.1 had the right loss (normalised shape MSE) but wrong input (raw frames
-could not encode per-pixel G curve shape → mean regression to γ=0).
+  Problem 1 – Graininess (no spatial regularity)
+    Fix: weak Huber-TV (λ=0.01) on predicted γ and α maps.
+         Much smaller than v3.1's λ=0.05 — enough to suppress salt-and-pepper
+         noise without flattening real structure.
 
-v3.2/v3.3 fixed the input but added amplitude A as a 3rd output, creating
-a new mean-regression attractor (A-dominated gradient overwhelmed shape
-learning regardless of input type).
+  Problem 2 – Alpha blurry / weak gradient
+    Fix: log-space MSE loss.
+         ∂G/∂α ∝ γ·log(τ): at small γ (outer circle) α gradient is small.
+         Log-MSE re-weights by 1/G² → amplifies large-τ signal where the
+         α-dependent decay is most pronounced, without changing G_theory.
 
-v3.4 combines the correct pieces:
-  • Input : per-pixel normalised G_empirical (shape only, K channels).
-            20% held-out pixels zeroed — spatial blind-spot.
-  • Output: (γ, α) 2 channels — amplitude removed entirely.
-  • Loss  : MSE(G_theory_norm, G_target_norm) at visible pixels.
-            G_theory_norm = (1+γ)/(1+γτ^α); target already normalised.
+  Problem 3 – Lower-left sub-diffusion spot unclear (α=0.2, G_norm≈1 at all τ)
+    Fix: extend RECON_TAUS to include τ=96,128 — at these delays,
+         sub-diffusion (α=0.2) stays ≈0.99 while normal diffusion (α=1)
+         drops to ≈0.35, making the contrast larger for the model to detect.
+         Combined with log-MSE, the remaining signal is amplified.
+
+Components inherited from v3.4 (unchanged):
+  • Input : per-pixel normalised G_empirical (K channels, 20% spatial blind-spot)
+  • Output: (γ, α) 2 channels — amplitude removed entirely
+  • Loss  : shape_only + log_space MSE at visible pixels + weak TV
 """
 
 import os
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
@@ -30,7 +40,7 @@ from datasets.phys_recon_dataset import PhysReconDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.phys_recon_loss import PhysicsReconLoss
 
-VERSION = "v3.4"
+VERSION = "v3.5"
 
 # ---- Hyperparameters -------------------------------------------------------
 EPOCHS          = 200
@@ -38,11 +48,28 @@ BATCH_SIZE      = 4
 LEARNING_RATE   = 1e-4
 PATCH_SIZE      = 64
 TRAIN_FRACTION  = 0.80
-RECON_TAUS      = (1, 2, 4, 8, 16, 32, 48, 64)
-NUM_TAU_CH      = len(RECON_TAUS)   # input channels = K normalised-G channels
+RECON_TAUS      = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)   # extended large-τ
+NUM_TAU_CH      = len(RECON_TAUS)
+LAMBDA_TV       = 0.01    # weak Huber-TV; 0 to disable
+LOG_SPACE       = True    # log-MSE to amplify large-τ α signal
 CHECKPOINT_DIR  = "./checkpoint"
 RESULT_DIR      = "./result"
 # ----------------------------------------------------------------------------
+
+
+def huber_tv(x, delta=0.05):
+    """
+    Huber total variation on (B, C, H, W).
+    Huber(t) = t²/(2δ) for |t|<δ, else |t|-δ/2 — smooth near 0.
+    """
+    dx = x[..., 1:] - x[..., :-1]
+    dy = x[..., 1:, :] - x[..., :-1, :]
+
+    def _h(t):
+        a = t.abs()
+        return torch.where(a < delta, 0.5 * t ** 2 / delta, a - 0.5 * delta)
+
+    return _h(dx).mean() + _h(dy).mean()
 
 
 def train_physics_reconstruction():
@@ -75,19 +102,21 @@ def train_physics_reconstruction():
     model     = PISSLTauEncoder(num_tau_channels=NUM_TAU_CH,
                                 predict_amplitude=False).to(device)
     criterion = PhysicsReconLoss(recon_taus=RECON_TAUS,
-                                 shape_only=True).to(device)
+                                 shape_only=True,
+                                 log_space=LOG_SPACE).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS,
                                                       eta_min=1e-6)
 
     # ---- Training Loop -------------------------------------------------------
     print(f"[{VERSION}] {len(train_dataset)} patches/epoch  "
-          f"recon_τ={RECON_TAUS}  train_fraction={TRAIN_FRACTION}")
-    history = {"loss": []}
+          f"recon_τ={RECON_TAUS}  train_fraction={TRAIN_FRACTION}  "
+          f"λ_TV={LAMBDA_TV}  log_space={LOG_SPACE}")
+    history = {"loss": [], "phys_loss": [], "tv_loss": []}
 
     model.train()
     for epoch in range(EPOCHS):
-        epoch_loss = 0.0
+        epoch_loss = epoch_phys = epoch_tv = 0.0
         gamma_sum = alpha_sum = pix_count = 0.0
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
 
@@ -97,12 +126,18 @@ def train_physics_reconstruction():
             train_mask  = train_mask.to(device)
 
             optimizer.zero_grad()
-            preds = model(g_input)                           # (B, 2, P, P)
-            loss  = criterion(preds, g_target, train_mask)
+            preds = model(g_input)                               # (B, 2, P, P)
+
+            phys_loss = criterion(preds, g_target, train_mask)
+            tv        = huber_tv(preds) if LAMBDA_TV > 0 else torch.tensor(0.0)
+            loss      = phys_loss + LAMBDA_TV * tv
+
             loss.backward()
             optimizer.step()
 
-            epoch_loss += loss.item()
+            epoch_loss  += loss.item()
+            epoch_phys  += phys_loss.item()
+            epoch_tv    += tv.item() if LAMBDA_TV > 0 else 0.0
 
             with torch.no_grad():
                 m = train_mask.unsqueeze(1)
@@ -119,8 +154,11 @@ def train_physics_reconstruction():
         n = len(train_loader)
         scheduler.step()
         history["loss"].append(epoch_loss / n)
+        history["phys_loss"].append(epoch_phys / n)
+        history["tv_loss"].append(epoch_tv / n)
         print(f"Epoch [{epoch+1}/{EPOCHS}]  "
-              f"Loss={epoch_loss/n:.5e}  γ̄={mean_g:.3f}  ᾱ={mean_a:.3f}  "
+              f"Loss={epoch_loss/n:.5e}  Phys={epoch_phys/n:.5e}  "
+              f"TV={epoch_tv/n:.5e}  γ̄={mean_g:.3f}  ᾱ={mean_a:.3f}  "
               f"LR={scheduler.get_last_lr()[0]:.2e}")
 
     # ---- Save checkpoint + loss curve ----------------------------------------
@@ -128,11 +166,18 @@ def train_physics_reconstruction():
     torch.save(model.state_dict(), ckpt_path)
     print(f"Model saved → {ckpt_path}")
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(history["loss"], label="Phys recon (shape MSE)")
-    ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
-    ax.set_title(f"Physics Reconstruction Loss [{VERSION}]")
-    ax.legend(); ax.set_yscale("log")
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(history["loss"], label="Total loss")
+    axes[0].plot(history["phys_loss"], label="Physics (log-MSE)", linestyle="--")
+    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Loss")
+    axes[0].set_title(f"Training Loss [{VERSION}]")
+    axes[0].legend(); axes[0].set_yscale("log")
+
+    axes[1].plot(history["tv_loss"], label=f"Huber-TV (λ={LAMBDA_TV})", color="orange")
+    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("TV loss (unscaled)")
+    axes[1].set_title("TV Regularisation"); axes[1].legend()
+    axes[1].set_yscale("log")
+
     loss_fig = os.path.join(RESULT_DIR, f"loss_curve_{VERSION}.png")
     fig.savefig(loss_fig, dpi=120, bbox_inches="tight"); plt.close(fig)
     print(f"Loss curve → {loss_fig}")
@@ -201,16 +246,16 @@ def train_physics_reconstruction():
     # ---- Inference maps figure -----------------------------------------------
     has_gt = gt_gamma is not None
     ncols  = 4 if has_gt else 2
-    fig2, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 4))
-    im0 = axes[0].imshow(gamma_map, cmap="magma",  vmin=0, vmax=1.0)
-    axes[0].set_title(f"Pred Gamma [{VERSION}]"); plt.colorbar(im0, ax=axes[0])
-    im1 = axes[1].imshow(alpha_map, cmap="viridis", vmin=0, vmax=2.0)
-    axes[1].set_title(f"Pred Alpha [{VERSION}]"); plt.colorbar(im1, ax=axes[1])
+    fig2, axes2 = plt.subplots(1, ncols, figsize=(5 * ncols, 4))
+    im0 = axes2[0].imshow(gamma_map, cmap="magma",  vmin=0, vmax=1.0)
+    axes2[0].set_title(f"Pred Gamma [{VERSION}]"); plt.colorbar(im0, ax=axes2[0])
+    im1 = axes2[1].imshow(alpha_map, cmap="viridis", vmin=0, vmax=2.0)
+    axes2[1].set_title(f"Pred Alpha [{VERSION}]"); plt.colorbar(im1, ax=axes2[1])
     if has_gt:
-        im2 = axes[2].imshow(gt_gamma, cmap="magma",  vmin=0, vmax=1.0)
-        axes[2].set_title("GT Gamma"); plt.colorbar(im2, ax=axes[2])
-        im3 = axes[3].imshow(gt_alpha, cmap="viridis", vmin=0, vmax=2.0)
-        axes[3].set_title("GT Alpha"); plt.colorbar(im3, ax=axes[3])
+        im2 = axes2[2].imshow(gt_gamma, cmap="magma",  vmin=0, vmax=1.0)
+        axes2[2].set_title("GT Gamma"); plt.colorbar(im2, ax=axes2[2])
+        im3 = axes2[3].imshow(gt_alpha, cmap="viridis", vmin=0, vmax=2.0)
+        axes2[3].set_title("GT Alpha"); plt.colorbar(im3, ax=axes2[3])
     fig2.tight_layout()
     inf_path = os.path.join(RESULT_DIR, f"inference_maps_{VERSION}.png")
     fig2.savefig(inf_path, dpi=120, bbox_inches="tight"); plt.close(fig2)

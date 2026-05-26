@@ -22,15 +22,13 @@ class PhysReconDataset(Dataset):
     Spatial blind-spot:
         80% of cell pixels: G_norm visible in input → loss applied.
         20% of cell pixels: G_norm zeroed in input → excluded from loss.
-
-    v3.6 (Direction A): K-1 log-log slope channels appended to input.
-        Δ_k = Δlog(G_norm) / Δlog(τ) → -α at large τ, independent of γ.
-        Held-out pixels are also zeroed in the slope channels.
+    The model must infer held-out pixels from neighbouring visible pixels,
+    giving a meaningful spatial generalisation test.
 
     Returns:
-        g_input   : (2K-1, P, P)  G_norm (K ch) + slopes (K-1 ch) — masked
-        g_target  : (P, P, K)     full normalised G — loss target (unchanged)
-        train_mask: (P, P)        1 at visible (80%) pixels
+        g_input   : (K, P, P)   masked normalised G — model input
+        g_target  : (P, P, K)   full normalised G   — loss target
+        train_mask: (P, P)      1 at visible (80%) pixels
     """
 
     def __init__(self,
@@ -91,18 +89,6 @@ class PhysReconDataset(Dataset):
         self.g_norm_masked = self.g_norm.copy()
         self.g_norm_masked[self.held_out_mask] = 0.0
 
-        # ---- Direction A: log-log slope channels (K-1 channels) -------------
-        # Δ_k = (log G_norm(τ_{k+1}) - log G_norm(τ_k)) / (log τ_{k+1} - log τ_k)
-        # At large τ, Δ_k → -α (independent of γ), providing a direct α signal.
-        log_g    = np.log(self.g_norm.clip(min=1e-8))          # (H, W, K)
-        log_tau  = np.log(np.array(self.recon_taus, dtype=np.float32))  # (K,)
-        d_log_tau = np.diff(log_tau)                            # (K-1,)
-        self.g_slope = np.diff(log_g, axis=-1) / d_log_tau     # (H, W, K-1)
-        self.g_slope[~self.cell_mask] = 0.0
-
-        self.g_slope_masked = self.g_slope.copy()
-        self.g_slope_masked[self.held_out_mask] = 0.0
-
         if mode == 'train':
             valid = [(y, x) for (y, x) in train_set
                      if self.margin <= y < self.H - self.margin
@@ -123,12 +109,10 @@ class PhysReconDataset(Dataset):
         y, x = self.coords[idx % len(self.coords)]
         m = self.margin
 
-        # Input: masked G_norm (K) + slopes (K-1) → (2K-1, P, P)
+        # Input: masked normalised G patch → (K, P, P)
         g_in  = self.g_norm_masked[y-m:y+m, x-m:x+m]        # (P, P, K)
-        s_in  = self.g_slope_masked[y-m:y+m, x-m:x+m]       # (P, P, K-1)
-        gs_in = np.concatenate([g_in, s_in], axis=-1)         # (P, P, 2K-1)
         g_input = torch.from_numpy(
-            gs_in.transpose(2, 0, 1).astype(np.float32))      # (2K-1, P, P)
+            g_in.transpose(2, 0, 1).astype(np.float32))       # (K, P, P)
 
         # Target: full normalised G patch → (P, P, K)
         g_tgt  = self.g_norm[y-m:y+m, x-m:x+m]
@@ -141,11 +125,9 @@ class PhysReconDataset(Dataset):
         return g_input, g_target, mask_t
 
     def _get_full_frame(self):
-        # Inference: full masked G_norm + slopes → (2K-1, H, W)
-        g  = self.g_norm_masked.transpose(2, 0, 1)    # (K,   H, W)
-        s  = self.g_slope_masked.transpose(2, 0, 1)   # (K-1, H, W)
-        gs = np.concatenate([g, s], axis=0)            # (2K-1,H, W)
-        return torch.from_numpy(gs.astype(np.float32))
+        # Inference: full masked normalised G map → (K, H, W)
+        g = self.g_norm_masked.transpose(2, 0, 1).astype(np.float32)
+        return torch.from_numpy(g)
 
 
 if __name__ == "__main__":

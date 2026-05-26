@@ -1,30 +1,30 @@
 """
-v3.6 — log-MSE + scaled Huber-TV + slope channels (Dir.A) + ELU-α (Dir.D).
+v3.6 — tau-weighted MSE + scaled Huber-TV + ELU-alpha (Dir.D).
 
 v3.5 post-mortem:
-  • λ_TV=0.01 was ~0.7% of log-MSE loss (~0.6) → TV did nothing.
-  • log-MSE with noisy G_empirical at large τ introduced unstable gradients.
+  - lambda_TV=0.01 was ~0.7% of total loss → TV did nothing.
+  - log-MSE inflated loss scale to ~0.6 (from 7e-3), making TV proportionally tiny.
+  - log-MSE with noisy large-tau G_empirical produced unstable gradients.
 
 v3.6 fixes:
-  • LAMBDA_TV = 0.5  (scaled to log-MSE magnitude; TV now ~40% of physics loss)
-  • Direction A: K-1 log-log slope channels appended to input.
-      Δ_k = Δlog(G_norm)/Δlog(τ) → -α at large τ, independent of γ.
-      Gives the model a direct per-pixel α signal; contrast between α=0.2
-      and α=1.0 is 24× larger in slope space than in G_norm space at τ=128.
-  • Direction D: α head uses ELU+1 instead of Sigmoid×2.
-      ELU+1: linear gradient for α>1 (no saturation), non-zero gradient
-      down to α→0. Sigmoid×2 has vanishing gradient near both ends.
-  • Input channels: K G_norm + K-1 slopes = 2K-1 = 19 (K=10 taus)
+  - tau-weighted MSE: L = sum_k w_k*(G_theory[k]-G_target[k])^2, w_k=log(tau_k)/sum.
+      Up-weights large-tau terms where dG/dalpha is strongest.
+      tau=1 gets weight=0 (log(1)=0) — correct, tau=1 gives no alpha signal.
+      More stable than log-MSE; loss stays at v3.4 scale (~1e-2).
+  - LAMBDA_TV = 0.5 — properly scaled to physics loss magnitude (~1e-2).
+  - ELU+1 for alpha output (Direction D): no saturation for alpha>1,
+      non-zero gradient down to alpha->0. Sigmoid*2 vanishes near both ends.
+  - Input: K=10 G_norm channels (Direction A slope channels NOT used —
+      would reduce reliance on spatial blind-spot self-supervised prior).
 
-Inherited from v3.4/v3.5 (unchanged):
-  • Per-pixel normalised G_empirical as input; 20% spatial blind-spot
-  • (γ, α) 2-channel output; amplitude removed entirely
-  • shape_only + log_space MSE at visible pixels
+Inherited from v3.4 (unchanged):
+  - Per-pixel normalised G_empirical input; 20% spatial blind-spot
+  - (gamma, alpha) 2-channel output; amplitude removed entirely
+  - shape_only normalised G_theory
 """
 
 import os
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
@@ -44,20 +44,16 @@ LEARNING_RATE   = 1e-4
 PATCH_SIZE      = 64
 TRAIN_FRACTION  = 0.80
 RECON_TAUS      = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)   # K=10
-_K              = len(RECON_TAUS)
-NUM_TAU_CH      = 2 * _K - 1   # K G_norm + K-1 slope channels = 19
-LAMBDA_TV       = 0.5     # scaled to log-MSE magnitude (~0.6)
-LOG_SPACE       = True    # log-MSE
+NUM_TAU_CH      = len(RECON_TAUS)   # 10 G_norm channels
+LAMBDA_TV       = 0.5               # scaled to physics loss magnitude
+TAU_WEIGHTED    = True              # log(tau_k) weights; replaces log-MSE
 CHECKPOINT_DIR  = "./checkpoint"
 RESULT_DIR      = "./result"
 # ----------------------------------------------------------------------------
 
 
 def huber_tv(x, delta=0.05):
-    """
-    Huber total variation on (B, C, H, W).
-    Huber(t) = t²/(2δ) for |t|<δ, else |t|-δ/2 — smooth near 0.
-    """
+    """Huber total variation on (B, C, H, W)."""
     dx = x[..., 1:] - x[..., :-1]
     dy = x[..., 1:, :] - x[..., :-1, :]
 
@@ -99,15 +95,14 @@ def train_physics_reconstruction():
                                 predict_amplitude=False).to(device)
     criterion = PhysicsReconLoss(recon_taus=RECON_TAUS,
                                  shape_only=True,
-                                 log_space=LOG_SPACE).to(device)
+                                 tau_weighted=TAU_WEIGHTED).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS,
                                                       eta_min=1e-6)
 
     # ---- Training Loop -------------------------------------------------------
     print(f"[{VERSION}] {len(train_dataset)} patches/epoch  "
-          f"recon_τ={RECON_TAUS}  train_fraction={TRAIN_FRACTION}  "
-          f"λ_TV={LAMBDA_TV}  log_space={LOG_SPACE}")
+          f"recon_tau={RECON_TAUS}  tau_weighted={TAU_WEIGHTED}  lambda_TV={LAMBDA_TV}")
     history = {"loss": [], "phys_loss": [], "tv_loss": []}
 
     model.train()
@@ -117,9 +112,9 @@ def train_physics_reconstruction():
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
 
         for g_input, g_target, train_mask in pbar:
-            g_input     = g_input.to(device)
-            g_target    = g_target.to(device)
-            train_mask  = train_mask.to(device)
+            g_input    = g_input.to(device)
+            g_target   = g_target.to(device)
+            train_mask = train_mask.to(device)
 
             optimizer.zero_grad()
             preds = model(g_input)                               # (B, 2, P, P)
@@ -131,9 +126,9 @@ def train_physics_reconstruction():
             loss.backward()
             optimizer.step()
 
-            epoch_loss  += loss.item()
-            epoch_phys  += phys_loss.item()
-            epoch_tv    += tv.item() if LAMBDA_TV > 0 else 0.0
+            epoch_loss += loss.item()
+            epoch_phys += phys_loss.item()
+            epoch_tv   += tv.item() if LAMBDA_TV > 0 else 0.0
 
             with torch.no_grad():
                 m = train_mask.unsqueeze(1)
@@ -144,8 +139,8 @@ def train_physics_reconstruction():
                 mean_a = alpha_sum / (pix_count + 1e-10)
 
             pbar.set_postfix({"L": f"{loss.item():.5e}",
-                              "γ̄": f"{mean_g:.3f}",
-                              "ᾱ": f"{mean_a:.3f}"})
+                              "gamma": f"{mean_g:.3f}",
+                              "alpha": f"{mean_a:.3f}"})
 
         n = len(train_loader)
         scheduler.step()
@@ -154,29 +149,29 @@ def train_physics_reconstruction():
         history["tv_loss"].append(epoch_tv / n)
         print(f"Epoch [{epoch+1}/{EPOCHS}]  "
               f"Loss={epoch_loss/n:.5e}  Phys={epoch_phys/n:.5e}  "
-              f"TV={epoch_tv/n:.5e}  γ̄={mean_g:.3f}  ᾱ={mean_a:.3f}  "
+              f"TV={epoch_tv/n:.5e}  gamma={mean_g:.3f}  alpha={mean_a:.3f}  "
               f"LR={scheduler.get_last_lr()[0]:.2e}")
 
     # ---- Save checkpoint + loss curve ----------------------------------------
     ckpt_path = os.path.join(CHECKPOINT_DIR, f"pissl_phys_recon_{VERSION}.pth")
     torch.save(model.state_dict(), ckpt_path)
-    print(f"Model saved → {ckpt_path}")
+    print(f"Model saved -> {ckpt_path}")
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     axes[0].plot(history["loss"], label="Total loss")
-    axes[0].plot(history["phys_loss"], label="Physics (log-MSE)", linestyle="--")
+    axes[0].plot(history["phys_loss"], label="Physics (tau-weighted MSE)", linestyle="--")
     axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Loss")
     axes[0].set_title(f"Training Loss [{VERSION}]")
     axes[0].legend(); axes[0].set_yscale("log")
 
-    axes[1].plot(history["tv_loss"], label=f"Huber-TV (λ={LAMBDA_TV})", color="orange")
+    axes[1].plot(history["tv_loss"], label=f"Huber-TV (lambda={LAMBDA_TV})", color="orange")
     axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("TV loss (unscaled)")
     axes[1].set_title("TV Regularisation"); axes[1].legend()
     axes[1].set_yscale("log")
 
     loss_fig = os.path.join(RESULT_DIR, f"loss_curve_{VERSION}.png")
     fig.savefig(loss_fig, dpi=120, bbox_inches="tight"); plt.close(fig)
-    print(f"Loss curve → {loss_fig}")
+    print(f"Loss curve -> {loss_fig}")
 
     # ---- Full-frame inference ------------------------------------------------
     print("\n--- Full Frame Inference ---")
@@ -221,11 +216,11 @@ def train_physics_reconstruction():
         aA_held = mae(alpha_map, gt_alpha, held_out_mask)
         rG = gG_held / (gG_seen + 1e-10)
         rA = aA_held / (aA_seen + 1e-10)
-        print(f"  Gamma MAE — seen    : {gG_seen:.4f}")
-        print(f"  Gamma MAE — held-out: {gG_held:.4f}  ratio: {rG:.2f}")
-        print(f"  Alpha MAE — seen    : {aA_seen:.4f}")
-        print(f"  Alpha MAE — held-out: {aA_held:.4f}  ratio: {rA:.2f}")
-        print(f"  (ratio ≈ 1 → spatial generalisation; >> 1 → memorisation)")
+        print(f"  Gamma MAE -- seen    : {gG_seen:.4f}")
+        print(f"  Gamma MAE -- held-out: {gG_held:.4f}  ratio: {rG:.2f}")
+        print(f"  Alpha MAE -- seen    : {aA_seen:.4f}")
+        print(f"  Alpha MAE -- held-out: {aA_held:.4f}  ratio: {rA:.2f}")
+        print(f"  (ratio ~1 -> spatial generalisation; >>1 -> memorisation)")
         print("==============================================\n")
 
         rpt = os.path.join(RESULT_DIR, f"generalisation_{VERSION}.txt")
@@ -237,7 +232,7 @@ def train_physics_reconstruction():
             f.write(f"Gamma MAE held-out: {gG_held:.4f}  ratio: {rG:.2f}\n")
             f.write(f"Alpha MAE seen    : {aA_seen:.4f}\n")
             f.write(f"Alpha MAE held-out: {aA_held:.4f}  ratio: {rA:.2f}\n")
-        print(f"Generalisation report → {rpt}")
+        print(f"Generalisation report -> {rpt}")
 
     # ---- Inference maps figure -----------------------------------------------
     has_gt = gt_gamma is not None
@@ -255,7 +250,7 @@ def train_physics_reconstruction():
     fig2.tight_layout()
     inf_path = os.path.join(RESULT_DIR, f"inference_maps_{VERSION}.png")
     fig2.savefig(inf_path, dpi=120, bbox_inches="tight"); plt.close(fig2)
-    print(f"Inference maps → {inf_path}")
+    print(f"Inference maps -> {inf_path}")
 
 
 if __name__ == "__main__":

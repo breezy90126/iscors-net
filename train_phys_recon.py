@@ -252,6 +252,75 @@ def train_physics_reconstruction():
     fig2.savefig(inf_path, dpi=120, bbox_inches="tight"); plt.close(fig2)
     print(f"Inference maps -> {inf_path}")
 
+    # ---- tau Shuffle Test ------------------------------------------------
+    # Diagnostic: randomly permute the K tau channels in model input.
+    # Large |delta| -> model uses tau ordering (physics curve decoding).
+    # Small |delta| -> model ignores tau ordering (spatial pattern matching).
+    print("\n--- tau Shuffle Test ---")
+    N_SHUFFLES  = 10
+    dg_list, da_list = [], []
+    cell_mask_t = torch.from_numpy(train_dataset.cell_mask).to(device)
+
+    with torch.no_grad():
+        for _ in range(N_SHUFFLES):
+            perm        = torch.randperm(NUM_TAU_CH)
+            preds_shuf  = model(full_input[:, perm, :, :])
+            dg = (preds_full[0, 0] - preds_shuf[0, 0]).abs()
+            da = (preds_full[0, 1] - preds_shuf[0, 1]).abs()
+            dg_list.append(dg[cell_mask_t].mean().item())
+            da_list.append(da[cell_mask_t].mean().item())
+
+    mean_dg = float(np.mean(dg_list));  std_dg = float(np.std(dg_list))
+    mean_da = float(np.mean(da_list));  std_da = float(np.std(da_list))
+    print(f"  |Delta gamma| ({N_SHUFFLES} shuffles): {mean_dg:.4f} +/- {std_dg:.4f}")
+    print(f"  |Delta alpha| ({N_SHUFFLES} shuffles): {mean_da:.4f} +/- {std_da:.4f}")
+
+    # gamma range (0,1), alpha range (0,2) — thresholds at 5% of each range
+    if mean_dg < 0.05 and mean_da < 0.10:
+        verdict = "SPATIAL — model not using tau ordering (blind-spot spatial prior dominates)"
+    elif mean_dg > 0.15 or mean_da > 0.30:
+        verdict = "TEMPORAL — model using tau ordering (physics curve decoding active)"
+    else:
+        verdict = "MIXED — partial tau sensitivity"
+    print(f"  Verdict: {verdict}")
+
+    shuf_rpt = os.path.join(RESULT_DIR, f"shuffle_test_{VERSION}.txt")
+    with open(shuf_rpt, "w") as f:
+        f.write(f"=== tau Shuffle Test [{VERSION}] ===\n")
+        f.write(f"N shuffles        : {N_SHUFFLES}\n")
+        f.write(f"|Delta gamma| mean: {mean_dg:.4f}  std: {std_dg:.4f}\n")
+        f.write(f"|Delta alpha| mean: {mean_da:.4f}  std: {std_da:.4f}\n")
+        f.write(f"Verdict           : {verdict}\n")
+    print(f"Shuffle report -> {shuf_rpt}")
+
+    # Visualise one shuffle: original | shuffled | |diff|
+    with torch.no_grad():
+        perm_vis   = torch.randperm(NUM_TAU_CH)
+        preds_vis  = model(full_input[:, perm_vis, :, :])
+    gm_shuf = preds_vis[0, 0].cpu().numpy(); gm_shuf[bg_mask] = 0.0
+    am_shuf = preds_vis[0, 1].cpu().numpy(); am_shuf[bg_mask] = 0.0
+    diff_g  = np.abs(gamma_map - gm_shuf)
+    diff_a  = np.abs(alpha_map - am_shuf)
+
+    fig3, ax3 = plt.subplots(2, 3, figsize=(15, 8))
+    for row, (orig, shuf, diff, cmap, vmax, lbl) in enumerate([
+        (gamma_map, gm_shuf, diff_g, "magma",   1.0, "Gamma"),
+        (alpha_map, am_shuf, diff_a, "viridis", 2.0, "Alpha"),
+    ]):
+        cell = train_dataset.cell_mask
+        im = ax3[row,0].imshow(orig, cmap=cmap, vmin=0, vmax=vmax)
+        ax3[row,0].set_title(f"{lbl} original"); plt.colorbar(im, ax=ax3[row,0])
+        im = ax3[row,1].imshow(shuf, cmap=cmap, vmin=0, vmax=vmax)
+        ax3[row,1].set_title(f"{lbl} shuffled-tau"); plt.colorbar(im, ax=ax3[row,1])
+        im = ax3[row,2].imshow(diff, cmap="hot", vmin=0)
+        ax3[row,2].set_title(f"|diff| {lbl}  mean={diff[cell].mean():.3f}")
+        plt.colorbar(im, ax=ax3[row,2])
+    fig3.suptitle(f"tau Shuffle Test [{VERSION}]  perm={perm_vis.tolist()}")
+    fig3.tight_layout()
+    shuf_fig = os.path.join(RESULT_DIR, f"shuffle_test_{VERSION}.png")
+    fig3.savefig(shuf_fig, dpi=120, bbox_inches="tight"); plt.close(fig3)
+    print(f"Shuffle test figure -> {shuf_fig}")
+
 
 if __name__ == "__main__":
     train_physics_reconstruction()

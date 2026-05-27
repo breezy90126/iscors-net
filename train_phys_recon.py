@@ -1,26 +1,27 @@
 """
-v3.6 — tau-weighted MSE + scaled Huber-TV + ELU-alpha (Dir.D).
+v3.7 — separate TV strengths for gamma and alpha.
 
-v3.5 post-mortem:
-  - lambda_TV=0.01 was ~0.7% of total loss → TV did nothing.
-  - log-MSE inflated loss scale to ~0.6 (from 7e-3), making TV proportionally tiny.
-  - log-MSE with noisy large-tau G_empirical produced unstable gradients.
+v3.6 post-mortem:
+  - tau shuffle test showed |Delta alpha|=0.130 with clearly separated spatial
+    structure in the diff map — model HAS learned alpha spatial structure internally.
+  - But alpha output was nearly uniform: TV (lambda=0.5 on both channels) was
+    compressing the alpha dynamic range, suppressing boundary expression.
+  - gamma and alpha have different physical smoothness priors:
+      gamma (diffusion coefficient): physically smooth — strong TV appropriate.
+      alpha (anomalous exponent): sharp region boundaries expected (e.g. heterochromatin
+        vs euchromatin vs active transport zones) — weak TV needed to let boundaries form.
 
-v3.6 fixes:
-  - tau-weighted MSE: L = sum_k w_k*(G_theory[k]-G_target[k])^2, w_k=log(tau_k)/sum.
-      Up-weights large-tau terms where dG/dalpha is strongest.
-      tau=1 gets weight=0 (log(1)=0) — correct, tau=1 gives no alpha signal.
-      More stable than log-MSE; loss stays at v3.4 scale (~1e-2).
-  - LAMBDA_TV = 0.5 — properly scaled to physics loss magnitude (~1e-2).
-  - ELU+1 for alpha output (Direction D): no saturation for alpha>1,
-      non-zero gradient down to alpha->0. Sigmoid*2 vanishes near both ends.
-  - Input: K=10 G_norm channels (Direction A slope channels NOT used —
-      would reduce reliance on spatial blind-spot self-supervised prior).
+v3.7 fix:
+  - LAMBDA_TV_GAMMA = 0.5  (unchanged — gamma is physically smooth)
+  - LAMBDA_TV_ALPHA = 0.05 (10x weaker — releases alpha dynamic range)
+  - Huber-TV applied separately to each output channel.
 
-Inherited from v3.4 (unchanged):
+Inherited from v3.6 (unchanged):
+  - tau-weighted MSE with log(tau_k) weights
+  - ELU+1 for alpha output (Direction D)
+  - K=10 G_norm channels input (Direction A slope channels NOT used)
   - Per-pixel normalised G_empirical input; 20% spatial blind-spot
   - (gamma, alpha) 2-channel output; amplitude removed entirely
-  - shape_only normalised G_theory
 """
 
 import os
@@ -35,7 +36,7 @@ from datasets.phys_recon_dataset import PhysReconDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.phys_recon_loss import PhysicsReconLoss
 
-VERSION = "v3.6"
+VERSION = "v3.7"
 
 # ---- Hyperparameters -------------------------------------------------------
 EPOCHS          = 200
@@ -45,7 +46,8 @@ PATCH_SIZE      = 64
 TRAIN_FRACTION  = 0.80
 RECON_TAUS      = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)   # K=10
 NUM_TAU_CH      = len(RECON_TAUS)   # 10 G_norm channels
-LAMBDA_TV       = 0.5               # scaled to physics loss magnitude
+LAMBDA_TV_GAMMA = 0.5               # strong: gamma is physically smooth
+LAMBDA_TV_ALPHA = 0.05              # weak: alpha has genuine sharp boundaries
 TAU_WEIGHTED    = True              # log(tau_k) weights; replaces log-MSE
 CHECKPOINT_DIR  = "./checkpoint"
 RESULT_DIR      = "./result"
@@ -102,12 +104,13 @@ def train_physics_reconstruction():
 
     # ---- Training Loop -------------------------------------------------------
     print(f"[{VERSION}] {len(train_dataset)} patches/epoch  "
-          f"recon_tau={RECON_TAUS}  tau_weighted={TAU_WEIGHTED}  lambda_TV={LAMBDA_TV}")
-    history = {"loss": [], "phys_loss": [], "tv_loss": []}
+          f"recon_tau={RECON_TAUS}  tau_weighted={TAU_WEIGHTED}  "
+          f"lambda_TV_gamma={LAMBDA_TV_GAMMA}  lambda_TV_alpha={LAMBDA_TV_ALPHA}")
+    history = {"loss": [], "phys_loss": [], "tv_gamma": [], "tv_alpha": []}
 
     model.train()
     for epoch in range(EPOCHS):
-        epoch_loss = epoch_phys = epoch_tv = 0.0
+        epoch_loss = epoch_phys = epoch_tvg = epoch_tva = 0.0
         gamma_sum = alpha_sum = pix_count = 0.0
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
 
@@ -120,15 +123,17 @@ def train_physics_reconstruction():
             preds = model(g_input)                               # (B, 2, P, P)
 
             phys_loss = criterion(preds, g_target, train_mask)
-            tv        = huber_tv(preds) if LAMBDA_TV > 0 else torch.tensor(0.0)
-            loss      = phys_loss + LAMBDA_TV * tv
+            tv_g = huber_tv(preds[:, 0:1]) if LAMBDA_TV_GAMMA > 0 else torch.tensor(0.0)
+            tv_a = huber_tv(preds[:, 1:2]) if LAMBDA_TV_ALPHA > 0 else torch.tensor(0.0)
+            loss = phys_loss + LAMBDA_TV_GAMMA * tv_g + LAMBDA_TV_ALPHA * tv_a
 
             loss.backward()
             optimizer.step()
 
             epoch_loss += loss.item()
             epoch_phys += phys_loss.item()
-            epoch_tv   += tv.item() if LAMBDA_TV > 0 else 0.0
+            epoch_tvg  += tv_g.item() if LAMBDA_TV_GAMMA > 0 else 0.0
+            epoch_tva  += tv_a.item() if LAMBDA_TV_ALPHA > 0 else 0.0
 
             with torch.no_grad():
                 m = train_mask.unsqueeze(1)
@@ -146,10 +151,12 @@ def train_physics_reconstruction():
         scheduler.step()
         history["loss"].append(epoch_loss / n)
         history["phys_loss"].append(epoch_phys / n)
-        history["tv_loss"].append(epoch_tv / n)
+        history["tv_gamma"].append(epoch_tvg / n)
+        history["tv_alpha"].append(epoch_tva / n)
         print(f"Epoch [{epoch+1}/{EPOCHS}]  "
               f"Loss={epoch_loss/n:.5e}  Phys={epoch_phys/n:.5e}  "
-              f"TV={epoch_tv/n:.5e}  gamma={mean_g:.3f}  alpha={mean_a:.3f}  "
+              f"TV_g={epoch_tvg/n:.5e}  TV_a={epoch_tva/n:.5e}  "
+              f"gamma={mean_g:.3f}  alpha={mean_a:.3f}  "
               f"LR={scheduler.get_last_lr()[0]:.2e}")
 
     # ---- Save checkpoint + loss curve ----------------------------------------
@@ -164,9 +171,10 @@ def train_physics_reconstruction():
     axes[0].set_title(f"Training Loss [{VERSION}]")
     axes[0].legend(); axes[0].set_yscale("log")
 
-    axes[1].plot(history["tv_loss"], label=f"Huber-TV (lambda={LAMBDA_TV})", color="orange")
+    axes[1].plot(history["tv_gamma"], label=f"Huber-TV gamma (lambda={LAMBDA_TV_GAMMA})", color="orange")
+    axes[1].plot(history["tv_alpha"], label=f"Huber-TV alpha (lambda={LAMBDA_TV_ALPHA})", color="steelblue", linestyle="--")
     axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("TV loss (unscaled)")
-    axes[1].set_title("TV Regularisation"); axes[1].legend()
+    axes[1].set_title("TV Regularisation per Channel"); axes[1].legend()
     axes[1].set_yscale("log")
 
     loss_fig = os.path.join(RESULT_DIR, f"loss_curve_{VERSION}.png")

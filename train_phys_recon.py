@@ -407,6 +407,87 @@ def train_physics_reconstruction():
     fig3.savefig(shuf_fig, dpi=120, bbox_inches="tight"); plt.close(fig3)
     print(f"Shuffle test figure -> {shuf_fig}")
 
+    # ---- Cross-video overfitting test (v2 geometry) --------------------------
+    # Model trained on v1 (nested circles, hard edges).
+    # Run inference on v2 (concentric rings, soft edges, different parameters).
+    # Consistent MAE → method generalises. Poor MAE → spatial memorisation.
+    v2_path = "./data/test_synthetic_cell_v2.tif"
+    if not os.path.exists(v2_path):
+        print(f"\n[v2 overfitting test] {v2_path} not found — skipping.")
+        print("  Generate it with: python utils/generate_test_video.py")
+    else:
+        print("\n--- Cross-video Overfitting Test (v2 geometry) ---")
+        import tifffile as _tff
+        v2_matrix = _tff.imread(v2_path).astype(np.float32)
+        print(f"  v2 video shape: {v2_matrix.shape}")
+
+        v2_infer = PhysReconDataset(
+            video_tensor=v2_matrix,
+            recon_taus=RECON_TAUS,
+            patch_size=PATCH_SIZE,
+            mode="inference",
+        )
+        v2_input = v2_infer[0].unsqueeze(0).to(device)
+        with torch.no_grad():
+            v2_preds = model(v2_input)
+
+        v2_gamma = v2_preds[0, 0].cpu().numpy()
+        v2_alpha = v2_preds[0, 1].cpu().numpy()
+        v2_bg    = ~v2_infer.cell_mask
+        v2_gamma[v2_bg] = 0.0
+        v2_alpha[v2_bg] = 0.0
+
+        v2_gt_path = v2_path.replace('.tif', '_gt.npz')
+        if os.path.exists(v2_gt_path):
+            v2_gt   = np.load(v2_gt_path)
+            v2_gt_g = v2_gt["gamma"]     # blurred GT
+            v2_gt_a = v2_gt["alpha"]
+            cell2   = v2_infer.cell_mask
+
+            v2_mae_g = float(np.abs(v2_gamma[cell2] - v2_gt_g[cell2]).mean())
+            v2_mae_a = float(np.abs(v2_alpha[cell2] - v2_gt_a[cell2]).mean())
+            print(f"  v2 Gamma MAE (cell): {v2_mae_g:.4f}  "
+                  f"(v1 seen={gG_seen:.4f}, held={gG_held:.4f})")
+            print(f"  v2 Alpha MAE (cell): {v2_mae_a:.4f}  "
+                  f"(v1 seen={aA_seen:.4f}, held={aA_held:.4f})")
+
+            if v2_mae_g < 2 * gG_held and v2_mae_a < 2 * aA_held:
+                ov_verdict = "OK — v2 MAE within 2× of v1 held-out → no geometry memorisation"
+            else:
+                ov_verdict = "WARN — v2 MAE >> v1 held-out → possible spatial overfitting"
+            print(f"  Verdict: {ov_verdict}")
+
+            ov_rpt = os.path.join(RESULT_DIR, f"overfitting_test_{VERSION}.txt")
+            with open(ov_rpt, "w") as f:
+                f.write(f"=== Cross-video Overfitting Test [{VERSION}] ===\n")
+                f.write(f"Train video : test_synthetic_cell.tif   (nested circles, hard edges)\n")
+                f.write(f"Test  video : test_synthetic_cell_v2.tif (concentric rings, soft edges)\n")
+                f.write(f"v1 Gamma MAE seen    : {gG_seen:.4f}\n")
+                f.write(f"v1 Gamma MAE held-out: {gG_held:.4f}\n")
+                f.write(f"v2 Gamma MAE (cell)  : {v2_mae_g:.4f}\n")
+                f.write(f"v1 Alpha MAE seen    : {aA_seen:.4f}\n")
+                f.write(f"v1 Alpha MAE held-out: {aA_held:.4f}\n")
+                f.write(f"v2 Alpha MAE (cell)  : {v2_mae_a:.4f}\n")
+                f.write(f"Verdict              : {ov_verdict}\n")
+            print(f"  Overfitting report -> {ov_rpt}")
+
+            # Figure: v2 pred vs v2 GT
+            fig4, ax4 = plt.subplots(1, 4, figsize=(20, 4))
+            im = ax4[0].imshow(v2_gamma, cmap="magma",  vmin=0, vmax=0.5)
+            ax4[0].set_title(f"v2 Pred γ [{VERSION}]"); plt.colorbar(im, ax=ax4[0])
+            im = ax4[1].imshow(v2_alpha, cmap="viridis", vmin=0, vmax=2.0)
+            ax4[1].set_title(f"v2 Pred α [{VERSION}]"); plt.colorbar(im, ax=ax4[1])
+            im = ax4[2].imshow(v2_gt_g,  cmap="magma",  vmin=0, vmax=0.5)
+            ax4[2].set_title("v2 GT γ (soft)"); plt.colorbar(im, ax=ax4[2])
+            im = ax4[3].imshow(v2_gt_a,  cmap="viridis", vmin=0, vmax=2.0)
+            ax4[3].set_title("v2 GT α (soft)"); plt.colorbar(im, ax=ax4[3])
+            fig4.suptitle(f"Cross-video Test [{VERSION}] — "
+                          f"γ MAE={v2_mae_g:.3f}  α MAE={v2_mae_a:.3f}")
+            fig4.tight_layout()
+            ov_fig = os.path.join(RESULT_DIR, f"overfitting_test_{VERSION}.png")
+            fig4.savefig(ov_fig, dpi=120, bbox_inches="tight"); plt.close(fig4)
+            print(f"  Overfitting figure -> {ov_fig}")
+
 
 if __name__ == "__main__":
     train_physics_reconstruction()

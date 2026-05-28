@@ -1,57 +1,115 @@
 """
-v3.7 — separate TV strengths for gamma and alpha.
+v3.8 — physics-derived TV + Fisher information tau-weighting.
 
-v3.6 post-mortem:
-  - tau shuffle test showed |Delta alpha|=0.130 with clearly separated spatial
-    structure in the diff map — model HAS learned alpha spatial structure internally.
-  - But alpha output was nearly uniform: TV (lambda=0.5 on both channels) was
-    compressing the alpha dynamic range, suppressing boundary expression.
-  - gamma and alpha have different physical smoothness priors:
-      gamma (diffusion coefficient): physically smooth — strong TV appropriate.
-      alpha (anomalous exponent): sharp region boundaries expected (e.g. heterochromatin
-        vs euchromatin vs active transport zones) — weak TV needed to let boundaries form.
+v3.7 post-mortem:
+  - Fast spot α=1.5 became visible after releasing λ_TV_alpha. Hypothesis confirmed.
+  - But two structural problems remained:
+      (1) γ map severely compressed: fast spot pred γ≈0.15 vs GT γ=0.5.
+      (2) γ τ-sensitivity collapsed: shuffle |Δγ| dropped from 0.14 to 0.037.
+  - Root cause: log(τ) weighting up-weights τ=64–128 (α-sensitive zone),
+    but fast spot's G_norm≈0 at large τ → useless gradient there.
+    Meanwhile γ signal lives at τ=2–8 which log(τ) weights at 0.025–0.063.
+    TV_gamma=0.5 then overwhelms the already-weak γ physics gradient.
+  - v3.7 λ_TV values (0.5, 0.05) were empirically tuned, not physics-derived.
+    The v3.7 analysis confirmed TV_gamma=0.5 is ~350× larger than the
+    physics-derived value, effectively freezing spatial γ structure.
 
-v3.7 fix:
-  - LAMBDA_TV_GAMMA = 0.5  (unchanged — gamma is physically smooth)
-  - LAMBDA_TV_ALPHA = 0.05 (10x weaker — releases alpha dynamic range)
-  - Huber-TV applied separately to each output channel.
+v3.8 fixes (two independent directions, both kept as joint loss):
 
-Inherited from v3.6 (unchanged):
-  - tau-weighted MSE with log(tau_k) weights
+  Direction 1 — Physics-derived TV strength:
+    λ_TV = σ²_G / (σ²_prior × L²_PSF)
+      σ²_G      = 1/T              (noise floor; from video length)
+      L_PSF     = 0.61·λ_光/NA/px  (Rayleigh limit; from optics)
+      σ²_prior  = (param_range/6)² (6-sigma Bayesian prior; from activation bounds,
+                                    NOT from GT)
+    This gives λ_TV_gamma ≈ 1.4e-3, λ_TV_alpha ≈ 3.5e-4 for T=2000.
+    Ratio = (α_range/γ_range)² = 4 comes from model architecture, not observation.
+
+  Direction 2 — Fisher information τ-weighting:
+    w_k ∝ (∂G_norm/∂γ)² + (∂G_norm/∂α)²  evaluated at prior (γ₀=0.1, α₀=1.0)
+    Properties:
+      τ=1: weight=0 (normalisation point, zero information — same as log τ)
+      τ=8–16: peak (most jointly informative for both parameters)
+      τ=128: weight≈0.026 (6.8× less than log τ's 0.174 — avoids over-weighting
+             saturated G≈0 zone where both partials → 0)
+    Comparison to log(τ):
+      log(τ) peaks at τ=128 (monotone increase) — biases toward α and away from γ.
+      Fisher peaks at τ≈16 (bell shape) — balances both parameters naturally.
+    Note: both are fixed prior-based weights for stable training.
+    Per-pixel dynamic Fisher weights (using current predictions) are a future
+    extension but risk training instability if predictions are initially wrong.
+
+Inherited unchanged from v3.6/v3.7:
   - ELU+1 for alpha output (Direction D)
-  - K=10 G_norm channels input (Direction A slope channels NOT used)
+  - K=10 G_norm channels input
   - Per-pixel normalised G_empirical input; 20% spatial blind-spot
-  - (gamma, alpha) 2-channel output; amplitude removed entirely
+  - (gamma, alpha) 2-channel output; amplitude removed
+  - tau shuffle test diagnostic
 """
 
+import math
 import os
+
+import numpy as np
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader
-import numpy as np
 import tqdm
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
 
 from datasets.phys_recon_dataset import PhysReconDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.phys_recon_loss import PhysicsReconLoss
 
-VERSION = "v3.7"
+VERSION = "v3.8"
 
-# ---- Hyperparameters -------------------------------------------------------
-EPOCHS          = 200
-BATCH_SIZE      = 4
-LEARNING_RATE   = 1e-4
-PATCH_SIZE      = 64
-TRAIN_FRACTION  = 0.80
-RECON_TAUS      = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)   # K=10
-NUM_TAU_CH      = len(RECON_TAUS)   # 10 G_norm channels
-LAMBDA_TV_GAMMA = 0.5               # strong: gamma is physically smooth
-LAMBDA_TV_ALPHA = 0.05              # weak: alpha has genuine sharp boundaries
-TAU_WEIGHTED    = True              # log(tau_k) weights; replaces log-MSE
-CHECKPOINT_DIR  = "./checkpoint"
-RESULT_DIR      = "./result"
-# ----------------------------------------------------------------------------
+# ---- Training hyperparameters -----------------------------------------------
+EPOCHS         = 200
+BATCH_SIZE     = 4
+LEARNING_RATE  = 1e-4
+PATCH_SIZE     = 64
+TRAIN_FRACTION = 0.80
+RECON_TAUS     = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)   # K=10
+NUM_TAU_CH     = len(RECON_TAUS)
+CHECKPOINT_DIR = "./checkpoint"
+RESULT_DIR     = "./result"
+
+# ---- Optical parameters for physics-derived TV ------------------------------
+# Adjust these to match the actual microscope setup.
+WAVELENGTH_NM  = 532.0    # iSCAT illumination wavelength (nm)
+NA             = 1.4      # objective numerical aperture
+PIXEL_SIZE_NM  = 65.0     # pixel size at sample plane (nm)
+#   PSF Rayleigh limit = 0.61 * λ / NA / pixel_size  (in pixels)
+#   For 532nm, NA=1.4, 65nm/px: L_PSF ≈ 3.57 px
+
+# ---- Fisher information τ-weighting prior -----------------------------------
+# Evaluated at (γ₀, α₀) representing a "typical cell pixel" (not from GT).
+# Stable training: use fixed prior, not per-pixel dynamic weights.
+FISHER_GAMMA_PRIOR = 0.1   # typical cell body γ (iSCAT high-speed)
+FISHER_ALPHA_PRIOR = 1.0   # baseline normal diffusion α
+# -----------------------------------------------------------------------------
+
+
+def compute_physics_tv_lambdas(T, wavelength_nm, na, pixel_nm):
+    """
+    Derive λ_TV for γ and α from physical quantities only.
+
+    Formula: λ_TV = σ²_G / (σ²_prior × L²_PSF)
+
+      σ²_G    = 1/T                — G_norm estimation noise floor
+      L_PSF   = 0.61·λ/NA/pixel   — Rayleigh limit (pixels)
+      σ²_prior_γ = (γ_max/6)²     — 6-sigma prior over γ ∈ [0, 1]  (Sigmoid bound)
+      σ²_prior_α = (α_max/6)²     — 6-sigma prior over α ∈ [0, 2]  (ELU+1 bound)
+
+    The parameter ranges come from model activation bounds, not GT knowledge.
+    Ratio λ_γ/λ_α = σ²_prior_α/σ²_prior_γ = (α_max/γ_max)² = 4 — physics says
+    α has larger dynamic range, so its TV should be proportionally weaker.
+    """
+    L_psf   = 0.61 * wavelength_nm / na / pixel_nm          # Rayleigh (pixels)
+    sigma2G = 1.0 / T                                        # noise floor
+    lam_g   = sigma2G / ((1.0 / 6) ** 2 * L_psf ** 2)       # γ_max=1
+    lam_a   = sigma2G / ((2.0 / 6) ** 2 * L_psf ** 2)       # α_max=2
+    return lam_g, lam_a, L_psf
 
 
 def huber_tv(x, delta=0.05):
@@ -83,6 +141,16 @@ def train_physics_reconstruction():
     T, H, W = video_matrix.shape
     print(f"Video shape: T={T}, H={H}, W={W}")
 
+    # ---- Physics-derived TV lambdas (computed from T and optics) -------------
+    LAMBDA_TV_GAMMA, LAMBDA_TV_ALPHA, L_psf = compute_physics_tv_lambdas(
+        T, WAVELENGTH_NM, NA, PIXEL_SIZE_NM
+    )
+    print(f"[{VERSION}] PSF = {L_psf:.3f} px  "
+          f"(λ={WAVELENGTH_NM}nm, NA={NA}, pixel={PIXEL_SIZE_NM}nm)")
+    print(f"[{VERSION}] Physics-derived TV:  "
+          f"λ_gamma={LAMBDA_TV_GAMMA:.3e}  λ_alpha={LAMBDA_TV_ALPHA:.3e}  "
+          f"ratio={LAMBDA_TV_GAMMA/LAMBDA_TV_ALPHA:.1f}×")
+
     train_dataset = PhysReconDataset(
         video_tensor=video_matrix,
         recon_taus=RECON_TAUS,
@@ -95,17 +163,26 @@ def train_physics_reconstruction():
     # ---- Model & Loss --------------------------------------------------------
     model     = PISSLTauEncoder(num_tau_channels=NUM_TAU_CH,
                                 predict_amplitude=False).to(device)
-    criterion = PhysicsReconLoss(recon_taus=RECON_TAUS,
-                                 shape_only=True,
-                                 tau_weighted=TAU_WEIGHTED).to(device)
+    criterion = PhysicsReconLoss(
+        recon_taus=RECON_TAUS,
+        shape_only=True,
+        fisher_weighted=True,
+        fisher_gamma_prior=FISHER_GAMMA_PRIOR,
+        fisher_alpha_prior=FISHER_ALPHA_PRIOR,
+    ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS,
                                                       eta_min=1e-6)
 
+    # Print Fisher weight profile for transparency
+    fw = criterion.fisher_weights.squeeze().cpu().tolist()
+    print(f"[{VERSION}] Fisher τ-weights at (γ₀={FISHER_GAMMA_PRIOR}, α₀={FISHER_ALPHA_PRIOR}):")
+    print("  " + "  ".join(f"τ={t}:{w:.3f}" for t, w in zip(RECON_TAUS, fw)))
+
     # ---- Training Loop -------------------------------------------------------
     print(f"[{VERSION}] {len(train_dataset)} patches/epoch  "
-          f"recon_tau={RECON_TAUS}  tau_weighted={TAU_WEIGHTED}  "
-          f"lambda_TV_gamma={LAMBDA_TV_GAMMA}  lambda_TV_alpha={LAMBDA_TV_ALPHA}")
+          f"fisher_weighted=True  "
+          f"λ_TV_gamma={LAMBDA_TV_GAMMA:.3e}  λ_TV_alpha={LAMBDA_TV_ALPHA:.3e}")
     history = {"loss": [], "phys_loss": [], "tv_gamma": [], "tv_alpha": []}
 
     model.train()
@@ -144,8 +221,7 @@ def train_physics_reconstruction():
                 mean_a = alpha_sum / (pix_count + 1e-10)
 
             pbar.set_postfix({"L": f"{loss.item():.5e}",
-                              "gamma": f"{mean_g:.3f}",
-                              "alpha": f"{mean_a:.3f}"})
+                              "γ": f"{mean_g:.3f}", "α": f"{mean_a:.3f}"})
 
         n = len(train_loader)
         scheduler.step()
@@ -156,7 +232,7 @@ def train_physics_reconstruction():
         print(f"Epoch [{epoch+1}/{EPOCHS}]  "
               f"Loss={epoch_loss/n:.5e}  Phys={epoch_phys/n:.5e}  "
               f"TV_g={epoch_tvg/n:.5e}  TV_a={epoch_tva/n:.5e}  "
-              f"gamma={mean_g:.3f}  alpha={mean_a:.3f}  "
+              f"γ={mean_g:.3f}  α={mean_a:.3f}  "
               f"LR={scheduler.get_last_lr()[0]:.2e}")
 
     # ---- Save checkpoint + loss curve ----------------------------------------
@@ -166,15 +242,18 @@ def train_physics_reconstruction():
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     axes[0].plot(history["loss"], label="Total loss")
-    axes[0].plot(history["phys_loss"], label="Physics (tau-weighted MSE)", linestyle="--")
+    axes[0].plot(history["phys_loss"], label="Physics (Fisher-weighted MSE)", linestyle="--")
     axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Loss")
     axes[0].set_title(f"Training Loss [{VERSION}]")
     axes[0].legend(); axes[0].set_yscale("log")
 
-    axes[1].plot(history["tv_gamma"], label=f"Huber-TV gamma (lambda={LAMBDA_TV_GAMMA})", color="orange")
-    axes[1].plot(history["tv_alpha"], label=f"Huber-TV alpha (lambda={LAMBDA_TV_ALPHA})", color="steelblue", linestyle="--")
+    axes[1].plot(history["tv_gamma"],
+                 label=f"Huber-TV γ  λ={LAMBDA_TV_GAMMA:.2e}", color="orange")
+    axes[1].plot(history["tv_alpha"],
+                 label=f"Huber-TV α  λ={LAMBDA_TV_ALPHA:.2e}",
+                 color="steelblue", linestyle="--")
     axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("TV loss (unscaled)")
-    axes[1].set_title("TV Regularisation per Channel"); axes[1].legend()
+    axes[1].set_title(f"TV Regularisation (physics-derived λ)"); axes[1].legend()
     axes[1].set_yscale("log")
 
     loss_fig = os.path.join(RESULT_DIR, f"loss_curve_{VERSION}.png")
@@ -203,7 +282,7 @@ def train_physics_reconstruction():
     print(f"Background pixels zeroed: {bg_mask.sum()}")
 
     # ---- Generalisation report -----------------------------------------------
-    gt_path = "./data/test_synthetic_cell_gt.npz"
+    gt_path  = "./data/test_synthetic_cell_gt.npz"
     gt_gamma = gt_alpha = None
     if os.path.exists(gt_path):
         gt = np.load(gt_path)
@@ -212,18 +291,19 @@ def train_physics_reconstruction():
         seen_mask     = train_dataset.supervised_mask.astype(bool)
         held_out_mask = train_dataset.held_out_mask
 
-        def mae(pred, gt, mask):
-            return float(np.abs(pred[mask] - gt[mask]).mean()) if mask.any() else float("nan")
+        def mae(pred, gt_map, mask):
+            return float(np.abs(pred[mask] - gt_map[mask]).mean()) if mask.any() else float("nan")
 
-        print(f"\n=== Generalisation Report [{VERSION}] ===")
-        print(f"  Supervised  pixels : {seen_mask.sum()}")
-        print(f"  Held-out    pixels : {held_out_mask.sum()}")
         gG_seen = mae(gamma_map, gt_gamma, seen_mask)
         gG_held = mae(gamma_map, gt_gamma, held_out_mask)
         aA_seen = mae(alpha_map, gt_alpha, seen_mask)
         aA_held = mae(alpha_map, gt_alpha, held_out_mask)
         rG = gG_held / (gG_seen + 1e-10)
         rA = aA_held / (aA_seen + 1e-10)
+
+        print(f"\n=== Generalisation Report [{VERSION}] ===")
+        print(f"  Supervised  pixels : {seen_mask.sum()}")
+        print(f"  Held-out    pixels : {held_out_mask.sum()}")
         print(f"  Gamma MAE -- seen    : {gG_seen:.4f}")
         print(f"  Gamma MAE -- held-out: {gG_held:.4f}  ratio: {rG:.2f}")
         print(f"  Alpha MAE -- seen    : {aA_seen:.4f}")
@@ -240,6 +320,9 @@ def train_physics_reconstruction():
             f.write(f"Gamma MAE held-out: {gG_held:.4f}  ratio: {rG:.2f}\n")
             f.write(f"Alpha MAE seen    : {aA_seen:.4f}\n")
             f.write(f"Alpha MAE held-out: {aA_held:.4f}  ratio: {rA:.2f}\n")
+            f.write(f"PSF_px            : {L_psf:.3f}\n")
+            f.write(f"lambda_TV_gamma   : {LAMBDA_TV_GAMMA:.3e}\n")
+            f.write(f"lambda_TV_alpha   : {LAMBDA_TV_ALPHA:.3e}\n")
         print(f"Generalisation report -> {rpt}")
 
     # ---- Inference maps figure -----------------------------------------------
@@ -261,9 +344,6 @@ def train_physics_reconstruction():
     print(f"Inference maps -> {inf_path}")
 
     # ---- tau Shuffle Test ------------------------------------------------
-    # Diagnostic: randomly permute the K tau channels in model input.
-    # Large |delta| -> model uses tau ordering (physics curve decoding).
-    # Small |delta| -> model ignores tau ordering (spatial pattern matching).
     print("\n--- tau Shuffle Test ---")
     N_SHUFFLES  = 10
     dg_list, da_list = [], []
@@ -271,23 +351,22 @@ def train_physics_reconstruction():
 
     with torch.no_grad():
         for _ in range(N_SHUFFLES):
-            perm        = torch.randperm(NUM_TAU_CH)
-            preds_shuf  = model(full_input[:, perm, :, :])
+            perm       = torch.randperm(NUM_TAU_CH)
+            preds_shuf = model(full_input[:, perm, :, :])
             dg = (preds_full[0, 0] - preds_shuf[0, 0]).abs()
             da = (preds_full[0, 1] - preds_shuf[0, 1]).abs()
             dg_list.append(dg[cell_mask_t].mean().item())
             da_list.append(da[cell_mask_t].mean().item())
 
-    mean_dg = float(np.mean(dg_list));  std_dg = float(np.std(dg_list))
-    mean_da = float(np.mean(da_list));  std_da = float(np.std(da_list))
-    print(f"  |Delta gamma| ({N_SHUFFLES} shuffles): {mean_dg:.4f} +/- {std_dg:.4f}")
-    print(f"  |Delta alpha| ({N_SHUFFLES} shuffles): {mean_da:.4f} +/- {std_da:.4f}")
+    mean_dg = float(np.mean(dg_list)); std_dg = float(np.std(dg_list))
+    mean_da = float(np.mean(da_list)); std_da = float(np.std(da_list))
+    print(f"  |Δgamma| ({N_SHUFFLES} shuffles): {mean_dg:.4f} ± {std_dg:.4f}")
+    print(f"  |Δalpha| ({N_SHUFFLES} shuffles): {mean_da:.4f} ± {std_da:.4f}")
 
-    # gamma range (0,1), alpha range (0,2) — thresholds at 5% of each range
     if mean_dg < 0.05 and mean_da < 0.10:
-        verdict = "SPATIAL — model not using tau ordering (blind-spot spatial prior dominates)"
+        verdict = "SPATIAL — model not using tau ordering"
     elif mean_dg > 0.15 or mean_da > 0.30:
-        verdict = "TEMPORAL — model using tau ordering (physics curve decoding active)"
+        verdict = "TEMPORAL — physics curve decoding active"
     else:
         verdict = "MIXED — partial tau sensitivity"
     print(f"  Verdict: {verdict}")
@@ -301,10 +380,9 @@ def train_physics_reconstruction():
         f.write(f"Verdict           : {verdict}\n")
     print(f"Shuffle report -> {shuf_rpt}")
 
-    # Visualise one shuffle: original | shuffled | |diff|
     with torch.no_grad():
-        perm_vis   = torch.randperm(NUM_TAU_CH)
-        preds_vis  = model(full_input[:, perm_vis, :, :])
+        perm_vis  = torch.randperm(NUM_TAU_CH)
+        preds_vis = model(full_input[:, perm_vis, :, :])
     gm_shuf = preds_vis[0, 0].cpu().numpy(); gm_shuf[bg_mask] = 0.0
     am_shuf = preds_vis[0, 1].cpu().numpy(); am_shuf[bg_mask] = 0.0
     diff_g  = np.abs(gamma_map - gm_shuf)
@@ -316,14 +394,14 @@ def train_physics_reconstruction():
         (alpha_map, am_shuf, diff_a, "viridis", 2.0, "Alpha"),
     ]):
         cell = train_dataset.cell_mask
-        im = ax3[row,0].imshow(orig, cmap=cmap, vmin=0, vmax=vmax)
-        ax3[row,0].set_title(f"{lbl} original"); plt.colorbar(im, ax=ax3[row,0])
-        im = ax3[row,1].imshow(shuf, cmap=cmap, vmin=0, vmax=vmax)
-        ax3[row,1].set_title(f"{lbl} shuffled-tau"); plt.colorbar(im, ax=ax3[row,1])
-        im = ax3[row,2].imshow(diff, cmap="hot", vmin=0)
-        ax3[row,2].set_title(f"|diff| {lbl}  mean={diff[cell].mean():.3f}")
-        plt.colorbar(im, ax=ax3[row,2])
-    fig3.suptitle(f"tau Shuffle Test [{VERSION}]  perm={perm_vis.tolist()}")
+        im = ax3[row, 0].imshow(orig, cmap=cmap, vmin=0, vmax=vmax)
+        ax3[row, 0].set_title(f"{lbl} original"); plt.colorbar(im, ax=ax3[row, 0])
+        im = ax3[row, 1].imshow(shuf, cmap=cmap, vmin=0, vmax=vmax)
+        ax3[row, 1].set_title(f"{lbl} shuffled-τ"); plt.colorbar(im, ax=ax3[row, 1])
+        im = ax3[row, 2].imshow(diff, cmap="hot", vmin=0)
+        ax3[row, 2].set_title(f"|diff| {lbl}  mean={diff[cell].mean():.3f}")
+        plt.colorbar(im, ax=ax3[row, 2])
+    fig3.suptitle(f"τ Shuffle Test [{VERSION}]  perm={perm_vis.tolist()}")
     fig3.tight_layout()
     shuf_fig = os.path.join(RESULT_DIR, f"shuffle_test_{VERSION}.png")
     fig3.savefig(shuf_fig, dpi=120, bbox_inches="tight"); plt.close(fig3)

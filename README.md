@@ -67,14 +67,17 @@ Separate strengths: γ is physically smooth (λ_γ=0.5); α has sharp region bou
 
 | Component | Detail |
 |---|---|
-| Input | (B, K, P, P) — K=10 G_norm channels, P=64 patch |
+| Input | (B, 2K, P, P) — K G_norm + K τ-PE channels, P=64 patch |
+| τ-PE | `tau_pe[k] = log(τ_k)/log(τ_max)` ∈ [0,1], broadcast spatially (v3.9) |
 | Encoder | 4 stages: 64→128→256→512 channels |
 | Decoder | Bilinear up + skip concat, DoubleConv at each scale |
 | Output | (B, 2, P, P) — γ and α |
 | γ activation | Sigmoid → (0, 1) |
 | α activation | ELU+1: `(F.elu(x)+1.001).clamp(max=2)` → (0.001, 2] |
 
-The ELU+1 α activation avoids saturation at both ends (unlike Sigmoid×2).
+τ-PE makes the τ label for each G_norm channel explicit. Without it the model can use
+the set of G_norm magnitudes (bag-of-values shortcut) to identify (γ,α) without learning
+the τ-dependent curve shape — physics decoding only activates at region boundaries.
 
 ---
 
@@ -100,7 +103,14 @@ After inference, randomly permute the K τ-channel order and re-run the model. C
 - Large |Δγ|, |Δα| → model uses τ ordering (physics curve decoding active)
 - Small |Δγ|, |Δα| → model ignores τ ordering (spatial pattern matching only)
 
-v3.6 result: |Δα|=0.130, spatially separated diff map → model IS doing physics inference for α internally. TV regularization was suppressing the output expression of that structure (fixed in v3.7).
+| Version | |Δγ| | |Δα| | Pattern | Interpretation |
+|---|---|---|---|---|
+| v3.6 | 0.14 | 0.130 | Spatially separated regions | Physics active; TV suppressing output |
+| v3.7 | 0.037 | 0.122 | Uniform (dim) | γ collapsed; log(τ) starves fast-spot gradient |
+| v3.8 | 0.139 | 0.328 | **Ring (bright edge)** | Fisher weighting restores physics; interior shortcuts via spatial propagation |
+| v3.9 | TBD | TBD | Expected: uniform | τ-PE + 35% blind-spot break spatial shortcut |
+
+**Ring pattern (v3.8):** The shuffle diff is large at region boundaries (physics decoding needed) and small in interiors (spatial propagation from consistent neighbours suffices). This duality is expected in a U-Net; the τ-PE and increased blind-spot (v3.9) are designed to push more interior pixels into physics-decoding mode.
 
 ---
 
@@ -116,7 +126,9 @@ v3.6 result: |Δα|=0.130, spatially separated diff map → model IS doing physi
 | v3.4 | v3.1 + v3.3 combined | Grainy maps without TV |
 | v3.5 | log-MSE + TV | TV ineffective (λ not scaled to log-MSE magnitude) |
 | v3.6 | τ-weighted MSE + scaled TV + ELU-α | TV active; shuffle test reveals internal α structure |
-| **v3.7** | Separate λ_TV for γ and α | Release α boundary formation while keeping γ smooth |
+| v3.7 | Separate λ_TV for γ and α | Release α boundary formation; log(τ) starves fast-spot γ |
+| v3.8 | Fisher τ-weighting + physics-derived TV | Fast-spot γ recovered; shuffle ring pattern diagnosed |
+| **v3.9** | τ-PE + 35% blind-spot | Break bag-of-values shortcut; force interior physics decoding |
 
 ---
 
@@ -133,10 +145,11 @@ python train_phys_recon.py
 ```
 
 Outputs in `./result/`:
-- `inference_maps_v3.7.png` — predicted γ and α vs GT
-- `loss_curve_v3.7.png` — physics loss + TV_gamma + TV_alpha curves
-- `shuffle_test_v3.7.png` — τ shuffle diagnostic maps
-- `generalisation_v3.7.txt` — seen vs held-out MAE report
+- `inference_maps_v3.9.png` — predicted γ and α vs GT
+- `loss_curve_v3.9.png` — physics loss + TV_gamma + TV_alpha curves
+- `shuffle_test_v3.9.png` — τ shuffle diagnostic (expect uniform diff, not ring)
+- `generalisation_v3.9.txt` — seen vs held-out MAE report
+- `overfitting_test_v3.9.png` — cross-video generalisation (v1 train → v2 inference)
 
 ---
 

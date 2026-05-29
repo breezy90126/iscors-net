@@ -19,11 +19,16 @@ class PhysReconDataset(Dataset):
     Amplitude A is completely removed from the model — no mean-regression
     attractor, no amplitude-dominated gradient.
 
-    Spatial blind-spot:
-        80% of cell pixels: G_norm visible in input → loss applied.
-        20% of cell pixels: G_norm zeroed in input → excluded from loss.
-    The model must infer held-out pixels from neighbouring visible pixels,
-    giving a meaningful spatial generalisation test.
+    Spatial blind-spot (v3.9: 35% held-out):
+        65% of cell pixels: G_norm visible in input → loss applied.
+        35% of cell pixels: G_norm zeroed in input → excluded from loss.
+
+    Why 35% (vs original 20%):
+        At 20%, the model has many consistent neighbours for every held-out pixel
+        → spatial propagation dominates, physics decoding mainly active at region
+        boundaries. Increasing to 35% forces more pixels to rely on their own τ
+        curve (fewer consistent neighbours available), shifting the balance from
+        spatial propagation toward physics decoding.
 
     Returns:
         g_input   : (K, P, P)   masked normalised G — model input
@@ -36,7 +41,7 @@ class PhysReconDataset(Dataset):
                  recon_taus=(1, 2, 4, 8, 16, 32, 48, 64),
                  patch_size=64,
                  mode='train',
-                 train_fraction=0.80,
+                 train_fraction=0.65,
                  min_cv=0.005,
                  seed=42,
                  # legacy args — kept so existing call-sites don't break

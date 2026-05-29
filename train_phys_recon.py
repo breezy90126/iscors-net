@@ -1,50 +1,57 @@
 """
-v3.8 — physics-derived TV + Fisher information tau-weighting.
+v3.9 — τ positional encoding + increased blind-spot ratio (35%).
 
-v3.7 post-mortem:
-  - Fast spot α=1.5 became visible after releasing λ_TV_alpha. Hypothesis confirmed.
-  - But two structural problems remained:
-      (1) γ map severely compressed: fast spot pred γ≈0.15 vs GT γ=0.5.
-      (2) γ τ-sensitivity collapsed: shuffle |Δγ| dropped from 0.14 to 0.037.
-  - Root cause: log(τ) weighting up-weights τ=64–128 (α-sensitive zone),
-    but fast spot's G_norm≈0 at large τ → useless gradient there.
-    Meanwhile γ signal lives at τ=2–8 which log(τ) weights at 0.025–0.063.
-    TV_gamma=0.5 then overwhelms the already-weak γ physics gradient.
-  - v3.7 λ_TV values (0.5, 0.05) were empirically tuned, not physics-derived.
-    The v3.7 analysis confirmed TV_gamma=0.5 is ~350× larger than the
-    physics-derived value, effectively freezing spatial γ structure.
+v3.8 post-mortem:
+  - Fisher weighting (direction 2): successful. Fast spot γ now visible;
+    |Δγ| shuffle 0.037→0.139 (3.8×), |Δα| 0.122→0.328 (2.7×). γ recovery restored.
+  - Physics-derived TV (direction 1): λ_TV_alpha = 3.54e-4 too small.
+    TV_alpha plateaued from epoch 1 — α has no effective spatial regularisation.
+    Cross-video α MAE = 0.458 (range 0.60–1.30 → 65% relative error). Geometry
+    memorisation confirmed: model overfits v1 ring positions for α, fails on v2.
+  - τ shuffle showed ring pattern (boundary bright, interior dim):
+    Root cause — model uses two inference modes:
+      (A) Interior: spatial propagation from consistent neighbours (τ-order independent)
+      (B) Boundary: physics decoding from own τ curve (τ-order dependent)
+    The ring = visualisation of where mode (A) vs (B) is active.
+    Mode (A) shortcut: G_norm magnitude pattern (bag-of-values) identified without
+    knowing τ labels → interior diff small even when τ shuffled.
 
-v3.8 fixes (two independent directions, both kept as joint loss):
+v3.9 fixes (two independent directions):
 
-  Direction 1 — Physics-derived TV strength:
-    λ_TV = σ²_G / (σ²_prior × L²_PSF)
-      σ²_G      = 1/T              (noise floor; from video length)
-      L_PSF     = 0.61·λ_光/NA/px  (Rayleigh limit; from optics)
-      σ²_prior  = (param_range/6)² (6-sigma Bayesian prior; from activation bounds,
-                                    NOT from GT)
-    This gives λ_TV_gamma ≈ 1.4e-3, λ_TV_alpha ≈ 3.5e-4 for T=2000.
-    Ratio = (α_range/γ_range)² = 4 comes from model architecture, not observation.
+  Direction 1 — τ positional encoding:
+    Append K extra channels to G_norm input: tau_pe[k] = log(τ_k)/log(τ_max) ∈ [0,1],
+    broadcast spatially. Model input: (B, 2K, H, W) instead of (B, K, H, W).
 
-  Direction 2 — Fisher information τ-weighting:
-    w_k ∝ (∂G_norm/∂γ)² + (∂G_norm/∂α)²  evaluated at prior (γ₀=0.1, α₀=1.0)
-    Properties:
-      τ=1: weight=0 (normalisation point, zero information — same as log τ)
-      τ=8–16: peak (most jointly informative for both parameters)
-      τ=128: weight≈0.026 (6.8× less than log τ's 0.174 — avoids over-weighting
-             saturated G≈0 zone where both partials → 0)
-    Comparison to log(τ):
-      log(τ) peaks at τ=128 (monotone increase) — biases toward α and away from γ.
-      Fisher peaks at τ≈16 (bell shape) — balances both parameters naturally.
-    Note: both are fixed prior-based weights for stable training.
-    Per-pixel dynamic Fisher weights (using current predictions) are a future
-    extension but risk training instability if predictions are initially wrong.
+    Effect on shuffle test:
+      When G_norm channels are permuted but τ-PE stays in correct order, model sees
+      G_norm(τ_{perm(k)}) paired with τ_k label → physics mismatch at every pixel.
+      Bag-of-values shortcut becomes ineffective because τ label now disambiguates
+      which value belongs to which τ. Expected: |Δγ|, |Δα| large and spatially uniform
+      (not only at boundaries).
 
-Inherited unchanged from v3.6/v3.7:
+  Direction 2 — Increased blind-spot ratio (20% → 35%):
+    TRAIN_FRACTION: 0.80 → 0.65
+
+    Effect on spatial propagation shortcut:
+      At 20%, every masked pixel has ~9 visible neighbours in a 3×3 neighbourhood.
+      Consistent neighbourhood → spatial propagation suffices, no need for own τ curve.
+      At 35%, masked pixels are more isolated → fewer consistent neighbours → model
+      must rely on own τ curve for more pixels → physics decoding strengthens.
+      Microscopy spatial redundancy prior is preserved (U-Net, not per-pixel MLP).
+
+  TV lambdas (correction from v3.8):
+    Physics formula underestimated needed strength (ignores initialisation noise).
+    Add PHYSICS_TV_CORRECTION = 10.0 to both λ:
+      λ_TV_gamma ≈ 1.4e-2 (vs 1.4e-3 in v3.8)
+      λ_TV_alpha ≈ 3.5e-3 (vs 3.5e-4 in v3.8)
+    4× ratio (γ:α) unchanged — from activation bounds, not GT.
+
+Inherited unchanged from v3.8:
   - ELU+1 for alpha output (Direction D)
-  - K=10 G_norm channels input
-  - Per-pixel normalised G_empirical input; 20% spatial blind-spot
-  - (gamma, alpha) 2-channel output; amplitude removed
-  - tau shuffle test diagnostic
+  - Fisher information τ-weighting (peaked at τ=8–16)
+  - Per-pixel normalised G_empirical input; (gamma, alpha) 2-channel output
+  - τ shuffle test diagnostic
+  - Cross-video overfitting test (v1 train → v2 inference)
 """
 
 import math
@@ -61,14 +68,14 @@ from datasets.phys_recon_dataset import PhysReconDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.phys_recon_loss import PhysicsReconLoss
 
-VERSION = "v3.8"
+VERSION = "v3.9"
 
 # ---- Training hyperparameters -----------------------------------------------
 EPOCHS         = 200
 BATCH_SIZE     = 4
 LEARNING_RATE  = 1e-4
 PATCH_SIZE     = 64
-TRAIN_FRACTION = 0.80
+TRAIN_FRACTION = 0.65                                       # v3.9: 35% blind-spot
 RECON_TAUS     = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)   # K=10
 NUM_TAU_CH     = len(RECON_TAUS)
 CHECKPOINT_DIR = "./checkpoint"
@@ -76,11 +83,14 @@ RESULT_DIR     = "./result"
 
 # ---- Optical parameters for physics-derived TV ------------------------------
 # Adjust these to match the actual microscope setup.
-WAVELENGTH_NM  = 532.0    # iSCAT illumination wavelength (nm)
-NA             = 1.4      # objective numerical aperture
-PIXEL_SIZE_NM  = 65.0     # pixel size at sample plane (nm)
+WAVELENGTH_NM       = 532.0   # iSCAT illumination wavelength (nm)
+NA                  = 1.4     # objective numerical aperture
+PIXEL_SIZE_NM       = 65.0    # pixel size at sample plane (nm)
 #   PSF Rayleigh limit = 0.61 * λ / NA / pixel_size  (in pixels)
 #   For 532nm, NA=1.4, 65nm/px: L_PSF ≈ 3.57 px
+# v3.9 correction: physics floor underestimates needed strength by ~10×
+# (initialisation noise not accounted for in pure noise-floor derivation)
+PHYSICS_TV_CORRECTION = 10.0
 
 # ---- Fisher information τ-weighting prior -----------------------------------
 # Evaluated at (γ₀, α₀) representing a "typical cell pixel" (not from GT).
@@ -109,7 +119,7 @@ def compute_physics_tv_lambdas(T, wavelength_nm, na, pixel_nm):
     sigma2G = 1.0 / T                                        # noise floor
     lam_g   = sigma2G / ((1.0 / 6) ** 2 * L_psf ** 2)       # γ_max=1
     lam_a   = sigma2G / ((2.0 / 6) ** 2 * L_psf ** 2)       # α_max=2
-    return lam_g, lam_a, L_psf
+    return lam_g * PHYSICS_TV_CORRECTION, lam_a * PHYSICS_TV_CORRECTION, L_psf
 
 
 def huber_tv(x, delta=0.05):
@@ -161,7 +171,7 @@ def train_physics_reconstruction():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     # ---- Model & Loss --------------------------------------------------------
-    model     = PISSLTauEncoder(num_tau_channels=NUM_TAU_CH,
+    model     = PISSLTauEncoder(recon_taus=RECON_TAUS,
                                 predict_amplitude=False).to(device)
     criterion = PhysicsReconLoss(
         recon_taus=RECON_TAUS,

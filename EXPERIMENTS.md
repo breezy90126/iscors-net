@@ -218,7 +218,7 @@ Applying equal TV strength to both channels incorrectly suppresses α boundary f
 
 ---
 
-### v3.7 — Separate TV Strengths (Current)
+### v3.7 — Separate TV Strengths
 
 **Core change:** Split single `LAMBDA_TV=0.5` into channel-specific values.
 
@@ -227,20 +227,110 @@ LAMBDA_TV_GAMMA = 0.5    # unchanged — gamma physically smooth
 LAMBDA_TV_ALPHA = 0.05   # 10x weaker — release alpha boundary formation
 ```
 
-Training loss:
-```python
-tv_g = huber_tv(preds[:, 0:1])   # TV on gamma channel only
-tv_a = huber_tv(preds[:, 1:2])   # TV on alpha channel only
-loss = phys_loss + LAMBDA_TV_GAMMA * tv_g + LAMBDA_TV_ALPHA * tv_a
+**Actual results:**
+- γ: smooth, but **severely compressed**. Fast spot pred γ≈0.15 vs GT γ=0.5.
+  τ-shuffle |Δγ| collapsed to 0.037 (was 0.14 in v3.6) — model stopped using τ for γ.
+- α: fast spot (α=1.5) now **visible** as a distinct yellow region. Hypothesis confirmed:
+  releasing λ_TV_alpha did release the α boundaries the model had internally encoded.
+- Slow spot (α=0.5): still not visible. Converges to cell body value ~0.9–1.0.
+- Shuffle test: |Δγ|=0.037, |Δα|=0.122
+
+**Root cause analysis — γ collapse:**
+The log(τ) weighting concentrates gradient at τ=64–128 (the α-sensitive zone).
+Fast spot has G_norm≈0 at τ>16 (saturated) → gradient is zero there.
+γ signal lives at τ=2–8, which gets weight 0.025–0.063 under log(τ).
+λ_TV_gamma=0.5 then overwhelms the weak γ gradient → spatial structure frozen.
+
+**Insight:** log(τ) weighting was designed to amplify α but it systematically
+starves γ at the cost of the fast spot's large-τ saturation.
+
+---
+
+### v3.8 — Physics-Derived TV + Fisher τ-Weighting
+
+**Two independent fixes:**
+
+**Direction 1 — Physics-derived TV λ:**
 ```
+λ_TV = (σ²_G / σ²_prior / L²_PSF)   ×   correction
+  σ²_G    = 1/T              (G_norm noise floor)
+  L_PSF   = 0.61·λ/NA/px    (Rayleigh resolution limit)
+  σ²_prior = (range/6)²     (6σ prior from activation bounds — no GT needed)
+```
+For T=2000, λ/NA/px = 532nm/1.4/65nm: L_PSF = 3.57 px  
+→ λ_TV_gamma = 1.4e-3, λ_TV_alpha = 3.5e-4, ratio = 4× (from activation bounds)
 
-**Hypothesis:** With α TV relaxed 10×, the sharp boundaries between diffusion regions that the shuffle test confirmed are encoded internally should now be expressible in the output α map.
+**Direction 2 — Fisher information τ-weighting:**
+```
+w_k ∝ (∂G_norm/∂γ)² + (∂G_norm/∂α)²  at prior (γ₀=0.1, α₀=1.0)
+```
+Fisher peaks at τ=8–16 (balances both parameters); weight at τ=128 is 6.8× lower
+than log(τ) → no longer over-weighting the saturated zone where fast spot lives.
 
-**Expected outcome:**
-- γ: remains smooth (λ=0.5 unchanged)
-- α: boundaries between cell body / fast spot / slow spot become visible
-- Shuffle test |Δα| may increase (model has less suppression to overcome)
-- MAE on held-out α pixels should decrease
+**Actual results:**
+- γ: fast spot now **clearly visible**, pred γ≈0.5–0.7 ✅. Cell body correct.
+- α: fast spot visible. Slow spot still not recovered.
+- Shuffle test: |Δγ|=0.139 (3.8× improvement), |Δα|=0.328 (2.7×) ✅
+- Cross-video test (v2 concentric rings): γ MAE=0.068 (reasonable),
+  **α MAE=0.458** (range 0.60–1.30; 65% relative error) ❌
+
+**Problems identified:**
+1. TV_alpha **plateau from epoch 1** — λ_TV_alpha = 3.5e-4 too small; physics noise
+   floor underestimates needed strength by ~10× (initialization noise not modelled).
+2. **τ shuffle ring pattern:** |diff| map shows bright ring at cell boundary,
+   dim interior. Interior pixels rely on spatial propagation (not physics decoding);
+   physics decoding only activates at boundaries where neighbours are inconsistent.
+3. **Bag-of-values shortcut:** model can identify (γ,α) from the set of G_norm
+   values without knowing τ labels (G_norm magnitude at each scale ≈ τ-independent
+   fingerprint). Shuffling τ does not break this fingerprint → interior diff small.
+
+**Insight (the core problem):** Two inference modes coexist in the U-Net:
+```
+Interior pixels:   spatial propagation (τ-order independent) — shortcut
+Boundary pixels:   physics decoding from own τ curve (τ-order dependent)
+```
+The ring pattern in shuffle diff is a direct visualisation of this duality.
+The modes are not bugs; they coexist by design (U-Net + spatial blind-spot).
+But at 20% held-out ratio, the proportion of purely physics-decoded pixels is
+too small — most interior pixels can always find consistent neighbours.
+
+---
+
+### v3.9 — τ Positional Encoding + 35% Blind-Spot (Current)
+
+**Two architectural changes to reduce the spatial-propagation shortcut:**
+
+**Direction 1 — τ positional encoding:**
+```python
+# Model input: (B, K, H, W) → (B, 2K, H, W)
+tau_pe[k] = log(τ_k) / log(τ_max)   # (K,) ∈ [0, 1], broadcast spatially
+x_in = cat([g_norm, tau_pe_spatial], dim=1)
+```
+The model now has **explicit τ labels** for each G_norm channel.
+The bag-of-values shortcut requires identifying (γ,α) from value SET — now infeasible
+because the same G_norm value at different τ labels means completely different physics.
+
+Shuffle test semantics change: `model(full_input[:, perm, :, :])` passes shuffled
+G_norm but the τ_PE registered buffer stays in correct order → mismatch at every pixel.
+Expected: |Δγ|, |Δα| large and **spatially uniform** (not ring-shaped).
+
+**Direction 2 — Increased blind-spot ratio (20% → 35%):**
+```python
+TRAIN_FRACTION = 0.65   # 35% held-out (was 20%)
+```
+At 20% held-out, a masked pixel has ~7 visible neighbours in a 3×3 window.
+Consistent neighbourhood → spatial propagation is always sufficient.
+At 35% held-out, isolated masked clusters appear → some pixels cannot reach
+consistent neighbours → model must decode physics from own τ curve.
+Microscopy spatial redundancy prior (U-Net) is preserved; per-pixel MLP is not used.
+
+**TV correction (v3.9):**
+Physics formula gives noise-floor lower bound; initialization noise adds ~10×.
+```python
+PHYSICS_TV_CORRECTION = 10.0
+# λ_TV_gamma ≈ 1.4e-2  (vs 1.4e-3 in v3.8)
+# λ_TV_alpha ≈ 3.5e-3  (vs 3.5e-4 in v3.8)
+```
 
 ---
 
@@ -260,30 +350,46 @@ loss = phys_loss + LAMBDA_TV_GAMMA * tv_g + LAMBDA_TV_ALPHA * tv_a
 | 10 | Fast spot (γ=0.5,α=1.5) saturates at large τ (G≈0); its α lives at small τ | identifiability analysis |
 | 11 | Slow spot (γ=0.05,α=0.5) has STRONGEST dG/dα at large τ — counterintuitively easy | identifiability analysis |
 | 12 | γ and α need different TV strengths: separate λ_TV_gamma and λ_TV_alpha | v3.7 |
+| 13 | log(τ) weighting systematically starves γ gradient: fast spot γ saturates at large τ, log(τ) concentrates weight there → γ physics loss ≈ 0 for fast spot | v3.7 |
+| 14 | Fisher weighting (peaked at τ=8–16) naturally balances γ and α gradients; recovers fast spot γ | v3.8 |
+| 15 | Shuffle ring pattern reveals spatial heterogeneity: interior uses spatial propagation (τ-independent), boundary uses physics decoding (τ-dependent) | v3.8 |
+| 16 | Bag-of-values shortcut: G_norm magnitude patterns can identify (γ,α) without τ labels in homogeneous regions — τ ordering only essential at boundaries | v3.8 |
+| 17 | τ positional encoding breaks bag-of-values shortcut: explicit τ labels make G_norm(τ_k) ↔ τ_k correspondence learnable everywhere, not just at boundaries | v3.9 |
+| 18 | Increasing blind-spot ratio forces physics decoding in interior by reducing consistent-neighbour availability | v3.9 |
 
 ---
 
 ## Open Questions
 
-1. **v3.7 result:** Does LAMBDA_TV_ALPHA=0.05 release α boundaries while preserving γ smoothness? What is the optimal ratio?
+1. **Slow spot α=0.5 recovery:** All versions fail here. G_norm curve for (γ=0.05, α=0.5)
+   is very flat at small τ and nearly identical to (γ≈0.05, α≈1.0) shape at τ<16.
+   Only τ=64–128 distinguishes them. Fisher weighting reduces large-τ weight by 6.8× vs
+   log(τ). Is there a τ-weighting that preserves slow-spot α signal without hurting fast spot?
 
-2. **Fast spot α recovery:** G_norm(128)≈0.002 for the fast spot — essentially zero. The model must rely on τ=4–16 for its α=1.5 signal. Does τ-weighted MSE (which up-weights large τ) hurt the fast spot? Consider adding a separate loss term for small-τ regions.
+2. **TV floor calibration:** Physics formula gives correct *lower bound* but not practical
+   working value. A data-driven calibration (set λ_TV to maintain TV loss ≈ 20% physics
+   loss at epoch 0) would be more principled than an empirical ×10 correction.
 
-3. **Real data validation:** iSCORS published results focus on chromatin condensation/relaxation. Typical γ range in high-speed iSCAT is 0.01–0.1 — the gradient-poor regime. Does the model generalize to real biological γ values?
+3. **Real data validation:** iSCORS published results focus on chromatin condensation/relaxation.
+   Typical γ range in high-speed iSCAT is 0.01–0.1 — the gradient-poor regime.
+   Does the model generalize to real biological γ values?
 
-4. **Membrane-tethered proteins:** Chromatin dynamics may approach the diffusion resolution limit at high frame rates (1000 fps). α may be dominated by confinement rather than anomalous diffusion — different physical model needed?
+4. **T=2000 vs real data:** Synthetic T=2000 gives G_empirical error ≈2.3% at τ=128.
+   Real data may have fewer frames or lower SNR — does the self-supervised signal survive?
 
-5. **T=2000 vs real data:** Synthetic T=2000 gives G_empirical error ≈2.3% at τ=128. Real data may have fewer frames or lower SNR — does the self-supervised signal survive?
+5. **Per-pixel MLP as physics-only baseline:** A shared-weight MLP over the K-dim τ curve
+   (no spatial receptive field) would force pure physics decoding. Comparing its MAE to
+   the U-Net would isolate the spatial denoising contribution from physics decoding quality.
 
 ---
 
 ## File Map
 
 ```
-train_phys_recon.py           Main training script (v3.x)
-datasets/phys_recon_dataset.py  G_empirical precomputation, 80/20 blind-spot split
-models/pissl_tau_encoder.py   U-Net, ELU+1 alpha activation
-loss/phys_recon_loss.py       tau-weighted shape-only MSE
-utils/traditional_iscors.py   FFT autocorrelation, curve fitting, G_empirical map
-utils/generate_test_video.py  Synthetic 3-region video (T=2000)
+train_phys_recon.py             Main training script (v3.x)
+datasets/phys_recon_dataset.py  G_empirical precomputation, 65/35 blind-spot split (v3.9)
+models/pissl_tau_encoder.py     U-Net, ELU+1 alpha, τ positional encoding (v3.9)
+loss/phys_recon_loss.py         Fisher-weighted shape-only MSE (v3.8)
+utils/traditional_iscors.py     FFT autocorrelation, curve fitting, G_empirical map
+utils/generate_test_video.py    Synthetic v1 (nested circles) + v2 (concentric rings)
 ```

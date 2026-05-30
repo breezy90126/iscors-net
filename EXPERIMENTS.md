@@ -296,7 +296,7 @@ too small — most interior pixels can always find consistent neighbours.
 
 ---
 
-### v3.9 — τ Positional Encoding + 35% Blind-Spot (Current)
+### v3.9 — τ Positional Encoding + 35% Blind-Spot
 
 **Two architectural changes to reduce the spatial-propagation shortcut:**
 
@@ -332,6 +332,85 @@ PHYSICS_TV_CORRECTION = 10.0
 # λ_TV_alpha ≈ 3.5e-3  (vs 3.5e-4 in v3.8)
 ```
 
+**Actual results:**
+```
+Gamma MAE seen    : 0.039   held-out: 0.036  ratio: 0.92
+Alpha MAE seen    : 0.190   held-out: 0.175  ratio: 0.92
+v2 Gamma MAE      : 0.061   (OK)
+v2 Alpha MAE      : 0.501   (WARN — slightly worse than v3.8's 0.458)
+|Δγ| shuffle      : 0.080   (down from 0.139 — see diagnosis below)
+|Δα| shuffle      : 0.393   (up from 0.328 — highest so far)
+Shuffle pattern   : uniform (v3.8 ring → v3.9 uniform) ✅
+```
+
+**What worked:**
+- α map shows all three regions clearly for the first time — fast spot (yellow), cell body
+  (teal), slow spot (dark blue). τ-PE effect confirmed: bag-of-values shortcut broken.
+- held-out MAE < seen MAE: 35% blind-spot forces stronger spatial generalisation. Held-out
+  pixels benefit from spatially averaged predictions from well-trained neighbours.
+- |Δα| shuffle = 0.393 (highest yet): α physics decoding maximally active.
+
+**What failed:**
+1. **γ cell body and slow spot still near-zero.** Only fast spot (γ=0.5) visible.
+2. **TV_alpha plateau at 0.1 throughout training.** λ_TV_alpha = 3.54e-3 appears not
+   to decrease the unscaled TV value.
+3. **|Δγ| shuffle decreased 0.139 → 0.080** — not τ-PE failure. γ is near-zero in the
+   cell body → shuffling τ doesn't change a near-zero prediction → diff artificially small.
+
+**Root cause of γ collapse (diagnosed for v4.0):**
+`huber_tv` was applied to the full patch (B,1,P,P) with no cell mask.
+Background pixels receive G_norm=0 input → model learns γ≈0 for them (no physics loss).
+Huber-TV across background-cell boundaries penalises `|γ_cell_edge − γ_background|`,
+pulling cell-edge γ toward 0. This cascade propagates inward through the TV chain:
+```
+background (γ≈0) ← TV → cell edge ← TV → cell interior → γ collapse
+```
+Cell body (γ=0.1) and slow spot (γ=0.05) are small enough to be fully pulled to zero.
+Fast spot (γ=0.5) survives because the physics gradient is large enough to resist.
+
+**TV_alpha plateau root cause (same mechanism):**
+Background-cell boundary differences are large (γ=0 vs γ=0.1) and dominate the TV
+mean value, creating a constant floor. Within-region TV is a small fraction of the total.
+
+---
+
+### v4.0 — Masked Huber-TV (Current)
+
+**Fix: Apply TV only between cell-cell adjacent pixel pairs.**
+
+```python
+def masked_huber_tv(x, cell_mask, delta=0.05):
+    m  = cell_mask.unsqueeze(1).float()
+    dx = x[..., 1:] - x[..., :-1]
+    dy = x[..., 1:, :] - x[..., :-1, :]
+    mx = m[..., 1:] * m[..., :-1]      # 1 only where both pixels are cell
+    my = m[..., 1:, :] * m[..., :-1, :]
+    n  = mx.sum() + my.sum() + 1e-10
+    return (_h(dx) * mx).sum() / n + (_h(dy) * my).sum() / n
+```
+
+`cell_mask_patch` is added as a 4th return element from `PhysReconDataset.__getitem__`.
+
+**Why this fixes both problems:**
+- γ collapse: background-cell boundary TV penalty eliminated → cell-edge γ no longer
+  pulled toward background → physics loss can drive γ toward true values.
+- TV_alpha plateau: background-cell boundary floor removed → within-cell TV_alpha
+  becomes the dominant term → effective smoothing is now visible.
+
+**α TV boost (Fix 2):**
+```python
+TV_ALPHA_EXTRA_SCALE = 3.0
+# effective λ_TV_alpha = 3.54e-3 × 3.0 = 1.06e-2
+```
+After masking, fewer pairs contribute (cell-only), so absolute TV magnitude decreases.
+×3 compensates and ensures TV_alpha ≈ 10% of physics loss — the target operating range.
+
+**Expected outcomes:**
+- γ cell body (0.1) and slow spot (0.05) become visible (no background pulling).
+- TV_alpha unscaled value should DECREASE during training (smoothing active).
+- |Δγ| shuffle should increase (γ is no longer near-zero → shuffle changes it more).
+- v2 alpha MAE may improve (α map smoother within regions).
+
 ---
 
 ## Key Insights Summary
@@ -356,38 +435,43 @@ PHYSICS_TV_CORRECTION = 10.0
 | 16 | Bag-of-values shortcut: G_norm magnitude patterns can identify (γ,α) without τ labels in homogeneous regions — τ ordering only essential at boundaries | v3.8 |
 | 17 | τ positional encoding breaks bag-of-values shortcut: explicit τ labels make G_norm(τ_k) ↔ τ_k correspondence learnable everywhere, not just at boundaries | v3.9 |
 | 18 | Increasing blind-spot ratio forces physics decoding in interior by reducing consistent-neighbour availability | v3.9 |
+| 19 | TV applied across background-cell boundaries causes γ collapse: background γ≈0 (no physics loss) + TV chain → cell-edge γ → 0 → cascades inward | v3.9 diagnosis |
+| 20 | Masked Huber-TV (cell-cell pairs only) breaks the background→cell TV cascade; each fix (γ collapse, TV plateau) has the same root cause and same solution | v4.0 |
 
 ---
 
 ## Open Questions
 
-1. **Slow spot α=0.5 recovery:** All versions fail here. G_norm curve for (γ=0.05, α=0.5)
-   is very flat at small τ and nearly identical to (γ≈0.05, α≈1.0) shape at τ<16.
-   Only τ=64–128 distinguishes them. Fisher weighting reduces large-τ weight by 6.8× vs
-   log(τ). Is there a τ-weighting that preserves slow-spot α signal without hurting fast spot?
+1. **Slow spot γ=0.05 recovery (v4.0 target):** v3.9 γ collapse root cause is the
+   background-cell TV cascade. With masked TV in v4.0, γ≈0.05 should become visible.
+   If not, the issue shifts to physics-loss gradient (∂G_norm/∂γ is small for γ=0.05
+   at τ∈[1,16]; only large τ captures it, where Fisher weight is suppressed).
 
-2. **TV floor calibration:** Physics formula gives correct *lower bound* but not practical
-   working value. A data-driven calibration (set λ_TV to maintain TV loss ≈ 20% physics
-   loss at epoch 0) would be more principled than an empirical ×10 correction.
+2. **Slow spot α=0.5 recovery:** G_norm curve for (γ=0.05, α=0.5) is very flat at
+   small τ and nearly identical to (γ≈0.05, α≈1.0) for τ<16. Only τ=64–128
+   distinguishes them. Fisher weighting reduces large-τ weight 6.8× vs log(τ).
+   Slow spot α was visible in v3.9 — confirm whether v4.0 preserves this.
 
-3. **Real data validation:** iSCORS published results focus on chromatin condensation/relaxation.
-   Typical γ range in high-speed iSCAT is 0.01–0.1 — the gradient-poor regime.
-   Does the model generalize to real biological γ values?
+3. **Real data validation:** Typical biological γ is 0.01–0.1 — the gradient-poor regime.
+   With masked TV removing the cascade toward zero, does the model correctly recover
+   small γ from real cell videos?
 
-4. **T=2000 vs real data:** Synthetic T=2000 gives G_empirical error ≈2.3% at τ=128.
-   Real data may have fewer frames or lower SNR — does the self-supervised signal survive?
+4. **TV floor after masking:** With background-cell boundary pairs excluded, the TV
+   unscaled value should decrease. If TV_alpha still plateaus after v4.0 masked TV,
+   the remaining floor is from correct between-region α boundaries (physically correct,
+   not a problem).
 
 5. **Per-pixel MLP as physics-only baseline:** A shared-weight MLP over the K-dim τ curve
    (no spatial receptive field) would force pure physics decoding. Comparing its MAE to
-   the U-Net would isolate the spatial denoising contribution from physics decoding quality.
+   the U-Net isolates the spatial denoising contribution from physics decoding quality.
 
 ---
 
 ## File Map
 
 ```
-train_phys_recon.py             Main training script (v3.x)
-datasets/phys_recon_dataset.py  G_empirical precomputation, 65/35 blind-spot split (v3.9)
+train_phys_recon.py             Main training script (v4.x): masked_huber_tv, TV_ALPHA_EXTRA_SCALE
+datasets/phys_recon_dataset.py  G_empirical precompute, 65/35 blind-spot, cell_mask_patch output
 models/pissl_tau_encoder.py     U-Net, ELU+1 alpha, τ positional encoding (v3.9)
 loss/phys_recon_loss.py         Fisher-weighted shape-only MSE (v3.8)
 utils/traditional_iscors.py     FFT autocorrelation, curve fitting, G_empirical map

@@ -31,9 +31,10 @@ class PhysReconDataset(Dataset):
         spatial propagation toward physics decoding.
 
     Returns:
-        g_input   : (K, P, P)   masked normalised G — model input
-        g_target  : (P, P, K)   full normalised G   — loss target
-        train_mask: (P, P)      1 at visible (80%) pixels
+        g_input        : (K, P, P)   masked normalised G — model input
+        g_target       : (P, P, K)   full normalised G   — loss target
+        train_mask     : (P, P)      1 at supervised (65%) pixels
+        cell_mask_patch: (P, P)      1 at cell pixels (CV ≥ min_cv)
     """
 
     def __init__(self,
@@ -123,11 +124,15 @@ class PhysReconDataset(Dataset):
         g_tgt  = self.g_norm[y-m:y+m, x-m:x+m]
         g_target = torch.from_numpy(g_tgt.astype(np.float32))
 
-        # Supervision mask: 1 at visible (80%) pixels
+        # Supervision mask: 1 at visible (65%) pixels
         mask   = self.supervised_mask[y-m:y+m, x-m:x+m]
         mask_t = torch.from_numpy(mask)
 
-        return g_input, g_target, mask_t
+        # Cell mask patch: needed by caller for masked TV (cell-cell pairs only)
+        cell_p = self.cell_mask[y-m:y+m, x-m:x+m].astype(np.float32)
+        cell_t = torch.from_numpy(cell_p)
+
+        return g_input, g_target, mask_t, cell_t
 
     def _get_full_frame(self):
         # Inference: full masked normalised G map → (K, H, W)
@@ -139,7 +144,8 @@ if __name__ == "__main__":
     dummy = np.random.randn(200, 128, 128).astype(np.float32) + 100.0
     ds = PhysReconDataset(dummy, recon_taus=(1, 2, 4, 8, 16, 32, 48, 64))
     print(f"Dataset length: {len(ds)}")
-    g_in, g_tgt, mask = ds[0]
-    print(f"Input  (K,P,P)   : {g_in.shape}  range [{g_in.min():.3f}, {g_in.max():.3f}]")
-    print(f"Target (P,P,K)   : {g_tgt.shape}  range [{g_tgt.min():.3f}, {g_tgt.max():.3f}]")
-    print(f"Mask   (P,P)     : {mask.shape}   visible fraction: {mask.mean():.3f}")
+    g_in, g_tgt, mask, cell = ds[0]
+    print(f"Input   (K,P,P)  : {g_in.shape}  range [{g_in.min():.3f}, {g_in.max():.3f}]")
+    print(f"Target  (P,P,K)  : {g_tgt.shape}  range [{g_tgt.min():.3f}, {g_tgt.max():.3f}]")
+    print(f"Mask    (P,P)    : {mask.shape}   visible fraction: {mask.mean():.3f}")
+    print(f"CellMsk (P,P)    : {cell.shape}   cell fraction: {cell.mean():.3f}")

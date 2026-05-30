@@ -1,54 +1,50 @@
 """
-v3.9 — τ positional encoding + increased blind-spot ratio (35%).
+v4.0 — Masked Huber-TV (cell-only pairs) + α TV ×3 boost.
 
-v3.8 post-mortem:
-  - Fisher weighting (direction 2): successful. Fast spot γ now visible;
-    |Δγ| shuffle 0.037→0.139 (3.8×), |Δα| 0.122→0.328 (2.7×). γ recovery restored.
-  - Physics-derived TV (direction 1): λ_TV_alpha = 3.54e-4 too small.
-    TV_alpha plateaued from epoch 1 — α has no effective spatial regularisation.
-    Cross-video α MAE = 0.458 (range 0.60–1.30 → 65% relative error). Geometry
-    memorisation confirmed: model overfits v1 ring positions for α, fails on v2.
-  - τ shuffle showed ring pattern (boundary bright, interior dim):
-    Root cause — model uses two inference modes:
-      (A) Interior: spatial propagation from consistent neighbours (τ-order independent)
-      (B) Boundary: physics decoding from own τ curve (τ-order dependent)
-    The ring = visualisation of where mode (A) vs (B) is active.
-    Mode (A) shortcut: G_norm magnitude pattern (bag-of-values) identified without
-    knowing τ labels → interior diff small even when τ shuffled.
+v3.9 post-mortem:
+  - τ-PE (v3.9 Dir-1): SUCCESS. Shuffle diff pattern became spatially uniform
+    (not ring). |Δα| = 0.393 (highest so far). τ-PE broke bag-of-values shortcut.
+  - 35% blind-spot (v3.9 Dir-2): SUCCESS. held-out MAE < seen MAE for both
+    parameters (held-out benefits from smooth spatial propagation from trained
+    neighbours). Spatial physics decoding strengthened.
+  - γ collapse diagnosed: cell body (γ=0.1) and slow spot (γ=0.05) both
+    predicted near-zero. Fast spot (γ=0.5) correctly identified.
+    Root cause: huber_tv was applied to the FULL patch (B,1,P,P), including
+    background pixels. Background pixels receive G_norm=0 input → model learns
+    γ≈0 for them (no physics loss). TV across background-cell boundaries then
+    pulls cell-edge γ toward 0, cascading inward → γ collapse for small-γ regions.
+  - TV_alpha plateau at 0.1 throughout 200 epochs: same cause. The large
+    background-cell boundary differences dominated the mean TV value, making
+    within-region α smoothing ineffective relative to the floor.
 
-v3.9 fixes (two independent directions):
+v4.0 fixes:
 
-  Direction 1 — τ positional encoding:
-    Append K extra channels to G_norm input: tau_pe[k] = log(τ_k)/log(τ_max) ∈ [0,1],
-    broadcast spatially. Model input: (B, 2K, H, W) instead of (B, K, H, W).
+  Fix 1 — Masked Huber-TV (cell-cell pairs only):
+    Replace huber_tv(preds) with masked_huber_tv(preds, cell_mask_patch).
+    Only adjacent pixel pairs where BOTH pixels are cell (CV ≥ 0.005) contribute.
+    This eliminates the background→cell cascade that caused γ collapse.
 
-    Effect on shuffle test:
-      When G_norm channels are permuted but τ-PE stays in correct order, model sees
-      G_norm(τ_{perm(k)}) paired with τ_k label → physics mismatch at every pixel.
-      Bag-of-values shortcut becomes ineffective because τ label now disambiguates
-      which value belongs to which τ. Expected: |Δγ|, |Δα| large and spatially uniform
-      (not only at boundaries).
+    Mechanism:
+      Before: TV penalises |γ_cell_edge − γ_background| ≈ |0.1 − 0|. TV wins
+              over physics loss for small γ → pulls edge toward 0 → propagates
+              inward via TV chain across cell interior.
+      After:  Background-cell pairs excluded from TV. Physics loss drives γ toward
+              true value at cell pixels. TV smooths only within-cell spatial noise.
 
-  Direction 2 — Increased blind-spot ratio (20% → 35%):
-    TRAIN_FRACTION: 0.80 → 0.65
+  Fix 2 — α TV ×3 boost (TV_ALPHA_EXTRA_SCALE):
+    With masking, the background-cell boundary floor that inflated TV_alpha is
+    removed. The remaining within-cell TV_alpha is smaller, so λ_TV_alpha needs
+    upward adjustment to maintain similar regularisation strength.
+    TV_ALPHA_EXTRA_SCALE = 3.0 → effective λ_TV_alpha = 3.54e-3 × 3 = 1.06e-2.
+    This makes TV contribution ~10% of physics loss, which is the target range.
 
-    Effect on spatial propagation shortcut:
-      At 20%, every masked pixel has ~9 visible neighbours in a 3×3 neighbourhood.
-      Consistent neighbourhood → spatial propagation suffices, no need for own τ curve.
-      At 35%, masked pixels are more isolated → fewer consistent neighbours → model
-      must rely on own τ curve for more pixels → physics decoding strengthens.
-      Microscopy spatial redundancy prior is preserved (U-Net, not per-pixel MLP).
-
-  TV lambdas (correction from v3.8):
-    Physics formula underestimated needed strength (ignores initialisation noise).
-    Add PHYSICS_TV_CORRECTION = 10.0 to both λ:
-      λ_TV_gamma ≈ 1.4e-2 (vs 1.4e-3 in v3.8)
-      λ_TV_alpha ≈ 3.5e-3 (vs 3.5e-4 in v3.8)
-    4× ratio (γ:α) unchanged — from activation bounds, not GT.
-
-Inherited unchanged from v3.8:
+Inherited unchanged from v3.9:
+  - τ positional encoding (K extra channels, log(τ)/log(τ_max))
+  - 35% blind-spot (TRAIN_FRACTION = 0.65)
   - ELU+1 for alpha output (Direction D)
   - Fisher information τ-weighting (peaked at τ=8–16)
+  - PHYSICS_TV_CORRECTION = 10.0 (kept; masked TV slightly lowers effective
+    magnitude so correction is still appropriate)
   - Per-pixel normalised G_empirical input; (gamma, alpha) 2-channel output
   - τ shuffle test diagnostic
   - Cross-video overfitting test (v1 train → v2 inference)
@@ -68,7 +64,7 @@ from datasets.phys_recon_dataset import PhysReconDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.phys_recon_loss import PhysicsReconLoss
 
-VERSION = "v3.9"
+VERSION = "v4.0"
 
 # ---- Training hyperparameters -----------------------------------------------
 EPOCHS         = 200
@@ -91,6 +87,11 @@ PIXEL_SIZE_NM       = 65.0    # pixel size at sample plane (nm)
 # v3.9 correction: physics floor underestimates needed strength by ~10×
 # (initialisation noise not accounted for in pure noise-floor derivation)
 PHYSICS_TV_CORRECTION = 10.0
+
+# v4.0: boost α TV by extra ×3 to compensate for smaller effective TV after
+# background-cell boundary pairs are excluded by masked_huber_tv.
+# Target: λ_TV_alpha × TV_alpha ≈ 10% of physics_loss magnitude.
+TV_ALPHA_EXTRA_SCALE  = 3.0
 
 # ---- Fisher information τ-weighting prior -----------------------------------
 # Evaluated at (γ₀, α₀) representing a "typical cell pixel" (not from GT).
@@ -122,16 +123,29 @@ def compute_physics_tv_lambdas(T, wavelength_nm, na, pixel_nm):
     return lam_g * PHYSICS_TV_CORRECTION, lam_a * PHYSICS_TV_CORRECTION, L_psf
 
 
-def huber_tv(x, delta=0.05):
-    """Huber total variation on (B, C, H, W)."""
-    dx = x[..., 1:] - x[..., :-1]
-    dy = x[..., 1:, :] - x[..., :-1, :]
+def masked_huber_tv(x, cell_mask, delta=0.05):
+    """Huber TV restricted to adjacent pairs where BOTH pixels are cell pixels.
+
+    Excluding background-cell boundary pairs prevents TV from pulling cell-edge
+    values toward the background value (typically γ≈0), which caused γ collapse
+    in v3.9 via a cascade from boundary into the cell interior.
+
+    Args:
+        x         : (B, 1, H, W) — γ or α prediction map.
+        cell_mask : (B, H, W) float — 1 at cell pixels (CV ≥ min_cv), 0 elsewhere.
+    """
+    m  = cell_mask.unsqueeze(1).float()          # (B, 1, H, W)
+    dx = x[..., 1:] - x[..., :-1]               # (B, 1, H, W-1)
+    dy = x[..., 1:, :] - x[..., :-1, :]         # (B, 1, H-1, W)
+    mx = m[..., 1:] * m[..., :-1]               # 1 where both neighbours are cell
+    my = m[..., 1:, :] * m[..., :-1, :]
 
     def _h(t):
         a = t.abs()
         return torch.where(a < delta, 0.5 * t ** 2 / delta, a - 0.5 * delta)
 
-    return _h(dx).mean() + _h(dy).mean()
+    n = mx.sum() + my.sum() + 1e-10
+    return (_h(dx) * mx).sum() / n + (_h(dy) * my).sum() / n
 
 
 def train_physics_reconstruction():
@@ -191,8 +205,10 @@ def train_physics_reconstruction():
 
     # ---- Training Loop -------------------------------------------------------
     print(f"[{VERSION}] {len(train_dataset)} patches/epoch  "
-          f"fisher_weighted=True  "
-          f"λ_TV_gamma={LAMBDA_TV_GAMMA:.3e}  λ_TV_alpha={LAMBDA_TV_ALPHA:.3e}")
+          f"fisher_weighted=True  masked_TV=True  "
+          f"λ_TV_gamma={LAMBDA_TV_GAMMA:.3e}  "
+          f"λ_TV_alpha={LAMBDA_TV_ALPHA * TV_ALPHA_EXTRA_SCALE:.3e} "
+          f"(={LAMBDA_TV_ALPHA:.3e} × {TV_ALPHA_EXTRA_SCALE})")
     history = {"loss": [], "phys_loss": [], "tv_gamma": [], "tv_alpha": []}
 
     model.train()
@@ -201,18 +217,25 @@ def train_physics_reconstruction():
         gamma_sum = alpha_sum = pix_count = 0.0
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
 
-        for g_input, g_target, train_mask in pbar:
-            g_input    = g_input.to(device)
-            g_target   = g_target.to(device)
-            train_mask = train_mask.to(device)
+        for g_input, g_target, train_mask, cell_mask_patch in pbar:
+            g_input          = g_input.to(device)
+            g_target         = g_target.to(device)
+            train_mask       = train_mask.to(device)
+            cell_mask_patch  = cell_mask_patch.to(device)
 
             optimizer.zero_grad()
             preds = model(g_input)                               # (B, 2, P, P)
 
             phys_loss = criterion(preds, g_target, train_mask)
-            tv_g = huber_tv(preds[:, 0:1]) if LAMBDA_TV_GAMMA > 0 else torch.tensor(0.0)
-            tv_a = huber_tv(preds[:, 1:2]) if LAMBDA_TV_ALPHA > 0 else torch.tensor(0.0)
-            loss = phys_loss + LAMBDA_TV_GAMMA * tv_g + LAMBDA_TV_ALPHA * tv_a
+            # Masked TV: only cell-cell adjacent pairs (excludes background-cell
+            # boundaries that previously caused γ collapse via pulling cascade).
+            tv_g = masked_huber_tv(preds[:, 0:1], cell_mask_patch) \
+                   if LAMBDA_TV_GAMMA > 0 else torch.tensor(0.0)
+            tv_a = masked_huber_tv(preds[:, 1:2], cell_mask_patch) \
+                   if LAMBDA_TV_ALPHA > 0 else torch.tensor(0.0)
+            loss = (phys_loss
+                    + LAMBDA_TV_GAMMA * tv_g
+                    + LAMBDA_TV_ALPHA * TV_ALPHA_EXTRA_SCALE * tv_a)
 
             loss.backward()
             optimizer.step()
@@ -258,9 +281,9 @@ def train_physics_reconstruction():
     axes[0].legend(); axes[0].set_yscale("log")
 
     axes[1].plot(history["tv_gamma"],
-                 label=f"Huber-TV γ  λ={LAMBDA_TV_GAMMA:.2e}", color="orange")
+                 label=f"Masked-TV γ  λ={LAMBDA_TV_GAMMA:.2e}", color="orange")
     axes[1].plot(history["tv_alpha"],
-                 label=f"Huber-TV α  λ={LAMBDA_TV_ALPHA:.2e}",
+                 label=f"Masked-TV α  λ_eff={LAMBDA_TV_ALPHA*TV_ALPHA_EXTRA_SCALE:.2e}",
                  color="steelblue", linestyle="--")
     axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("TV loss (unscaled)")
     axes[1].set_title(f"TV Regularisation (physics-derived λ)"); axes[1].legend()

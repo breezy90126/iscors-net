@@ -455,7 +455,8 @@ alpha p1–p99: [0.619, 1.061]   mean=0.812  std=0.095
 Gamma range [0.017–0.117] and alpha [0.62–1.06] are physically consistent with
 chromatin dynamics (sub-normal to normal diffusion). 99.9% cell pixels likely
 correct for a full-FOV cell video where background is outside the frame.
-No iSCORS reference comparison available (MAT field mismatch or resolution difference).
+Traditional iSCORS MAT fields are BG_img/Cond_map/D_map/V_map (not gamma/alpha); notebook
+updated to extract by exact names and compare model gamma vs 1/D_map (inverse relationship).
 
 ---
 
@@ -487,6 +488,9 @@ No iSCORS reference comparison available (MAT field mismatch or resolution diffe
 | 22 | TV_alpha plateau was entirely from background-cell boundary terms: masked TV reduced unscaled TV_alpha floor 0.1 → 0.025 (4×), confirming the root cause | v4.0 |
 | 23 | Stronger α TV regularisation (×3) reduces |Δα| shuffle (0.393 → 0.299): smoother maps → smaller per-pixel shuffle diff. Not a regression — expected trade-off | v4.0 |
 | 24 | Real data gamma [0.017–0.117] and alpha [0.62–1.06] match expected chromatin dynamics. 99.9% cell pixels is correct for full-FOV microscopy (no background margin) | v4.0 |
+| 25 | τ shuffle spatial heterogeneity persists even with τ-PE: cell body has highest |Δγ| (γ=0.1, G decays moderately — physics identifiable); fast spot has highest |Δα| (α lives at small τ, hard to shuffle away); slow spot has lowest both (G_norm near-flat at large τ — physics barely distinguishable from noise). τ-PE cannot force identifiability where the signal itself is weak. | v4.0 real |
+| 26 | G_norm normalization is unstable for real data at small τ: biological dynamics are fast → G(τ=1)≈0 → G_norm=G(τ)/G(τ=1) amplifies noise → τ=1,2,4,8 channels are effectively pure salt-and-pepper noise. 4 of 10 model input channels carry no physics signal. Use τ_min≥16 for real data, or normalize by G(τ_min_nonzero) instead of G(τ=1). | v4.0 real |
+| 27 | Traditional iSCORS MAT output fields are BG_img (cell morphology), Cond_map (V_DLS/D condensation), D_map (diffusion coefficient), V_map (velocity). Our model's γ is proportional to 1/D_map (inverse: high γ → fast decay → small D). α has no traditional equivalent. MAT extraction must use exact field names; generic search ('gamma','alpha') finds nothing. | v4.0 real |
 
 ---
 
@@ -506,9 +510,10 @@ No iSCORS reference comparison available (MAT field mismatch or resolution diffe
    cause: the physics loss itself provides geometry-specific G_empirical patterns.
    Possible fix: augment with random spatial crops, flips, or multi-video training.
 
-4. **Real data iSCORS comparison:** 99.9% cell pixels correct for full-FOV videos.
-   But without the iSCORS reference side-by-side, real data accuracy is unvalidated.
-   Need to confirm MAT field names match the extraction code, or supply reference TIFs.
+4. **Real data G_norm normalization:** τ=1,2,4,8 channels are noise-only for fast biological
+   dynamics (G(τ=1)≈0 → normalization unstable). Next step: set τ_min=16 and normalize
+   by G(τ=16) instead of G(τ=1), or clip G_norm to [0, 2] before feeding the model.
+   Also measure Pearson r(model gamma, 1/D_map) to validate real-data accuracy.
 
 5. **Per-pixel MLP as physics-only baseline:** A shared-weight MLP over the K-dim τ curve
    (no spatial receptive field) would force pure physics decoding. Comparing its MAE to

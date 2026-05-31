@@ -7,19 +7,29 @@ class PhysicsReconLoss(nn.Module):
     Self-supervised Physics Reconstruction loss.
 
     Modes (shape_only / legacy_2ch / default):
-      shape_only=True  [v3.4+]: target pre-normalised by dataset (G_norm starts at 1).
-                                G_theory_norm = (1+γ)/(1+γτ^α).
+      shape_only=True  [v3.4+]: target pre-normalised by dataset.
+                                G_theory_norm = (1+γ·τ_ref^α)/(1+γτ^α)  where
+                                τ_ref = recon_taus[0] (first tau = normalization anchor).
+                                For recon_taus[0]=1: reduces to (1+γ)/(1+γτ^α) (legacy).
       legacy_2ch=True  [v3.1]:  both sides normalised inside the loss.
       default          [v3.2/v3.3]: amplitude-aware A/(1+γτ^α).
 
+    τ selection and normalization anchor:
+      recon_taus[0] is the normalization reference τ_ref.
+      Dataset:   G_norm(τ) = G_empirical(τ) / G_empirical(τ_ref)
+      Loss:      G_theory_norm(τ) = G_theory(τ) / G_theory(τ_ref) = (1+γτ_ref^α)/(1+γτ^α)
+      Fisher:    τ_ref gets weight=0 (normalization point; zero identifiability).
+
+      To exclude noisy small-τ channels (e.g., τ=1,2,4,8 for fast real dynamics):
+        recon_taus = (16, 32, 48, 64, 96, 128)   → τ_ref=16, K=6
+      No other code changes needed — dataset, model (τ-PE), and loss auto-adapt.
+
     Weighting options (applied after mode selection):
       fisher_weighted=True [v3.8]: w_k ∝ (∂G_norm/∂γ)² + (∂G_norm/∂α)² at prior (γ₀,α₀).
-                                   Fisher information measures how much each τ contributes
-                                   to identifying BOTH parameters jointly. Peaks at
-                                   intermediate τ; naturally zeros τ=1; avoids over-weighting
-                                   saturated large-τ where G≈0.
-      tau_weighted=True    [v3.6]: w_k = log(τ_k). Legacy option; biases toward large τ
-                                   and suppresses small-τ γ gradient.
+                                   General formula for any τ_ref. Peaks at intermediate τ
+                                   where both parameters are identifiable; zeros at τ_ref
+                                   and at saturated large-τ where G≈0.
+      tau_weighted=True    [v3.6]: w_k = log(τ_k). Legacy; biases toward large τ.
       log_space=True       [v3.5]: log-MSE instead of linear MSE.
     """
 
@@ -30,13 +40,17 @@ class PhysicsReconLoss(nn.Module):
         taus = torch.as_tensor(recon_taus, dtype=torch.float32)
         self.register_buffer("taus", taus.view(1, 1, 1, -1))          # (1,1,1,K)
 
+        # τ_ref = first tau = G_norm normalization anchor (same as dataset)
+        tau_ref = float(recon_taus[0])
+
         # Legacy log(τ) weights
         w_log = torch.log(taus.clamp(min=1.0))
         w_log = w_log / (w_log.sum() + 1e-10)
         self.register_buffer("tau_weights", w_log.view(1, 1, 1, -1))  # (1,1,1,K)
 
-        # Fisher information weights at prior (γ₀, α₀)
-        w_fisher = self._fisher_weights(taus, fisher_gamma_prior, fisher_alpha_prior)
+        # Fisher information weights at prior (γ₀, α₀) with correct τ_ref
+        w_fisher = self._fisher_weights(taus, fisher_gamma_prior, fisher_alpha_prior,
+                                        tau_ref=tau_ref)
         self.register_buffer("fisher_weights", w_fisher.view(1, 1, 1, -1))
 
         self.shape_only      = shape_only
@@ -46,30 +60,42 @@ class PhysicsReconLoss(nn.Module):
         self.fisher_weighted = fisher_weighted
 
     @staticmethod
-    def _fisher_weights(taus, gamma_0=0.1, alpha_0=1.0):
+    def _fisher_weights(taus, gamma_0=0.1, alpha_0=1.0, tau_ref=1.0):
         """
-        τ-weights proportional to Fisher information of G_norm(τ) at prior (γ₀, α₀).
+        τ-weights ∝ Fisher information of G_norm(τ; τ_ref) at prior (γ₀, α₀).
 
-        G_norm(τ) = (1+γ) / (1+γτ^α)   →   normalization at τ=1 always gives G_norm=1.
+        G_norm(τ; τ_ref) = (1 + γ·τ_ref^α) / (1 + γ·τ^α)
 
-        Partial derivatives:
-            ∂G_norm/∂γ = (1 − τ^α) / (1 + γτ^α)²
-            ∂G_norm/∂α = −(1+γ)·γ·τ^α·log(τ) / (1 + γτ^α)²
+        Partial derivatives (general τ_ref):
+            ∂G_norm/∂γ = (τ_ref^α − τ^α) / (1 + γτ^α)²
+            ∂G_norm/∂α = γ·[τ_ref^α·log(τ_ref)·(1+γτ^α)
+                            − (1+γτ_ref^α)·τ^α·log(τ)] / (1 + γτ^α)²
 
         Fisher information: f_k = (∂G_norm/∂γ)² + (∂G_norm/∂α)²
 
-        Properties:
-          τ=1: both partials = 0 → weight = 0  (normalization point, zero information)
-          Small τ: dominated by ∂G/∂γ  (γ-sensitive zone)
-          Large τ: dominated by ∂G/∂α  (α-sensitive zone, until G saturates to 0)
-          Saturated τ (G≈0): both partials → 0 → weight → 0  (automatic saturation masking)
-        """
-        t_a   = taus.clamp(min=1e-8) ** alpha_0
-        denom = 1.0 + gamma_0 * t_a
+        Properties (valid for any τ_ref):
+          τ=τ_ref: both partials = 0 → weight = 0  (normalization point, no information)
+          Small τ (> τ_ref): dominated by ∂G/∂γ  (γ-sensitive zone)
+          Large τ: dominated by ∂G/∂α  (α-sensitive zone)
+          Saturated τ (G≈0): both partials → 0 → weight → 0
 
-        dG_dg = (1.0 - t_a) / denom ** 2
-        dG_da = (-(1.0 + gamma_0) * gamma_0 * t_a
-                 * torch.log(taus.clamp(min=1.0)) / denom ** 2)
+        Special case τ_ref=1: reduces to legacy formula
+            ∂G_norm/∂γ = (1 − τ^α) / (1 + γτ^α)²
+            ∂G_norm/∂α = −(1+γ)·γ·τ^α·log(τ) / (1 + γτ^α)²
+        """
+        import math
+        tau_ref_a   = tau_ref ** alpha_0                           # scalar
+        t_a         = taus.clamp(min=1e-8) ** alpha_0             # (K,)
+        D           = 1.0 + gamma_0 * t_a                         # 1 + γ·τ^α
+        D2          = D ** 2
+
+        dG_dg = (tau_ref_a - t_a) / D2
+
+        log_tau_ref = math.log(max(tau_ref, 1.0))                 # 0 when τ_ref=1
+        log_taus    = torch.log(taus.clamp(min=1.0))
+        N_ref       = 1.0 + gamma_0 * tau_ref_a                   # 1 + γ·τ_ref^α
+        dG_da = (gamma_0 * tau_ref_a * log_tau_ref * D
+                 - N_ref * gamma_0 * t_a * log_taus) / D2
 
         fisher = dG_dg ** 2 + dG_da ** 2
         fisher = fisher / (fisher.sum() + 1e-10)
@@ -122,32 +148,42 @@ if __name__ == "__main__":
     import torch
     import numpy as np
 
-    taus = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128]
-    taus_t = torch.tensor(taus, dtype=torch.float32)
+    # ── Case 1: legacy τ_ref=1 (recon_taus starts at 1) ─────────────────────
+    taus_full = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128]
+    taus_t = torch.tensor(taus_full, dtype=torch.float32)
 
-    # Compare weight profiles
-    w_log = torch.log(taus_t.clamp(min=1)); w_log /= w_log.sum()
-    w_fisher = PhysicsReconLoss._fisher_weights(taus_t, gamma_0=0.1, alpha_0=1.0)
+    w_log    = torch.log(taus_t.clamp(min=1)); w_log /= w_log.sum()
+    w_fisher = PhysicsReconLoss._fisher_weights(taus_t, gamma_0=0.1, alpha_0=1.0, tau_ref=1.0)
 
-    print("τ       log(τ)   Fisher(γ₀=0.1, α₀=1.0)")
-    for i, tau in enumerate(taus):
+    print("=== τ_ref=1  (full τ set: 1..128) ===")
+    print(f"{'τ':>5}  {'log(τ)':>8}  {'Fisher':>8}")
+    for i, tau in enumerate(taus_full):
         print(f"  {tau:3d}   {w_log[i]:.4f}   {w_fisher[i]:.4f}")
 
-    # Sanity: Fisher weights sum to 1, τ=1 gets 0
     assert abs(w_fisher.sum().item() - 1.0) < 1e-5
-    assert w_fisher[0].item() < 1e-8, "τ=1 should have zero Fisher weight"
-    print(f"\nFisher sum={w_fisher.sum():.6f}  τ=1 weight={w_fisher[0]:.2e}  ✓")
+    assert w_fisher[0].item() < 1e-8, "τ=τ_ref should have zero Fisher weight"
+    print(f"  sum={w_fisher.sum():.6f}  τ=1 weight={w_fisher[0]:.2e}  ✓")
 
-    # Forward pass check
-    B, H, W, K = 2, 64, 64, 10
-    mask   = torch.ones(B, H, W); mask[:, ::3, ::3] = 0.0
-    preds  = torch.cat([torch.rand(B,1,H,W)*0.5, torch.rand(B,1,H,W)*2], dim=1)
-    g_norm = torch.rand(B, H, W, K); g_norm[..., 0] = 1.0
+    # ── Case 2: τ_ref=16 (drop noisy small-τ for fast real dynamics) ─────────
+    taus_fast = [16, 32, 48, 64, 96, 128]
+    taus_f = torch.tensor(taus_fast, dtype=torch.float32)
+    w_fisher_16 = PhysicsReconLoss._fisher_weights(taus_f, gamma_0=0.1, alpha_0=1.0, tau_ref=16.0)
 
-    L_unweighted = PhysicsReconLoss(taus, shape_only=True)(preds, g_norm, mask)
-    L_log_tau    = PhysicsReconLoss(taus, shape_only=True, tau_weighted=True)(preds, g_norm, mask)
-    L_fisher     = PhysicsReconLoss(taus, shape_only=True, fisher_weighted=True)(preds, g_norm, mask)
+    print("\n=== τ_ref=16  (fast-dynamics τ set: 16..128) ===")
+    print(f"{'τ':>5}  {'Fisher(τ_ref=16)':>18}")
+    for i, tau in enumerate(taus_fast):
+        print(f"  {tau:3d}   {w_fisher_16[i]:.4f}")
+    assert abs(w_fisher_16.sum().item() - 1.0) < 1e-5
+    assert w_fisher_16[0].item() < 1e-8, "τ=τ_ref=16 should have zero Fisher weight"
+    print(f"  sum={w_fisher_16.sum():.6f}  τ=16 weight={w_fisher_16[0]:.2e}  ✓")
 
-    print(f"\nshape_only uniform    : {L_unweighted.item():.4e}")
-    print(f"shape_only log(τ)     : {L_log_tau.item():.4e}")
-    print(f"shape_only Fisher     : {L_fisher.item():.4e}")
+    # ── Forward pass check (both τ sets) ─────────────────────────────────────
+    for taus_cfg, label in [(taus_full, "K=10 τ_ref=1"), (taus_fast, "K=6 τ_ref=16")]:
+        K   = len(taus_cfg)
+        B, H, W = 2, 64, 64
+        mask   = torch.ones(B, H, W); mask[:, ::3, ::3] = 0.0
+        preds  = torch.cat([torch.rand(B,1,H,W)*0.5, torch.rand(B,1,H,W)*2], dim=1)
+        g_norm = torch.rand(B, H, W, K); g_norm[..., 0] = 1.0  # τ_ref channel = 1
+        L = PhysicsReconLoss(taus_cfg, shape_only=True,
+                              fisher_weighted=True)(preds, g_norm, mask)
+        print(f"\n[{label}] Fisher loss = {L.item():.4e}  ✓")

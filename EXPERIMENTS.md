@@ -491,6 +491,7 @@ updated to extract by exact names and compare model gamma vs 1/D_map (inverse re
 | 25 | τ shuffle spatial heterogeneity persists even with τ-PE: cell body has highest |Δγ| (γ=0.1, G decays moderately — physics identifiable); fast spot has highest |Δα| (α lives at small τ, hard to shuffle away); slow spot has lowest both (G_norm near-flat at large τ — physics barely distinguishable from noise). τ-PE cannot force identifiability where the signal itself is weak. | v4.0 real |
 | 26 | G_norm normalization is unstable for real data at small τ: biological dynamics are fast → G(τ=1)≈0 → G_norm=G(τ)/G(τ=1) amplifies noise → τ=1,2,4,8 channels are effectively pure salt-and-pepper noise. 4 of 10 model input channels carry no physics signal. Use τ_min≥16 for real data, or normalize by G(τ_min_nonzero) instead of G(τ=1). | v4.0 real |
 | 27 | Traditional iSCORS MAT output fields are BG_img (cell morphology), Cond_map (V_DLS/D condensation), D_map (diffusion coefficient), V_map (velocity). Our model's γ is proportional to 1/D_map (inverse: high γ → fast decay → small D). α has no traditional equivalent. MAT extraction must use exact field names; generic search ('gamma','alpha') finds nothing. | v4.0 real |
+| 28 | Noisy small-τ channels can be excluded by changing RECON_TAUS=(16,32,48,64,96,128). No other code changes needed — dataset, model τ-PE, and loss all auto-adapt. The loss Fisher weights must use τ_ref=recon_taus[0] in their partial derivative formulas; the legacy τ_ref=1 formula was a hidden bug for any τ set not starting at 1. | v4.1 candidate |
 
 ---
 
@@ -510,9 +511,10 @@ updated to extract by exact names and compare model gamma vs 1/D_map (inverse re
    cause: the physics loss itself provides geometry-specific G_empirical patterns.
    Possible fix: augment with random spatial crops, flips, or multi-video training.
 
-4. **Real data G_norm normalization:** τ=1,2,4,8 channels are noise-only for fast biological
-   dynamics (G(τ=1)≈0 → normalization unstable). Next step: set τ_min=16 and normalize
-   by G(τ=16) instead of G(τ=1), or clip G_norm to [0, 2] before feeding the model.
+4. **Real data τ selection:** τ=1,2,4,8 are noise-only for fast biological dynamics.
+   Fix: set `RECON_TAUS=(16,32,48,64,96,128)` in train_phys_recon.py. Dataset normalises
+   by G(τ=16); loss computes G_theory_norm=(1+γ·16^α)/(1+γτ^α); Fisher weights use τ_ref=16.
+   All auto-adapt to recon_taus[0] after the Fisher weight fix in loss/phys_recon_loss.py.
    Also measure Pearson r(model gamma, 1/D_map) to validate real-data accuracy.
 
 5. **Per-pixel MLP as physics-only baseline:** A shared-weight MLP over the K-dim τ curve

@@ -72,7 +72,15 @@ BATCH_SIZE     = 4
 LEARNING_RATE  = 1e-4
 PATCH_SIZE     = 64
 TRAIN_FRACTION = 0.65                                       # v3.9: 35% blind-spot
-RECON_TAUS     = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)   # K=10
+# τ set selection — choose based on data dynamics:
+#   Synthetic / slow dynamics: use full set (G(τ=1) >> 0, normalization stable)
+#   Real / fast dynamics:      start at τ=16 (G(τ=1)≈0 → small-τ channels are noise)
+#     Switching to fast-dynamics set requires no other code changes.
+#     The loss, model τ-PE, and dataset normalization all auto-adapt to recon_taus[0].
+#     Dropped channels: τ=1 (always G_norm=1, zero physics signal),
+#                       τ=2,4,8 (noisy when G(τ=1)≈0 amplifies normalization error).
+RECON_TAUS     = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)   # K=10  synthetic default
+# RECON_TAUS  = (16, 32, 48, 64, 96, 128)                 # K=6   real / fast dynamics
 NUM_TAU_CH     = len(RECON_TAUS)
 CHECKPOINT_DIR = "./checkpoint"
 RESULT_DIR     = "./result"

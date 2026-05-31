@@ -108,7 +108,8 @@ After inference, randomly permute the K τ-channel order and re-run the model. C
 | v3.6 | 0.14 | 0.130 | Spatially separated regions | Physics active; TV suppressing output |
 | v3.7 | 0.037 | 0.122 | Uniform (dim) | γ collapsed; log(τ) starves fast-spot gradient |
 | v3.8 | 0.139 | 0.328 | **Ring (bright edge)** | Fisher weighting restores physics; interior shortcuts via spatial propagation |
-| v3.9 | TBD | TBD | Expected: uniform | τ-PE + 35% blind-spot break spatial shortcut |
+| v3.9 | 0.080 | 0.393 | **Uniform** | τ-PE broke bag-of-values shortcut ✓; |Δγ| low because γ itself collapsed to ≈0 |
+| v4.0 | TBD | TBD | Expected: uniform, |Δγ|↑ | Masked TV removes γ collapse → γ non-zero → larger shuffle sensitivity |
 
 **Ring pattern (v3.8):** The shuffle diff is large at region boundaries (physics decoding needed) and small in interiors (spatial propagation from consistent neighbours suffices). This duality is expected in a U-Net; the τ-PE and increased blind-spot (v3.9) are designed to push more interior pixels into physics-decoding mode.
 
@@ -128,7 +129,8 @@ After inference, randomly permute the K τ-channel order and re-run the model. C
 | v3.6 | τ-weighted MSE + scaled TV + ELU-α | TV active; shuffle test reveals internal α structure |
 | v3.7 | Separate λ_TV for γ and α | Release α boundary formation; log(τ) starves fast-spot γ |
 | v3.8 | Fisher τ-weighting + physics-derived TV | Fast-spot γ recovered; shuffle ring pattern diagnosed |
-| **v3.9** | τ-PE + 35% blind-spot | Break bag-of-values shortcut; force interior physics decoding |
+| v3.9 | τ-PE + 35% blind-spot | Break bag-of-values shortcut; force interior physics decoding |
+| **v4.0** | Masked Huber-TV (cell-cell pairs only) + α TV ×3 | Fix γ collapse: background→cell TV cascade eliminated |
 
 ---
 
@@ -145,21 +147,21 @@ python train_phys_recon.py
 ```
 
 Outputs in `./result/`:
-- `inference_maps_v3.9.png` — predicted γ and α vs GT
-- `loss_curve_v3.9.png` — physics loss + TV_gamma + TV_alpha curves
-- `shuffle_test_v3.9.png` — τ shuffle diagnostic (expect uniform diff, not ring)
-- `generalisation_v3.9.txt` — seen vs held-out MAE report
-- `overfitting_test_v3.9.png` — cross-video generalisation (v1 train → v2 inference)
+- `inference_maps_v4.0.png` — predicted γ and α vs GT
+- `loss_curve_v4.0.png` — physics loss + masked TV_gamma + masked TV_alpha curves
+- `shuffle_test_v4.0.png` — τ shuffle diagnostic (expect uniform diff, large |Δγ|)
+- `generalisation_v4.0.txt` — seen vs held-out MAE report
+- `overfitting_test_v4.0.png` — cross-video generalisation (v1 train → v2 inference)
 
 ---
 
 ## Project Structure
 
 ```
-train_phys_recon.py             Main training script
-datasets/phys_recon_dataset.py  G_empirical precomputation + 80/20 blind-spot
-models/pissl_tau_encoder.py     U-Net, ELU+1 alpha activation
-loss/phys_recon_loss.py         tau-weighted shape-only MSE
+train_phys_recon.py             Main training script (v4.0: masked_huber_tv)
+datasets/phys_recon_dataset.py  G_empirical precompute, 65/35 blind-spot, cell_mask_patch
+models/pissl_tau_encoder.py     U-Net, ELU+1 alpha, τ positional encoding (v3.9)
+loss/phys_recon_loss.py         Fisher-weighted shape-only MSE (v3.8)
 utils/traditional_iscors.py     FFT autocorrelation, G_empirical map
 utils/generate_test_video.py    Synthetic 3-region video generator
 EXPERIMENTS.md                  Full version history and insights

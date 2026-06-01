@@ -1,69 +1,42 @@
 """
-v4.1 — Reliability weighting (Fisher × σ_G inverse), σ_G as optional 3K model input.
+v4.2 — Real-data self-supervised training + checkerboard cross-validation + R² map.
 
-v4.0 recap (inherited unchanged):
-  - Masked Huber-TV: TV only on cell-cell adjacent pixel pairs → no γ collapse.
-  - α TV ×3 boost: compensates for smaller effective TV after boundary exclusion.
-  - τ-PE: 2K input channels → model MUST learn τ→G_norm functional relationship.
-  - 35% blind-spot: forces physics decoding beyond spatial propagation.
+v4.1 post-mortem (synthetic training, real inference):
+  - Synthetic v1: structure CORRECT — fast/slow/cell-body regions identified.
+    γ pred [0.024, 0.362] vs GT [0.05/0.1/0.5]: dynamic range compressed at extremes.
+    α pred [0.828, 1.701] vs GT [0.5/1.0/1.5]: better, but slow-spot underestimated.
+    TV-α plateau immediately → alpha already smooth within regions after v4.0 fix.
+  - Shuffle test: |Δγ|=0.096 |Δα|=0.155 → TEMPORAL verdict, τ-PE working.
+  - Cross-video v2: γ MAE=0.070, α MAE=0.500 — γ generalises, α still off.
+  - Real cell (inference only, no real training): γ mean=0.050 std=0.021,
+    α mean=0.820 std=0.092. Pearson r(γ, 1/D)=−0.289 Spearman=−0.397.
+    Direction correct (γ ∝ D, so γ vs 1/D is negative), magnitude weak.
+    Root cause: model trained on synthetic → predicts mean, ignores spatial
+    heterogeneity. G_norm mean curve fits well (theory γ=0.05 α=0.82 matches
+    empirical mean), but ±1σ band very wide → heterogeneity not captured.
+    Cell fraction=99.9% → CV threshold too loose for real data.
 
-v4.1 additions:
+v4.2 additions:
+  - real-train notebook cell: self-supervised training on real video.
+    RECON_TAUS=(16,32,48,64,96,128) — excludes noisy fast-dynamics small-τ.
+    Fisher prior (γ₀, α₀) auto-estimated from mean empirical G_norm curve fit.
+    Combined Fisher × Reliability loss weighting inherited from v4.1.
+  - R² confidence map: R²(y,x) = 1 − SS_res/SS_tot over τ.
+    Quantifies per-pixel physics fit quality as posterior confidence indicator.
+  - Checkerboard cross-validation: diagonal_resample(video) → gridA/gridB.
+    gridA: traditional iSCORS curve-fit (quasi-GT). gridB: model inference.
+    Pearson/Spearman r, MAE without external GT labels.
+
+v4.1 additions (inherited):
   - σ_G(τ;y,x) reliability map computed in dataset (Wiener-Khinchin noise model).
   - Combined weight in loss: Fisher(τ) × 1/σ_G_norm(τ;y,x), normalised per pixel.
-    Fisher answers "which τ has physics info?"; σ_G answers "is this τ reliable here?".
-    Product selects τ channels that are BOTH informative AND trustworthy.
-  - Model optionally accepts σ_G_norm as 3rd input block (3K channels total) so
-    the network can also learn to weight by reliability internally (use_sigma=True).
-    Defaults to False for backward compatibility with v4.0 checkpoints.
+  - Model optionally accepts σ_G_norm as 3rd input block (3K channels, use_sigma=True).
   - Colormaps: γ and α percentile-clipped within cell mask (not full-frame).
 
 v4.0 post-mortem:
-  - τ-PE (v3.9 Dir-1): SUCCESS. Shuffle diff pattern became spatially uniform
-    (not ring). |Δα| = 0.393 (highest so far). τ-PE broke bag-of-values shortcut.
-  - 35% blind-spot (v3.9 Dir-2): SUCCESS. held-out MAE < seen MAE for both
-    parameters (held-out benefits from smooth spatial propagation from trained
-    neighbours). Spatial physics decoding strengthened.
-  - γ collapse diagnosed: cell body (γ=0.1) and slow spot (γ=0.05) both
-    predicted near-zero. Fast spot (γ=0.5) correctly identified.
-    Root cause: huber_tv was applied to the FULL patch (B,1,P,P), including
-    background pixels. Background pixels receive G_norm=0 input → model learns
-    γ≈0 for them (no physics loss). TV across background-cell boundaries then
-    pulls cell-edge γ toward 0, cascading inward → γ collapse for small-γ regions.
-  - TV_alpha plateau at 0.1 throughout 200 epochs: same cause. The large
-    background-cell boundary differences dominated the mean TV value, making
-    within-region α smoothing ineffective relative to the floor.
-
-v4.0 fixes:
-
-  Fix 1 — Masked Huber-TV (cell-cell pairs only):
-    Replace huber_tv(preds) with masked_huber_tv(preds, cell_mask_patch).
-    Only adjacent pixel pairs where BOTH pixels are cell (CV ≥ 0.005) contribute.
-    This eliminates the background→cell cascade that caused γ collapse.
-
-    Mechanism:
-      Before: TV penalises |γ_cell_edge − γ_background| ≈ |0.1 − 0|. TV wins
-              over physics loss for small γ → pulls edge toward 0 → propagates
-              inward via TV chain across cell interior.
-      After:  Background-cell pairs excluded from TV. Physics loss drives γ toward
-              true value at cell pixels. TV smooths only within-cell spatial noise.
-
-  Fix 2 — α TV ×3 boost (TV_ALPHA_EXTRA_SCALE):
-    With masking, the background-cell boundary floor that inflated TV_alpha is
-    removed. The remaining within-cell TV_alpha is smaller, so λ_TV_alpha needs
-    upward adjustment to maintain similar regularisation strength.
-    TV_ALPHA_EXTRA_SCALE = 3.0 → effective λ_TV_alpha = 3.54e-3 × 3 = 1.06e-2.
-    This makes TV contribution ~10% of physics loss, which is the target range.
-
-Inherited unchanged from v3.9:
-  - τ positional encoding (K extra channels, log(τ)/log(τ_max))
-  - 35% blind-spot (TRAIN_FRACTION = 0.65)
-  - ELU+1 for alpha output (Direction D)
-  - Fisher information τ-weighting (peaked at τ=8–16)
-  - PHYSICS_TV_CORRECTION = 10.0 (kept; masked TV slightly lowers effective
-    magnitude so correction is still appropriate)
-  - Per-pixel normalised G_empirical input; (gamma, alpha) 2-channel output
-  - τ shuffle test diagnostic
-  - Cross-video overfitting test (v1 train → v2 inference)
+  - Masked Huber-TV eliminated γ collapse from background→cell cascade.
+  - α TV ×3 boost restored within-cell smoothing after boundary exclusion.
+  - τ-PE + 35% blind-spot: TEMPORAL verdict, physics decoding confirmed active.
 """
 
 import math
@@ -80,7 +53,7 @@ from datasets.phys_recon_dataset import PhysReconDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.phys_recon_loss import PhysicsReconLoss
 
-VERSION = "v4.1"
+VERSION = "v4.2"
 
 # ---- Training hyperparameters -----------------------------------------------
 EPOCHS         = 200

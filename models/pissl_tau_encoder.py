@@ -39,6 +39,9 @@ class PISSLTauEncoder(nn.Module):
     U-Net for Physics-Informed Spatial Sampling.
 
     v3.9+: input is (B, 2K, P, P) = K G_norm channels || K τ-PE channels.
+    v4.1+: optionally (B, 3K, P, P) = K G_norm || K τ-PE || K σ_G_norm channels
+           when use_sigma=True. σ_G_norm lets the model learn to down-weight
+           unreliable τ channels (high noise) automatically.
 
     τ positional encoding (v3.9):
         tau_pe[k] = log(τ_k) / log(τ_max)  ∈ [0, 1], constant spatially.
@@ -65,9 +68,10 @@ class PISSLTauEncoder(nn.Module):
             x>0 → linear, no saturation for super-diffusion
             x<0 → exponential approach to 0, non-zero gradient everywhere
     """
-    def __init__(self, recon_taus, predict_amplitude=False):
+    def __init__(self, recon_taus, predict_amplitude=False, use_sigma=False):
         super().__init__()
         self.predict_amplitude = predict_amplitude
+        self.use_sigma = use_sigma
         out_channels = 3 if predict_amplitude else 2
 
         K = len(recon_taus)
@@ -79,8 +83,9 @@ class PISSLTauEncoder(nn.Module):
         tau_pe  = log_tau / (log_tau.max() + 1e-8)            # (K,)
         self.register_buffer("tau_pe", tau_pe)
 
-        # Encoder — input is 2K channels (K G_norm + K τ-PE)
-        self.inc   = DoubleConv(K * 2, 64)
+        # Encoder — 2K channels (G_norm + τ-PE) or 3K (+ σ_G_norm) if use_sigma
+        in_ch = K * 3 if use_sigma else K * 2
+        self.inc   = DoubleConv(in_ch, 64)
         self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
         self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
         self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512))
@@ -105,18 +110,22 @@ class PISSLTauEncoder(nn.Module):
         self.gamma_activation = nn.Sigmoid()   # γ ∈ (0, 1)
         self.amp_activation   = nn.Softplus()  # A > 0
 
-    def forward(self, x):
+    def forward(self, x, sigma_g_norm=None):
         """
         Args:
-            x: (B, K, H, W) — K masked G_norm channels (τ-shuffled or normal).
+            x:            (B, K, H, W) — K masked G_norm channels.
+            sigma_g_norm: (B, K, H, W) optional — normalised σ_G channels.
+                          Required when use_sigma=True; ignored otherwise.
         """
         B, K, H, W = x.shape
         # τ-PE broadcast: (K,) → (1, K, 1, 1) → (B, K, H, W)
         tau_pe_sp = self.tau_pe.view(1, K, 1, 1).expand(B, K, H, W)
-        # Concatenate G_norm and τ-PE: (B, 2K, H, W)
-        # When G_norm channels are τ-shuffled (perm), τ-PE stays in correct order
-        # → creates G_norm(τ_k) ↔ τ_{perm⁻¹(k)} mismatch → physics inconsistency
-        x_in = torch.cat([x, tau_pe_sp], dim=1)               # (B, 2K, H, W)
+        if self.use_sigma and sigma_g_norm is not None:
+            # 3K channels: G_norm || τ-PE || σ_G_norm
+            x_in = torch.cat([x, tau_pe_sp, sigma_g_norm], dim=1)  # (B, 3K, H, W)
+        else:
+            # 2K channels: G_norm || τ-PE  (backward-compatible default)
+            x_in = torch.cat([x, tau_pe_sp], dim=1)               # (B, 2K, H, W)
 
         # Encode
         x1 = self.inc(x_in)

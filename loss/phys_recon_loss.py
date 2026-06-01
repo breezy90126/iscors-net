@@ -31,6 +31,17 @@ class PhysicsReconLoss(nn.Module):
                                    and at saturated large-τ where G≈0.
       tau_weighted=True    [v3.6]: w_k = log(τ_k). Legacy; biases toward large τ.
       log_space=True       [v3.5]: log-MSE instead of linear MSE.
+
+    Reliability weighting [v4.1]:
+      forward() accepts an optional sigma_g_norm argument: (B, H, W, K) tensor of
+      per-pixel normalised measurement noise σ_G_norm(τ;y,x).
+
+      Reliability weight: r(τ;y,x) = 1 / (σ_G_norm(τ;y,x) + ε)
+      Combined weight  : w_combined(τ;y,x) = fisher(τ) × r(τ;y,x)
+      Normalised per pixel so Σ_τ w_combined = 1 at each (y,x).
+
+      When sigma_g_norm is None (default), falls back to Fisher-only or uniform
+      weighting as before, preserving full backward compatibility.
     """
 
     def __init__(self, recon_taus, shape_only=False, legacy_2ch=False,
@@ -101,13 +112,17 @@ class PhysicsReconLoss(nn.Module):
         fisher = fisher / (fisher.sum() + 1e-10)
         return fisher
 
-    def forward(self, preds, g_empirical, train_mask):
+    def forward(self, preds, g_empirical, train_mask, sigma_g_norm=None):
         """
         Args:
-            preds:       (B, 2, H, W) [γ,α] for shape_only/legacy_2ch;
-                         (B, 3, H, W) [γ,α,A] for amplitude mode.
-            g_empirical: (B, H, W, K)
-            train_mask:  (B, H, W) — 1.0 at supervised pixels.
+            preds:          (B, 2, H, W) [γ,α] for shape_only/legacy_2ch;
+                            (B, 3, H, W) [γ,α,A] for amplitude mode.
+            g_empirical:    (B, H, W, K)
+            train_mask:     (B, H, W) — 1.0 at supervised pixels.
+            sigma_g_norm:   (B, H, W, K) optional — per-pixel normalised σ_G.
+                            When provided (v4.1), combined Fisher × Reliability
+                            weights are used (fisher_weighted must be True).
+                            When None, falls back to original fisher/tau/uniform.
         """
         gamma = preds[:, 0].unsqueeze(-1)   # (B, H, W, 1)
         alpha = preds[:, 1].unsqueeze(-1)
@@ -134,8 +149,17 @@ class PhysicsReconLoss(nn.Module):
 
         mask4d = train_mask.unsqueeze(-1)                              # (B,H,W,1)
 
-        if self.fisher_weighted:
-            # Fisher-weighted average over τ, then average over supervised pixels
+        if self.fisher_weighted and sigma_g_norm is not None:
+            # Combined Fisher × Reliability weighting (v4.1)
+            # reliability(τ;y,x) = 1 / (σ_G_norm + ε) — inverse noise
+            reliability = 1.0 / (sigma_g_norm + eps)                   # (B,H,W,K)
+            # Combine: Fisher (1,1,1,K) × reliability (B,H,W,K)
+            combined = self.fisher_weights * reliability                # (B,H,W,K)
+            # Normalise per pixel so weights sum to 1 over τ
+            combined = combined / (combined.sum(dim=-1, keepdim=True) + eps)
+            return (sq_err * mask4d * combined).sum() / (mask4d.sum() + eps)
+
+        elif self.fisher_weighted:
             return (sq_err * mask4d * self.fisher_weights).sum() / (mask4d.sum() + eps)
         elif self.tau_weighted:
             return (sq_err * mask4d * self.tau_weights).sum() / (mask4d.sum() + eps)

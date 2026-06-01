@@ -4,37 +4,36 @@ import random
 from torch.utils.data import Dataset
 
 from utils.traditional_iscors import compute_g_empirical_map
+from utils.sn2n_sampling import compute_sigma_g
 
 
 class PhysReconDataset(Dataset):
     """
-    Dataset for v3.4 Physics Reconstruction training.
+    Dataset for v4.1 Physics Reconstruction training.
 
-    v3.4 = v3.1 loss (shape-only normalised MSE)
-         + v3.3 input mechanism (masked G_empirical as model input)
+    v4.1 additions over v4.0:
+      - σ_G(τ; y,x) reliability map computed alongside G_empirical.
+        σ²_G(τ) ≈ (2/T) * [G(0)² + G(τ)²] — Wiener-Khinchin noise estimate.
+      - σ_G_norm = σ_G / G(τ_ref): noise in the normalised G space (same units
+        as G_norm used by the loss).
+      - Added as 5th return element so loss can apply Fisher × Reliability
+        combined weighting (Fisher: which τ has physics info; Reliability:
+        which τ has trustworthy measurements).
 
     Per-pixel normalisation:
         G_norm(τ; y,x) = G_empirical(τ; y,x) / G_empirical(τ₁; y,x)
     Both input and loss target are in this normalised shape space.
-    Amplitude A is completely removed from the model — no mean-regression
-    attractor, no amplitude-dominated gradient.
 
     Spatial blind-spot (v3.9: 35% held-out):
         65% of cell pixels: G_norm visible in input → loss applied.
         35% of cell pixels: G_norm zeroed in input → excluded from loss.
 
-    Why 35% (vs original 20%):
-        At 20%, the model has many consistent neighbours for every held-out pixel
-        → spatial propagation dominates, physics decoding mainly active at region
-        boundaries. Increasing to 35% forces more pixels to rely on their own τ
-        curve (fewer consistent neighbours available), shifting the balance from
-        spatial propagation toward physics decoding.
-
     Returns:
-        g_input        : (K, P, P)   masked normalised G — model input
-        g_target       : (P, P, K)   full normalised G   — loss target
-        train_mask     : (P, P)      1 at supervised (65%) pixels
-        cell_mask_patch: (P, P)      1 at cell pixels (CV ≥ min_cv)
+        g_input          : (K, P, P)   masked normalised G — model input
+        g_target         : (P, P, K)   full normalised G   — loss target
+        train_mask       : (P, P)      1 at supervised (65%) pixels
+        cell_mask_patch  : (P, P)      1 at cell pixels (CV ≥ min_cv)
+        sigma_g_norm_patch: (P, P, K)  normalised σ_G — reliability map
     """
 
     def __init__(self,
@@ -68,12 +67,18 @@ class PhysReconDataset(Dataset):
               f"({100*n_cell/self.cell_mask.size:.1f}%)")
 
         # ---- Per-pixel normalisation: shape only, amplitude removed ---------
-        # G_norm(τ) = G_empirical(τ) / G_empirical(τ₁).
-        # Background pixels (G=0) normalise to 0; cell pixels start at 1.
         eps = 1e-10
         g_tau1 = g_empirical[:, :, 0:1]                     # (H, W, 1)
         self.g_norm = g_empirical / (g_tau1 + eps)           # (H, W, K)
-        self.g_norm[~self.cell_mask] = 0.0                   # zero background
+        self.g_norm[~self.cell_mask] = 0.0
+
+        # ---- σ_G reliability map (v4.1) -------------------------------------
+        # σ²_G(τ) ≈ (2/T) * [G(0)² + G(τ)²]   — Wiener-Khinchin noise model
+        # σ_G_norm(τ) = σ_G(τ) / G(τ_ref)      — noise in normalised G space
+        print(f"[PhysRecon] Computing σ_G reliability map ...")
+        sigma_g = compute_sigma_g(self.video, self.recon_taus, g_map=g_empirical)
+        self.sigma_g_norm = sigma_g / (np.abs(g_tau1) + eps)  # (H, W, K)
+        self.sigma_g_norm[~self.cell_mask] = 0.0
 
         # ---- 80 / 20 split on CELL pixels -----------------------------------
         rng = random.Random(seed)
@@ -94,6 +99,10 @@ class PhysReconDataset(Dataset):
         # Masked normalised G used as model input: held-out pixels zeroed
         self.g_norm_masked = self.g_norm.copy()
         self.g_norm_masked[self.held_out_mask] = 0.0
+        # σ_G_norm is not masked (model does not need it as input by default;
+        # it is passed to the loss for reliability-weighted training)
+        self.sigma_g_norm_masked = self.sigma_g_norm.copy()
+        self.sigma_g_norm_masked[self.held_out_mask] = 0.0
 
         if mode == 'train':
             valid = [(y, x) for (y, x) in train_set
@@ -132,7 +141,11 @@ class PhysReconDataset(Dataset):
         cell_p = self.cell_mask[y-m:y+m, x-m:x+m].astype(np.float32)
         cell_t = torch.from_numpy(cell_p)
 
-        return g_input, g_target, mask_t, cell_t
+        # Reliability: σ_G_norm patch → (P, P, K)
+        sg_p = self.sigma_g_norm[y-m:y+m, x-m:x+m].astype(np.float32)
+        sg_t = torch.from_numpy(sg_p)
+
+        return g_input, g_target, mask_t, cell_t, sg_t
 
     def _get_full_frame(self):
         # Inference: full masked normalised G map → (K, H, W)
@@ -144,8 +157,9 @@ if __name__ == "__main__":
     dummy = np.random.randn(200, 128, 128).astype(np.float32) + 100.0
     ds = PhysReconDataset(dummy, recon_taus=(1, 2, 4, 8, 16, 32, 48, 64))
     print(f"Dataset length: {len(ds)}")
-    g_in, g_tgt, mask, cell = ds[0]
+    g_in, g_tgt, mask, cell, sigma = ds[0]
     print(f"Input   (K,P,P)  : {g_in.shape}  range [{g_in.min():.3f}, {g_in.max():.3f}]")
     print(f"Target  (P,P,K)  : {g_tgt.shape}  range [{g_tgt.min():.3f}, {g_tgt.max():.3f}]")
     print(f"Mask    (P,P)    : {mask.shape}   visible fraction: {mask.mean():.3f}")
     print(f"CellMsk (P,P)    : {cell.shape}   cell fraction: {cell.mean():.3f}")
+    print(f"Sigma   (P,P,K)  : {sigma.shape}  range [{sigma.min():.3f}, {sigma.max():.3f}]")

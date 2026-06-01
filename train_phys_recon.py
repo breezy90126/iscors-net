@@ -1,7 +1,23 @@
 """
-v4.0 — Masked Huber-TV (cell-only pairs) + α TV ×3 boost.
+v4.1 — Reliability weighting (Fisher × σ_G inverse), σ_G as optional 3K model input.
 
-v3.9 post-mortem:
+v4.0 recap (inherited unchanged):
+  - Masked Huber-TV: TV only on cell-cell adjacent pixel pairs → no γ collapse.
+  - α TV ×3 boost: compensates for smaller effective TV after boundary exclusion.
+  - τ-PE: 2K input channels → model MUST learn τ→G_norm functional relationship.
+  - 35% blind-spot: forces physics decoding beyond spatial propagation.
+
+v4.1 additions:
+  - σ_G(τ;y,x) reliability map computed in dataset (Wiener-Khinchin noise model).
+  - Combined weight in loss: Fisher(τ) × 1/σ_G_norm(τ;y,x), normalised per pixel.
+    Fisher answers "which τ has physics info?"; σ_G answers "is this τ reliable here?".
+    Product selects τ channels that are BOTH informative AND trustworthy.
+  - Model optionally accepts σ_G_norm as 3rd input block (3K channels total) so
+    the network can also learn to weight by reliability internally (use_sigma=True).
+    Defaults to False for backward compatibility with v4.0 checkpoints.
+  - Colormaps: γ and α percentile-clipped within cell mask (not full-frame).
+
+v4.0 post-mortem:
   - τ-PE (v3.9 Dir-1): SUCCESS. Shuffle diff pattern became spatially uniform
     (not ring). |Δα| = 0.393 (highest so far). τ-PE broke bag-of-values shortcut.
   - 35% blind-spot (v3.9 Dir-2): SUCCESS. held-out MAE < seen MAE for both
@@ -64,7 +80,7 @@ from datasets.phys_recon_dataset import PhysReconDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.phys_recon_loss import PhysicsReconLoss
 
-VERSION = "v4.0"
+VERSION = "v4.1"
 
 # ---- Training hyperparameters -----------------------------------------------
 EPOCHS         = 200
@@ -100,6 +116,13 @@ PHYSICS_TV_CORRECTION = 10.0
 # background-cell boundary pairs are excluded by masked_huber_tv.
 # Target: λ_TV_alpha × TV_alpha ≈ 10% of physics_loss magnitude.
 TV_ALPHA_EXTRA_SCALE  = 3.0
+
+# ---- v4.1: Reliability weighting & σ model input ---------------------------
+# USE_RELIABILITY: pass σ_G_norm to loss for Fisher × Reliability combined weights.
+# USE_SIGMA_INPUT: also add σ_G as 3rd input block (3K channels).
+#   Set USE_SIGMA_INPUT=True only for fresh training — incompatible with v4.0 ckpts.
+USE_RELIABILITY  = True
+USE_SIGMA_INPUT  = False   # True enables 3K model (requires retraining from scratch)
 
 # ---- Fisher information τ-weighting prior -----------------------------------
 # Evaluated at (γ₀, α₀) representing a "typical cell pixel" (not from GT).
@@ -194,7 +217,8 @@ def train_physics_reconstruction():
 
     # ---- Model & Loss --------------------------------------------------------
     model     = PISSLTauEncoder(recon_taus=RECON_TAUS,
-                                predict_amplitude=False).to(device)
+                                predict_amplitude=False,
+                                use_sigma=USE_SIGMA_INPUT).to(device)
     criterion = PhysicsReconLoss(
         recon_taus=RECON_TAUS,
         shape_only=True,
@@ -225,16 +249,21 @@ def train_physics_reconstruction():
         gamma_sum = alpha_sum = pix_count = 0.0
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
 
-        for g_input, g_target, train_mask, cell_mask_patch in pbar:
+        for g_input, g_target, train_mask, cell_mask_patch, sigma_patch in pbar:
             g_input          = g_input.to(device)
             g_target         = g_target.to(device)
             train_mask       = train_mask.to(device)
             cell_mask_patch  = cell_mask_patch.to(device)
+            sigma_patch      = sigma_patch.to(device)            # (B, P, P, K)
+
+            # sigma for model input needs (B, K, P, P)
+            sigma_in = sigma_patch.permute(0, 3, 1, 2) if USE_SIGMA_INPUT else None
 
             optimizer.zero_grad()
-            preds = model(g_input)                               # (B, 2, P, P)
+            preds = model(g_input, sigma_g_norm=sigma_in)        # (B, 2, P, P)
 
-            phys_loss = criterion(preds, g_target, train_mask)
+            sigma_for_loss = sigma_patch if USE_RELIABILITY else None
+            phys_loss = criterion(preds, g_target, train_mask, sigma_g_norm=sigma_for_loss)
             # Masked TV: only cell-cell adjacent pairs (excludes background-cell
             # boundaries that previously caused γ collapse via pulling cascade).
             tv_g = masked_huber_tv(preds[:, 0:1], cell_mask_patch) \
@@ -367,13 +396,21 @@ def train_physics_reconstruction():
         print(f"Generalisation report -> {rpt}")
 
     # ---- Inference maps figure -----------------------------------------------
+    # Percentile-clip colormaps within the cell mask (not background zeros)
+    cell_m = train_dataset.cell_mask
+    gm_cell = gamma_map[cell_m]; am_cell = alpha_map[cell_m]
+    g_p1, g_p99 = np.percentile(gm_cell, 1), np.percentile(gm_cell, 99)
+    a_p1, a_p99 = np.percentile(am_cell, 1), np.percentile(am_cell, 99)
+
     has_gt = gt_gamma is not None
     ncols  = 4 if has_gt else 2
     fig2, axes2 = plt.subplots(1, ncols, figsize=(5 * ncols, 4))
-    im0 = axes2[0].imshow(gamma_map, cmap="magma",  vmin=0, vmax=1.0)
-    axes2[0].set_title(f"Pred Gamma [{VERSION}]"); plt.colorbar(im0, ax=axes2[0])
-    im1 = axes2[1].imshow(alpha_map, cmap="viridis", vmin=0, vmax=2.0)
-    axes2[1].set_title(f"Pred Alpha [{VERSION}]"); plt.colorbar(im1, ax=axes2[1])
+    im0 = axes2[0].imshow(gamma_map, cmap="magma",  vmin=g_p1, vmax=g_p99)
+    axes2[0].set_title(f"Pred Gamma [{VERSION}]  [{g_p1:.3f},{g_p99:.3f}]")
+    plt.colorbar(im0, ax=axes2[0])
+    im1 = axes2[1].imshow(alpha_map, cmap="viridis", vmin=a_p1, vmax=a_p99)
+    axes2[1].set_title(f"Pred Alpha [{VERSION}]  [{a_p1:.3f},{a_p99:.3f}]")
+    plt.colorbar(im1, ax=axes2[1])
     if has_gt:
         im2 = axes2[2].imshow(gt_gamma, cmap="magma",  vmin=0, vmax=1.0)
         axes2[2].set_title("GT Gamma"); plt.colorbar(im2, ax=axes2[2])

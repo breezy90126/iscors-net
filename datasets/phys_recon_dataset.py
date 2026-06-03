@@ -9,7 +9,15 @@ from utils.sn2n_sampling import compute_sigma_g
 
 class PhysReconDataset(Dataset):
     """
-    Dataset for v4.1 Physics Reconstruction training.
+    Dataset for v4.3 Physics Reconstruction training.
+
+    v4.3 additions over v4.1:
+      - sigma_clip: exclude normalization-unstable pixels.
+        Pixels where σ_G_norm(τ_ref) > sigma_clip are removed from cell_mask.
+        σ_G_norm(τ_ref) is large when G(τ_ref)≈0 (fast dynamics → blow-up in
+        G_norm → loss dominated by noise → γ→0 / α>1 spurious minimum).
+        Recommended: sigma_clip=2.0 removes the worst ~20% of unstable pixels.
+        Setting sigma_clip=None disables the filter (backward compatible).
 
     v4.1 additions over v4.0:
       - σ_G(τ; y,x) reliability map computed alongside G_empirical.
@@ -32,7 +40,7 @@ class PhysReconDataset(Dataset):
         g_input          : (K, P, P)   masked normalised G — model input
         g_target         : (P, P, K)   full normalised G   — loss target
         train_mask       : (P, P)      1 at supervised (65%) pixels
-        cell_mask_patch  : (P, P)      1 at cell pixels (CV ≥ min_cv)
+        cell_mask_patch  : (P, P)      1 at cell pixels (CV ≥ min_cv, σ_clip)
         sigma_g_norm_patch: (P, P, K)  normalised σ_G — reliability map
     """
 
@@ -43,6 +51,7 @@ class PhysReconDataset(Dataset):
                  mode='train',
                  train_fraction=0.65,
                  min_cv=0.005,
+                 sigma_clip=None,
                  seed=42,
                  # legacy args — kept so existing call-sites don't break
                  random_tau=True,
@@ -79,6 +88,20 @@ class PhysReconDataset(Dataset):
         sigma_g = compute_sigma_g(self.video, self.recon_taus, g_map=g_empirical)
         self.sigma_g_norm = sigma_g / (np.abs(g_tau1) + eps)  # (H, W, K)
         self.sigma_g_norm[~self.cell_mask] = 0.0
+
+        # ---- σ_clip: remove normalization-unstable pixels (v4.3) -----------
+        # σ_G_norm(τ_ref) >> 1 means G(τ_ref)≈0 → G_norm blows up → loss noise
+        if sigma_clip is not None:
+            stable = self.sigma_g_norm[:, :, 0] <= sigma_clip
+            n_before = int(self.cell_mask.sum())
+            self.cell_mask = self.cell_mask & stable
+            n_after  = int(self.cell_mask.sum())
+            print(f"[PhysRecon] σ_clip={sigma_clip}: "
+                  f"{n_before - n_after} unstable pixels removed "
+                  f"→ {n_after}/{self.cell_mask.size} cell pixels "
+                  f"({100*n_after/self.cell_mask.size:.1f}%)")
+            self.g_norm[~self.cell_mask]       = 0.0
+            self.sigma_g_norm[~self.cell_mask] = 0.0
 
         # ---- 80 / 20 split on CELL pixels -----------------------------------
         rng = random.Random(seed)

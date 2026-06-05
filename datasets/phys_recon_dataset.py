@@ -9,15 +9,15 @@ from utils.sn2n_sampling import compute_sigma_g
 
 class PhysReconDataset(Dataset):
     """
-    Dataset for v4.3 Physics Reconstruction training.
+    Dataset for v4.5 Physics Reconstruction training.
 
-    v4.3 additions over v4.1:
-      - sigma_clip: exclude normalization-unstable pixels.
-        Pixels where σ_G_norm(τ_ref) > sigma_clip are removed from cell_mask.
-        σ_G_norm(τ_ref) is large when G(τ_ref)≈0 (fast dynamics → blow-up in
-        G_norm → loss dominated by noise → γ→0 / α>1 spurious minimum).
-        Recommended: sigma_clip=2.0 removes the worst ~20% of unstable pixels.
-        Setting sigma_clip=None disables the filter (backward compatible).
+    v4.5 changes over v4.3:
+      - Normalization anchor changed from G(τ_ref) to G(τ=0) = CV².
+        G_norm(τ) = G(τ)/G(0) = 1/(1+γτ^α) exactly.
+        G(0) is always the largest G value → no blow-up for any diffusion speed.
+        γ is now fully identifiable (no degeneracy with α).
+        Matches MATLAB iSCORS 'nor_1' normalisation exactly.
+      - sigma_clip is now a safe no-op (σ_G_norm_g0 ≈ √(4/T) << 2.0).
 
     v4.1 additions over v4.0:
       - σ_G(τ; y,x) reliability map computed alongside G_empirical.
@@ -75,22 +75,29 @@ class PhysReconDataset(Dataset):
         print(f"[PhysRecon] Cell pixels: {n_cell}/{self.cell_mask.size}  "
               f"({100*n_cell/self.cell_mask.size:.1f}%)")
 
-        # ---- Per-pixel normalisation: shape only, amplitude removed ---------
-        eps = 1e-10
-        g_tau1 = g_empirical[:, :, 0:1]                     # (H, W, 1)
-        self.g_norm = g_empirical / (g_tau1 + eps)           # (H, W, K)
+        # ---- G(τ=0) = CV² normalisation anchor (v4.5) ----------------------
+        # G(0;y,x) = <δI(t)²>_t / <I>²  — zero-lag autocorrelation = CV²
+        # Always the largest G value regardless of diffusion speed → stable.
+        # G_norm(τ) = G(τ)/G(0) = 1/(1+γτ^α) exactly  → γ fully identifiable.
+        # Matches MATLAB iSCORS 'nor_1' normalisation (CorrF / CorrF(1)).
+        eps    = 1e-10
+        mean_I  = self.video.mean(axis=0)                    # (H, W)
+        delta_I = self.video - mean_I                        # (T, H, W)
+        g_zero  = (delta_I ** 2).mean(axis=0) / (mean_I ** 2 + eps)  # CV²
+
+        self.g_zero = g_zero                                 # store for diagnostics
+        self.g_norm = g_empirical / (g_zero[:, :, None] + eps)  # (H, W, K)
         self.g_norm[~self.cell_mask] = 0.0
 
-        # ---- σ_G reliability map (v4.1) -------------------------------------
-        # σ²_G(τ) ≈ (2/T) * [G(0)² + G(τ)²]   — Wiener-Khinchin noise model
-        # σ_G_norm(τ) = σ_G(τ) / G(τ_ref)      — noise in normalised G space
+        # ---- σ_G reliability map (v4.5: normalised by G(0)) ----------------
+        # σ_G_norm_g0 = σ_G / G(0) = sqrt((2/T)(1 + G_norm²))
+        # Bounded ∈ [0, √(4/T)] for all pixels → sigma_clip is a safe no-op.
         print(f"[PhysRecon] Computing σ_G reliability map ...")
         sigma_g = compute_sigma_g(self.video, self.recon_taus, g_map=g_empirical)
-        self.sigma_g_norm = sigma_g / (np.abs(g_tau1) + eps)  # (H, W, K)
+        self.sigma_g_norm = sigma_g / (g_zero[:, :, None] + eps)  # (H, W, K)
         self.sigma_g_norm[~self.cell_mask] = 0.0
 
-        # ---- σ_clip: remove normalization-unstable pixels (v4.3) -----------
-        # σ_G_norm(τ_ref) >> 1 means G(τ_ref)≈0 → G_norm blows up → loss noise
+        # ---- σ_clip: safety net (mostly no-op with G(0) normalisation) -----
         if sigma_clip is not None:
             stable = self.sigma_g_norm[:, :, 0] <= sigma_clip
             n_before = int(self.cell_mask.sum())

@@ -53,7 +53,7 @@ from datasets.phys_recon_dataset import PhysReconDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.phys_recon_loss import PhysicsReconLoss
 
-VERSION = "v4.4"
+VERSION = "v4.5"
 
 # ---- Training hyperparameters -----------------------------------------------
 EPOCHS         = 200

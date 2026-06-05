@@ -46,12 +46,13 @@ class PhysicsReconLoss(nn.Module):
 
     def __init__(self, recon_taus, shape_only=False, legacy_2ch=False,
                  log_space=False, tau_weighted=False,
-                 fisher_weighted=False, fisher_gamma_prior=0.1, fisher_alpha_prior=1.0):
+                 fisher_weighted=False, fisher_gamma_prior=0.1, fisher_alpha_prior=1.0,
+                 g0_norm=False):
         super().__init__()
         taus = torch.as_tensor(recon_taus, dtype=torch.float32)
         self.register_buffer("taus", taus.view(1, 1, 1, -1))          # (1,1,1,K)
 
-        # τ_ref = first tau = G_norm normalization anchor (same as dataset)
+        # τ_ref = first tau (only used when g0_norm=False)
         tau_ref = float(recon_taus[0])
 
         # Legacy log(τ) weights
@@ -59,9 +60,14 @@ class PhysicsReconLoss(nn.Module):
         w_log = w_log / (w_log.sum() + 1e-10)
         self.register_buffer("tau_weights", w_log.view(1, 1, 1, -1))  # (1,1,1,K)
 
-        # Fisher information weights at prior (γ₀, α₀) with correct τ_ref
-        w_fisher = self._fisher_weights(taus, fisher_gamma_prior, fisher_alpha_prior,
-                                        tau_ref=tau_ref)
+        # Fisher information weights
+        # g0_norm: G_norm=1/(1+γτ^α), all τ informative (no zero-weight τ_ref)
+        # legacy:  G_norm=(1+γτ_ref^α)/(1+γτ^α), τ=τ_ref has zero weight
+        if g0_norm:
+            w_fisher = self._fisher_weights_g0(taus, fisher_gamma_prior, fisher_alpha_prior)
+        else:
+            w_fisher = self._fisher_weights(taus, fisher_gamma_prior, fisher_alpha_prior,
+                                            tau_ref=tau_ref)
         self.register_buffer("fisher_weights", w_fisher.view(1, 1, 1, -1))
 
         self.shape_only      = shape_only
@@ -69,6 +75,7 @@ class PhysicsReconLoss(nn.Module):
         self.log_space       = log_space
         self.tau_weighted    = tau_weighted
         self.fisher_weighted = fisher_weighted
+        self.g0_norm         = g0_norm
 
     @staticmethod
     def _fisher_weights(taus, gamma_0=0.1, alpha_0=1.0, tau_ref=1.0):
@@ -112,6 +119,34 @@ class PhysicsReconLoss(nn.Module):
         fisher = fisher / (fisher.sum() + 1e-10)
         return fisher
 
+    @staticmethod
+    def _fisher_weights_g0(taus, gamma_0=0.1, alpha_0=1.0):
+        """
+        Fisher weights for G_norm(τ) = 1/(1+γτ^α)  [g0_norm mode, v4.5].
+
+        G(τ=0) is the anchor; no τ_ref to zero out — all channels informative.
+
+        Partial derivatives:
+            ∂G_norm/∂γ = -τ^α / (1+γτ^α)²
+            ∂G_norm/∂α = -γτ^α·log(τ) / (1+γτ^α)²
+
+        Properties:
+          τ→0 : both partials → 0  (no physics signal)
+          intermediate τ: peaks (γ and α both identifiable)
+          large τ (G≈0): both partials → 0
+          τ=1: log(1)=0 → ∂G/∂α=0, only γ-sensitive  (still non-zero, unlike τ_ref)
+        """
+        t_a      = taus.clamp(min=1e-8) ** alpha_0          # τ^α
+        D2       = (1.0 + gamma_0 * t_a) ** 2
+        log_taus = torch.log(taus.clamp(min=1.0))
+
+        dG_dg = t_a / D2                                     # drop sign (squared)
+        dG_da = gamma_0 * t_a * log_taus / D2
+
+        fisher = dG_dg ** 2 + dG_da ** 2
+        fisher = fisher / (fisher.sum() + 1e-10)
+        return fisher
+
     def forward(self, preds, g_empirical, train_mask, sigma_g_norm=None):
         """
         Args:
@@ -130,7 +165,10 @@ class PhysicsReconLoss(nn.Module):
 
         g_theory = 1.0 / (1.0 + gamma * torch.pow(self.taus, alpha))  # (B,H,W,K)
 
-        if self.shape_only:
+        if self.g0_norm:
+            pass  # g_theory = 1/(1+γτ^α) already matches G(τ)/G(0) target
+
+        elif self.shape_only:
             g_theory = g_theory / (g_theory[..., 0:1] + eps)
 
         elif self.legacy_2ch:

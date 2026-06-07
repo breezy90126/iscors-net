@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import random
+from scipy.stats import kurtosis as _kurtosis
 from torch.utils.data import Dataset
 
 from utils.traditional_iscors import compute_g_empirical_map
@@ -74,6 +75,32 @@ class PhysReconDataset(Dataset):
         n_cell = int(self.cell_mask.sum())
         print(f"[PhysRecon] Cell pixels: {n_cell}/{self.cell_mask.size}  "
               f"({100*n_cell/self.cell_mask.size:.1f}%)")
+
+        # ---- Saturated / hot-pixel artifact removal (v4.6) ------------------
+        # Camera saturation, dead/hot pixels and debris produce a temporal
+        # intensity trace that is far spikier than genuine fluorophore
+        # fluctuations: a few extreme frames dominate the variance while most
+        # frames sit at a clipped baseline → excess kurtosis is abnormally
+        # high relative to the rest of the cell. These pixels masquerade as
+        # extreme-γ outliers (the dark/blown-out blobs seen in inference maps)
+        # because their G_empirical curves do not follow diffusion physics at
+        # all. We flag and drop them from cell_mask before any normalisation.
+        kurt_map = _kurtosis(self.video, axis=0, fisher=True)        # (H, W)
+        if self.cell_mask.any():
+            kurt_ref = np.percentile(kurt_map[self.cell_mask], 99.0)
+        else:
+            kurt_ref = 0.0
+        artifact_mask = self.cell_mask & (kurt_map > max(kurt_ref * 2.0, 10.0))
+        n_artifact = int(artifact_mask.sum())
+        if n_artifact > 0:
+            print(f"[PhysRecon] Removing {n_artifact} saturated/hot-pixel "
+                  f"artifact pixels (excess kurtosis > "
+                  f"{max(kurt_ref * 2.0, 10.0):.1f}) ...")
+            self.cell_mask = self.cell_mask & ~artifact_mask
+            n_cell = int(self.cell_mask.sum())
+            print(f"[PhysRecon] Cell pixels after artifact removal: "
+                  f"{n_cell}/{self.cell_mask.size} "
+                  f"({100*n_cell/self.cell_mask.size:.1f}%)")
 
         # ---- G(τ=0) = CV² normalisation anchor (v4.5) ----------------------
         # G(0;y,x) = <δI(t)²>_t / <I>²  — zero-lag autocorrelation = CV²

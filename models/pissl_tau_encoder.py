@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class DoubleConv(nn.Module):
@@ -61,17 +60,21 @@ class PISSLTauEncoder(nn.Module):
     Spatial context is still used (U-Net), exploiting the microscopy redundancy prior
     (nearby pixels share similar physics). Per-pixel MLP is not used.
 
-    Output activations:
-        γ: Sigmoid → (0, 1)
-        α: ELU+1 (Direction D) — (F.elu(x) + 1.001).clamp(max=2.0) → (0.001, 2]
-            x=0 → α=1.0 (healthy default)
-            x>0 → linear, no saturation for super-diffusion
-            x<0 → exponential approach to 0, non-zero gradient everywhere
+    Output activations (v4.6, Direction E — scaled-sigmoid):
+        γ: gamma_scale · Sigmoid(x) → (0, gamma_scale), default scale 2.0
+            Empirical g0_norm fits reach ≈1.7–2.0 — plain Sigmoid (0,1)
+            (v4.5) was clipping real signal at the upper end.
+        α: 2 · Sigmoid(x) → (0, 2)
+            x=0 → α=1.0 (healthy default, same as v4.5 ELU+1)
+            Smooth saturation at both ends — gradient shrinks but never
+            hits exactly zero, so there is no boundary "pile-up" the way
+            the v4.5 hard .clamp(max=2.0) produced at α=2.0.
     """
-    def __init__(self, recon_taus, predict_amplitude=False, use_sigma=False):
+    def __init__(self, recon_taus, predict_amplitude=False, use_sigma=False, gamma_scale=2.0):
         super().__init__()
         self.predict_amplitude = predict_amplitude
         self.use_sigma = use_sigma
+        self.gamma_scale = gamma_scale
         out_channels = 3 if predict_amplitude else 2
 
         K = len(recon_taus)
@@ -107,7 +110,20 @@ class PISSLTauEncoder(nn.Module):
             with torch.no_grad():
                 self.physics_projection.bias[2].fill_(-6.9)  # Softplus(-6.9) ≈ 1e-3
 
-        self.gamma_activation = nn.Sigmoid()   # γ ∈ (0, 1)
+        # v4.6: smooth scaled-sigmoid activations (Direction E).
+        # Both replace hard clamps with saturating-but-never-flat curves —
+        # gradient is small but never exactly zero anywhere in range, so
+        # there is no boundary "pile-up" (cf. v4.5 ELU+1 clamp at α=2.0).
+        # γ ∈ (0, gamma_scale): empirical g0_norm fits (checkerboard gridA,
+        #   1/D_map GT) reach ≈1.7–2.0 — γ ∈ (0,1) was clipping real signal.
+        #   gamma_scale=2.0 gives headroom while keeping training stable
+        #   (a fully unbounded Softplus risks early-training blow-up).
+        # α ∈ (0, 2): 2 is the genuine physical ceiling (ballistic motion,
+        #   MSD ~ t²). 2·sigmoid(x) is symmetric: x=0 → α=1.0 (healthy
+        #   default, same as v4.5), and approaches 0 / 2 smoothly from
+        #   both sides — no more asymmetric ELU compression of α<1.
+        self.gamma_activation = nn.Sigmoid()   # scaled to (0, gamma_scale) in forward()
+        self.alpha_activation = nn.Sigmoid()   # scaled to (0, 2) in forward()
         self.amp_activation   = nn.Softplus()  # A > 0
 
     def forward(self, x, sigma_g_norm=None):
@@ -145,10 +161,10 @@ class PISSLTauEncoder(nn.Module):
 
         p = self.physics_projection(u3)
 
-        gamma_map = self.gamma_activation(p[:, 0:1])           # (0, 1)
-
-        # Direction D: ELU+1 — no saturation at either extreme
-        alpha_map = (F.elu(p[:, 1:2]) + 1.001).clamp(max=2.0) # (0.001, 2]
+        # Direction E: scaled-sigmoid — smooth saturation, no zero-gradient
+        # pile-up at either boundary (cf. v4.5 hard clamp at α=2.0).
+        gamma_map = self.gamma_scale * self.gamma_activation(p[:, 0:1])  # (0, gamma_scale)
+        alpha_map = 2.0 * self.alpha_activation(p[:, 1:2])               # (0, 2)
 
         if self.predict_amplitude:
             amp_map = self.amp_activation(p[:, 2:3])

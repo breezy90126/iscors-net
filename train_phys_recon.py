@@ -1,5 +1,16 @@
 """
-v4.2 — Real-data self-supervised training + checkerboard cross-validation + R² map.
+v4.6 — G(0)=CV² normalisation + scaled-sigmoid activations (synthetic trainer).
+
+v4.6 changes over v4.2 (sync with iscors_real_runner.ipynb / app.py pipeline):
+  - G(0)=CV² normalisation anchor (v4.5): dataset target is G(τ)/G(0)=1/(1+γτ^α).
+    Loss must be built with g0_norm=True so theory matches the target exactly;
+    shape_only=True (legacy τ_ref normalisation) was a silent mismatch — the
+    dataset already emitted G(τ)/G(0) while the loss re-normalised by G(τ_ref).
+    g0_norm also selects the all-τ-informative Fisher weights (τ=1 no longer
+    zeroed — under G(0) normalisation τ=1 still carries γ signal).
+  - Scaled-sigmoid activations (v4.6): γ ∈ (0, GAMMA_SCALE), α ∈ (0, 2). The TV
+    prior range and all γ colormaps now derive from GAMMA_SCALE, not a hard-coded
+    γ_max=1 (which made λ_TV_gamma ~4× too strong and clipped γ plots at 1.0).
 
 v4.1 post-mortem (synthetic training, real inference):
   - Synthetic v1: structure CORRECT — fast/slow/cell-body regions identified.
@@ -53,7 +64,7 @@ from datasets.phys_recon_dataset import PhysReconDataset
 from models.pissl_tau_encoder import PISSLTauEncoder
 from loss.phys_recon_loss import PhysicsReconLoss
 
-VERSION = "v4.5"
+VERSION = "v4.6"
 
 # ---- Training hyperparameters -----------------------------------------------
 EPOCHS         = 200
@@ -90,6 +101,16 @@ PHYSICS_TV_CORRECTION = 10.0
 # Target: λ_TV_alpha × TV_alpha ≈ 10% of physics_loss magnitude.
 TV_ALPHA_EXTRA_SCALE  = 3.0
 
+# ---- v4.5/v4.6: normalisation anchor & activation range --------------------
+# G0_NORM=True  : dataset target = G(τ)/G(0) = 1/(1+γτ^α)  (v4.5 anchor, MATLAB nor_1).
+#                 Loss is built with g0_norm=True so theory matches the target and
+#                 the all-τ-informative Fisher weights are used (τ=1 not zeroed).
+#   G0_NORM=False: legacy τ_ref normalisation (shape_only) — kept for reproducibility.
+# GAMMA_SCALE   : γ output ceiling (v4.6 scaled-sigmoid γ ∈ (0, GAMMA_SCALE)).
+#                 Empirical g0_norm fits reach ≈1.7–2.0, so γ ∈ (0,1) clipped signal.
+G0_NORM      = True
+GAMMA_SCALE  = 2.0
+
 # ---- v4.1: Reliability weighting & σ model input ---------------------------
 # USE_RELIABILITY: pass σ_G_norm to loss for Fisher × Reliability combined weights.
 # USE_SIGMA_INPUT: also add σ_G as 3rd input block (3K channels).
@@ -105,24 +126,26 @@ FISHER_ALPHA_PRIOR = 1.0   # baseline normal diffusion α
 # -----------------------------------------------------------------------------
 
 
-def compute_physics_tv_lambdas(T, wavelength_nm, na, pixel_nm):
+def compute_physics_tv_lambdas(T, wavelength_nm, na, pixel_nm, gamma_max=2.0):
     """
     Derive λ_TV for γ and α from physical quantities only.
 
     Formula: λ_TV = σ²_G / (σ²_prior × L²_PSF)
 
-      σ²_G    = 1/T                — G_norm estimation noise floor
-      L_PSF   = 0.61·λ/NA/pixel   — Rayleigh limit (pixels)
-      σ²_prior_γ = (γ_max/6)²     — 6-sigma prior over γ ∈ [0, 1]  (Sigmoid bound)
-      σ²_prior_α = (α_max/6)²     — 6-sigma prior over α ∈ [0, 2]  (ELU+1 bound)
+      σ²_G    = 1/T                  — G_norm estimation noise floor
+      L_PSF   = 0.61·λ/NA/pixel     — Rayleigh limit (pixels)
+      σ²_prior_γ = (γ_max/6)²       — 6-sigma prior over γ ∈ [0, γ_max]  (Sigmoid bound)
+      σ²_prior_α = (α_max/6)²       — 6-sigma prior over α ∈ [0, 2]      (Sigmoid bound)
 
     The parameter ranges come from model activation bounds, not GT knowledge.
-    Ratio λ_γ/λ_α = σ²_prior_α/σ²_prior_γ = (α_max/γ_max)² = 4 — physics says
-    α has larger dynamic range, so its TV should be proportionally weaker.
+    γ_max tracks the model's GAMMA_SCALE (v4.6 scaled-sigmoid γ ∈ (0, GAMMA_SCALE));
+    hard-coding γ_max=1 while the model emits γ ∈ (0,2) made λ_TV_gamma ~4× too strong.
+    Ratio λ_γ/λ_α = (α_max/γ_max)² — physics says the wider-range parameter should
+    get the proportionally weaker TV.
     """
     L_psf   = 0.61 * wavelength_nm / na / pixel_nm          # Rayleigh (pixels)
     sigma2G = 1.0 / T                                        # noise floor
-    lam_g   = sigma2G / ((1.0 / 6) ** 2 * L_psf ** 2)       # γ_max=1
+    lam_g   = sigma2G / ((gamma_max / 6) ** 2 * L_psf ** 2)
     lam_a   = sigma2G / ((2.0 / 6) ** 2 * L_psf ** 2)       # α_max=2
     return lam_g * PHYSICS_TV_CORRECTION, lam_a * PHYSICS_TV_CORRECTION, L_psf
 
@@ -171,7 +194,7 @@ def train_physics_reconstruction():
 
     # ---- Physics-derived TV lambdas (computed from T and optics) -------------
     LAMBDA_TV_GAMMA, LAMBDA_TV_ALPHA, L_psf = compute_physics_tv_lambdas(
-        T, WAVELENGTH_NM, NA, PIXEL_SIZE_NM
+        T, WAVELENGTH_NM, NA, PIXEL_SIZE_NM, gamma_max=GAMMA_SCALE
     )
     print(f"[{VERSION}] PSF = {L_psf:.3f} px  "
           f"(λ={WAVELENGTH_NM}nm, NA={NA}, pixel={PIXEL_SIZE_NM}nm)")
@@ -191,10 +214,12 @@ def train_physics_reconstruction():
     # ---- Model & Loss --------------------------------------------------------
     model     = PISSLTauEncoder(recon_taus=RECON_TAUS,
                                 predict_amplitude=False,
-                                use_sigma=USE_SIGMA_INPUT).to(device)
+                                use_sigma=USE_SIGMA_INPUT,
+                                gamma_scale=GAMMA_SCALE).to(device)
     criterion = PhysicsReconLoss(
         recon_taus=RECON_TAUS,
-        shape_only=True,
+        g0_norm=G0_NORM,                 # v4.5: target = G(τ)/G(0) = 1/(1+γτ^α)
+        shape_only=(not G0_NORM),        # legacy τ_ref normalisation fallback
         fisher_weighted=True,
         fisher_gamma_prior=FISHER_GAMMA_PRIOR,
         fisher_alpha_prior=FISHER_ALPHA_PRIOR,
@@ -441,8 +466,8 @@ def train_physics_reconstruction():
 
     fig3, ax3 = plt.subplots(2, 3, figsize=(15, 8))
     for row, (orig, shuf, diff, cmap, vmax, lbl) in enumerate([
-        (gamma_map, gm_shuf, diff_g, "magma",   1.0, "Gamma"),
-        (alpha_map, am_shuf, diff_a, "viridis", 2.0, "Alpha"),
+        (gamma_map, gm_shuf, diff_g, "magma",   GAMMA_SCALE, "Gamma"),
+        (alpha_map, am_shuf, diff_a, "viridis", 2.0,         "Alpha"),
     ]):
         cell = train_dataset.cell_mask
         im = ax3[row, 0].imshow(orig, cmap=cmap, vmin=0, vmax=vmax)

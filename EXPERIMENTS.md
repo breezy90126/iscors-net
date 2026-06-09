@@ -460,6 +460,103 @@ updated to extract by exact names and compare model gamma vs 1/D_map (inverse re
 
 ---
 
+### v4.1 — σ_G Reliability Weighting
+
+**Add a per-pixel, per-τ measurement-noise map and use it to weight the loss.**
+
+```
+σ²_G(τ) ≈ (2/T)·[G(0)² + G(τ)²]        # Wiener–Khinchin noise estimate
+σ_G_norm = σ_G / G(τ_ref)               # in the normalised G space
+w_combined(τ;y,x) = Fisher(τ) × 1/(σ_G_norm(τ;y,x)+ε)   # normalised per pixel
+```
+
+Fisher says *which τ carries physics information*; reliability says *which τ is
+trustworthy at this pixel*. The product down-weights noise-dominated channels
+(small-τ for fast real dynamics) without dropping them globally. Optionally σ_G_norm
+is also fed as a 3rd input block (`use_sigma=True`, 3K channels) so the network can
+learn the down-weighting itself — requires training from scratch (incompatible with
+2K checkpoints). Backward compatible: σ=None falls back to Fisher-only weighting.
+
+---
+
+### v4.2 — Real-Data Pipeline + Confidence + Cross-Validation
+
+Three additions for working on real video with **no external GT**:
+
+1. **Real self-training cell** (`iscors_real_runner.ipynb`): train directly on a real
+   iSCAT video. `RECON_TAUS=(16,32,48,64,96,128)` drops noise-only small-τ; Fisher prior
+   (γ₀,α₀) auto-estimated from the mean empirical G_norm curve fit.
+2. **R² confidence map**: `R²(y,x) = 1 − SS_res/SS_tot` over τ — per-pixel physics-fit
+   quality as a posterior confidence indicator.
+3. **Checkerboard cross-validation**: diagonal resample → gridA / gridB. gridA gets a
+   traditional curve-fit (quasi-GT), gridB gets model inference; report Pearson/Spearman
+   and MAE with no external labels.
+
+**Real-data post-mortem:** structure direction correct but heterogeneity weak —
+`Pearson r(γ, 1/D_map) ≈ −0.29`. A synthetic-trained model regresses to the mean;
+the mean G_norm curve fits well but the ±1σ band is wide → spatial heterogeneity
+under-captured. Motivated training directly on real video (v4.2 real cell).
+
+---
+
+### v4.5 — G(0)=CV² Normalisation (key correctness change)
+
+**Change the normalisation anchor from G(τ_ref) to the zero-lag G(0).**
+
+```
+G(0;y,x) = ⟨δI(t)²⟩_t / ⟨I⟩²  = CV²        # always the largest G value
+G_norm(τ) = G(τ)/G(0) = 1 / (1 + γ·τ^α)    # exact, no τ_ref degeneracy
+```
+
+**Why it matters:**
+- `G/G(τ₁)` blows up for fast biological dynamics where G(τ=1)→0 (insight #26).
+  G(0) is always the maximum, so the ratio is bounded for any diffusion speed.
+- The target collapses to `1/(1+γτ^α)` → **γ is fully identifiable** (the old
+  `(1+γτ_ref^α)/(1+γτ^α)` form had a τ_ref-dependent scale degeneracy with α).
+- Matches MATLAB iSCORS `nor_1` (CorrF/CorrF(1)) → model γ and MAT `1/D_map` are
+  directly comparable on the same scale.
+
+**Loss/Fisher follow the anchor:** with `g0_norm=True` the theory is `1/(1+γτ^α)` (no
+self-normalisation) and the Fisher weights switch to `_fisher_weights_g0` — under G(0)
+normalisation τ=1 is still γ-informative, so it is no longer zeroed (it was under the
+τ_ref formula). σ_clip becomes a safe no-op since σ_G_norm_g0 ≤ √(4/T) ≪ 2.
+
+---
+
+### v4.6 — Artifact Mask + Scaled-Sigmoid + Gradio Frontend (Current)
+
+**Three changes:**
+
+1. **Kurtosis artifact mask** (`phys_recon_dataset.py`): camera saturation, hot/dead
+   pixels and debris produce spiky temporal traces (a few extreme frames dominate the
+   variance) with excess kurtosis far above the rest of the cell. These masquerade as
+   extreme-γ outliers (dark/blown-out blobs) because their G(τ) curves don't follow
+   diffusion physics. Flag `kurtosis > max(2×p99_cell, 10)` and drop from `cell_mask`
+   before normalisation.
+
+2. **Scaled-sigmoid activations (Direction E):**
+   ```
+   γ = gamma_scale · sigmoid(x)   → (0, gamma_scale),  default 2.0
+   α = 2 · sigmoid(x)             → (0, 2),  x=0 → α=1.0
+   ```
+   - γ: empirical g0_norm fits (checkerboard gridA, 1/D_map GT) reach ≈1.7–2.0;
+     the v4.5 plain `Sigmoid→(0,1)` was clipping real signal at the top. `gamma_scale=2.0`
+     gives headroom while staying stable (unbounded Softplus risks early blow-up).
+   - α: `2·sigmoid` is symmetric and saturates smoothly at both ends — no zero-gradient
+     boundary "pile-up" like the v4.5 hard `.clamp(max=2.0)` produced at α=2.
+
+3. **Gradio inference frontend (`app.py`):** HF Spaces deployment — upload video →
+   background removal → `PhysReconDataset` (reuses the G(0) normalisation) → checkpoint
+   inference → (γ,α) maps, physical-unit conversion, and optional MATLAB-GT comparison.
+   `GAMMA_SCALE`/`USE_SIGMA` must match the loaded checkpoint.
+
+**TV prior follows γ range:** `compute_physics_tv_lambdas` now takes `gamma_max=GAMMA_SCALE`;
+hard-coding γ_max=1 while the model emits γ∈(0,2) made λ_TV_gamma ~4× too strong. The
+synthetic trainer `train_phys_recon.py` was synced to the notebook here: `g0_norm=True`,
+`gamma_scale` passed through, γ colormaps scale with GAMMA_SCALE.
+
+---
+
 ## Key Insights Summary
 
 | # | Insight | Version |
@@ -492,6 +589,11 @@ updated to extract by exact names and compare model gamma vs 1/D_map (inverse re
 | 26 | G_norm normalization is unstable for real data at small τ: biological dynamics are fast → G(τ=1)≈0 → G_norm=G(τ)/G(τ=1) amplifies noise → τ=1,2,4,8 channels are effectively pure salt-and-pepper noise. 4 of 10 model input channels carry no physics signal. Use τ_min≥16 for real data, or normalize by G(τ_min_nonzero) instead of G(τ=1). | v4.0 real |
 | 27 | Traditional iSCORS MAT output fields are BG_img (cell morphology), Cond_map (V_DLS/D condensation), D_map (diffusion coefficient), V_map (velocity). Our model's γ is proportional to 1/D_map (inverse: high γ → fast decay → small D). α has no traditional equivalent. MAT extraction must use exact field names; generic search ('gamma','alpha') finds nothing. | v4.0 real |
 | 28 | Noisy small-τ channels can be excluded by changing RECON_TAUS=(16,32,48,64,96,128). No other code changes needed — dataset, model τ-PE, and loss all auto-adapt. The loss Fisher weights must use τ_ref=recon_taus[0] in their partial derivative formulas; the legacy τ_ref=1 formula was a hidden bug for any τ set not starting at 1. | v4.1 candidate |
+| 29 | Fisher (which τ has info) × Reliability 1/σ_G (which τ is trustworthy) is the right combined weight: it down-weights noisy channels per pixel without dropping them globally. σ_G can also be a 3rd input block so the network learns its own down-weighting. | v4.1 |
+| 30 | G(0)=CV² is the only normalisation anchor that is bounded for all diffusion speeds (always the max G). Normalising by G(τ₁) blows up when G(τ=1)→0 for fast dynamics. G(0) also removes the τ_ref scale degeneracy → γ fully identifiable, and matches MATLAB nor_1 so model γ ↔ 1/D_map on one scale. | v4.5 |
+| 31 | Under G(0) normalisation τ=1 still carries γ signal, so it must NOT be zeroed — Fisher weights switch from the τ_ref formula (which zeroes τ_ref) to the g0 formula. Loss theory must drop self-normalisation (g0_norm=True); leaving shape_only=True silently mismatches the dataset target. | v4.5 |
+| 32 | Saturated/hot pixels have abnormally high temporal-trace kurtosis and produce non-physical G(τ) curves → extreme-γ blobs. Excess-kurtosis masking before normalisation removes them more reliably than a CV threshold alone. | v4.6 |
+| 33 | Activation range must match the data: empirical g0_norm fits reach γ≈1.7–2.0, so γ∈(0,1) clips signal — use scaled-sigmoid γ∈(0,gamma_scale). Hard clamps (ELU+1.clamp at α=2) pile gradients up at the boundary; smooth saturating sigmoids avoid this. TV priors and γ colormaps must track gamma_scale, not a hard-coded γ_max=1. | v4.6 |
 
 ---
 
@@ -526,10 +628,12 @@ updated to extract by exact names and compare model gamma vs 1/D_map (inverse re
 ## File Map
 
 ```
-train_phys_recon.py             Main training script (v4.x): masked_huber_tv, TV_ALPHA_EXTRA_SCALE
-datasets/phys_recon_dataset.py  G_empirical precompute, 65/35 blind-spot, cell_mask_patch output
-models/pissl_tau_encoder.py     U-Net, ELU+1 alpha, τ positional encoding (v3.9)
-loss/phys_recon_loss.py         Fisher-weighted shape-only MSE (v3.8)
+train_phys_recon.py             Synthetic trainer (v4.6): G0_NORM, scaled-sigmoid, masked_huber_tv
+iscors_real_runner.ipynb        Phase-2 real-data notebook (v4.6 reference pipeline)
+app.py                          Gradio inference frontend (HF Spaces)
+datasets/phys_recon_dataset.py  G_empirical + G(0)=CV² norm, σ_G map, kurtosis artifact mask
+models/pissl_tau_encoder.py     U-Net, scaled-sigmoid γ/α, τ-PE (v3.9), optional σ input (v4.1)
+loss/phys_recon_loss.py         Fisher × Reliability weighted MSE; g0_norm + shape_only modes
 utils/traditional_iscors.py     FFT autocorrelation, curve fitting, G_empirical map
 utils/generate_test_video.py    Synthetic v1 (nested circles) + v2 (concentric rings)
 ```

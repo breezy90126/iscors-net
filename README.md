@@ -20,17 +20,24 @@ This is O(H·W·T) and takes hours on a full cell video. We replace curve-fittin
 
 ---
 
-## Method (v3.x)
+## Method (v4.6)
 
-### Input preparation
+### Input preparation — G(0)=CV² normalisation (v4.5)
 
-For each pixel, compute empirical G at fixed τ lags and normalise by τ=1:
+For each pixel, compute empirical G at fixed τ lags and normalise by the **zero-lag**
+autocorrelation G(0) = ⟨δI²⟩/⟨I⟩² = CV²:
 
 ```
-G_norm(τ; y,x) = G_empirical(τ; y,x) / G_empirical(τ₁; y,x)
+G_norm(τ; y,x) = G_empirical(τ; y,x) / G(0; y,x)   →   1 / (1 + γ·τ^α)
 ```
 
-This removes amplitude A; the model sees only the decay shape.
+G(0) is always the largest G value regardless of diffusion speed, so the ratio never
+blows up (unlike the earlier `G/G(τ₁)`, which exploded when fast biological dynamics
+drove G(τ=1)→0). This matches MATLAB iSCORS `nor_1` normalisation and makes **γ fully
+identifiable** — the target collapses exactly to `1/(1+γτ^α)` with no τ_ref degeneracy.
+
+> Earlier versions (v3.1–v4.3) normalised by `G(τ₁)`, giving target `(1+γτ_ref^α)/(1+γτ^α)`.
+> That "shape-only" mode is retained as a fallback (`G0_NORM=False`) but G(0) is the default.
 
 ### Spatial blind-spot (self-supervision)
 
@@ -40,16 +47,19 @@ This removes amplitude A; the model sees only the decay shape.
 
 This gives a meaningful spatial generalisation test without any external GT.
 
-### Loss: τ-weighted shape-only MSE
+### Loss: Fisher × Reliability weighted MSE (G(0) target)
 
 ```
-G_theory_norm(τ) = (1+γ) / (1 + γ·τ^α)
+G_theory_norm(τ) = 1 / (1 + γ·τ^α)          # matches the G(0)-normalised target
 
-L = Σ_k w_k · (G_theory_norm(τ_k) − G_norm(τ_k))²
-    w_k = log(τ_k) / Σ_j log(τ_j)
+L = Σ_k w_k(τ; y,x) · (G_theory_norm(τ_k) − G_norm(τ_k))²
+    w_k ∝ Fisher(τ_k) × 1/σ_G_norm(τ_k; y,x)   # normalised per pixel
 ```
 
-τ=1 gets weight 0 (no α signal); large τ up-weighted where dG/dα is strongest.
+- **Fisher τ-weighting (v3.8):** `w ∝ (∂G/∂γ)² + (∂G/∂α)²` at a prior (γ₀,α₀). Under
+  G(0) normalisation all τ are informative (τ=1 is no longer zeroed — it carries γ signal).
+- **Reliability weighting (v4.1):** down-weights τ channels with high measurement noise
+  σ_G_norm = √((2/T)(1+G_norm²)) (Wiener–Khinchin estimate).
 
 ### TV regularisation (v3.7)
 
@@ -72,8 +82,13 @@ Separate strengths: γ is physically smooth (λ_γ=0.5); α has sharp region bou
 | Encoder | 4 stages: 64→128→256→512 channels |
 | Decoder | Bilinear up + skip concat, DoubleConv at each scale |
 | Output | (B, 2, P, P) — γ and α |
-| γ activation | Sigmoid → (0, 1) |
-| α activation | ELU+1: `(F.elu(x)+1.001).clamp(max=2)` → (0.001, 2] |
+| γ activation (v4.6) | `gamma_scale · Sigmoid(x)` → (0, gamma_scale), default 2.0 |
+| α activation (v4.6) | `2 · Sigmoid(x)` → (0, 2); x=0 → α=1.0 |
+
+v4.6 replaced the v4.5 `Sigmoid→(0,1)` for γ (which clipped empirical g0_norm fits that
+reach ≈1.7–2.0) and the `ELU+1.clamp(max=2)` for α (whose hard clamp piled gradients up
+at α=2). Scaled sigmoids saturate smoothly at both ends with no zero-gradient pile-up.
+Optionally (`use_sigma=True`) the input gains K extra σ_G_norm channels (3K total).
 
 τ-PE makes the τ label for each G_norm channel explicit. Without it the model can use
 the set of G_norm magnitudes (bag-of-values shortcut) to identify (γ,α) without learning
@@ -130,38 +145,48 @@ After inference, randomly permute the K τ-channel order and re-run the model. C
 | v3.7 | Separate λ_TV for γ and α | Release α boundary formation; log(τ) starves fast-spot γ |
 | v3.8 | Fisher τ-weighting + physics-derived TV | Fast-spot γ recovered; shuffle ring pattern diagnosed |
 | v3.9 | τ-PE + 35% blind-spot | Break bag-of-values shortcut; force interior physics decoding |
-| **v4.0** | Masked Huber-TV (cell-cell pairs only) + α TV ×3 | Fix γ collapse: background→cell TV cascade eliminated |
+| v4.0 | Masked Huber-TV (cell-cell pairs only) + α TV ×3 | Fix γ collapse: background→cell TV cascade eliminated |
+| v4.1 | σ_G reliability map + Fisher×Reliability loss | Down-weight noisy τ channels per pixel |
+| v4.2 | Real-data self-train + R² confidence map + checkerboard CV | Validate on real video without external GT |
+| v4.5 | **G(0)=CV² normalisation** (target `1/(1+γτ^α)`) | γ fully identifiable; matches MATLAB `nor_1` |
+| **v4.6** | Kurtosis artifact mask + scaled-sigmoid γ/α + Gradio frontend | Drop hot pixels; widen γ range; HF Spaces deploy |
 
 ---
 
 ## Running
 
+**Synthetic trainer (diagnostics, GT available):**
+
 ```bash
 pip install -r requirements.txt
-
-# Generate synthetic test video (T=2000)
-python utils/generate_test_video.py
-
-# Train
-python train_phys_recon.py
+python utils/generate_test_video.py     # synthetic test video (T=2000)
+python train_phys_recon.py              # G0_NORM=True, GAMMA_SCALE=2.0 by default
 ```
 
-Outputs in `./result/`:
-- `inference_maps_v4.0.png` — predicted γ and α vs GT
-- `loss_curve_v4.0.png` — physics loss + masked TV_gamma + masked TV_alpha curves
-- `shuffle_test_v4.0.png` — τ shuffle diagnostic (expect uniform diff, large |Δγ|)
-- `generalisation_v4.0.txt` — seen vs held-out MAE report
-- `overfitting_test_v4.0.png` — cross-video generalisation (v1 train → v2 inference)
+Outputs in `./result/` (suffixed with the current `VERSION`, e.g. `_v4.6`):
+- `inference_maps_v4.6.png` — predicted γ and α vs GT (γ colormap scales with GAMMA_SCALE)
+- `loss_curve_v4.6.png` — physics loss + masked TV_gamma + masked TV_alpha curves
+- `shuffle_test_v4.6.png` — τ shuffle diagnostic (expect uniform diff, large |Δγ|)
+- `generalisation_v4.6.txt` — seen vs held-out MAE report
+- `overfitting_test_v4.6.png` — cross-video generalisation (v1 train → v2 inference)
+
+**Real-data pipeline & deployment:**
+- `iscors_real_runner.ipynb` — Phase-2 notebook: real-video self-training, physical-unit
+  conversion, R² map, checkerboard CV, model-vs-MATLAB-GT comparison.
+- `app.py` — Gradio inference frontend (HF Spaces). Set `GAMMA_SCALE` / `USE_SIGMA` to
+  match the checkpoint being loaded.
 
 ---
 
 ## Project Structure
 
 ```
-train_phys_recon.py             Main training script (v4.0: masked_huber_tv)
-datasets/phys_recon_dataset.py  G_empirical precompute, 65/35 blind-spot, cell_mask_patch
-models/pissl_tau_encoder.py     U-Net, ELU+1 alpha, τ positional encoding (v3.9)
-loss/phys_recon_loss.py         Fisher-weighted shape-only MSE (v3.8)
+train_phys_recon.py             Synthetic trainer (v4.6: G0_NORM, scaled-sigmoid, masked_huber_tv)
+iscors_real_runner.ipynb        Phase-2 real-data notebook (v4.6 reference pipeline)
+app.py                          Gradio inference frontend (HF Spaces)
+datasets/phys_recon_dataset.py  G_empirical + G(0)=CV² norm, σ_G map, kurtosis artifact mask
+models/pissl_tau_encoder.py     U-Net, scaled-sigmoid γ/α, τ positional encoding, optional σ input
+loss/phys_recon_loss.py         Fisher × Reliability weighted MSE; g0_norm + shape_only modes
 utils/traditional_iscors.py     FFT autocorrelation, G_empirical map
 utils/generate_test_video.py    Synthetic 3-region video generator
 EXPERIMENTS.md                  Full version history and insights

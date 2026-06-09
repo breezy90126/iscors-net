@@ -1,177 +1,168 @@
-# Spiral iSCAT + FAST-like XYZ 座標 MVP 專案規格說明 (Spec)
+# iSCORS-Net
 
-這個規格說明 (Spec) 是為了讓 AI 輔助程式碼編輯器如 **Cursor**（或類似工具，如 VS Code with GitHub Copilot）能夠理解整個專案的來龍去脈，並引導你逐步實現 MVP (Minimum Viable Product)。Spec 基於我們的對話脈絡：從傳統逐幀 fitting 的痛點，自然演化到 forward model 的 marginalization，利用 temporal redundancy 來邊緣化 nuisance（如 noise、speckle）。目標是實現一個 coding 專案，整合 FAST 的開源代碼和提供的 `xyt_dataset_generator.py`，來驗證 spiral iSCAT 粒子 free diffusion 的 3D 軌跡估計。
+Physics-Informed Self-Supervised Learning for iSCAT anomalous diffusion mapping.
 
-**使用建議**：
-- 在 Cursor 中，新建一個專案目錄 (e.g., `iscat_fast_mvp`)，將這個 Spec 複製成 `README.md` 或 `spec.md`。
-- 使用 Cursor 的 AI 功能 (e.g., "Apply" 或 "Chat")，餵入 Spec，讓它生成/修改 code。
-- 逐步執行下面的步驟，Cursor 可以幫你 auto-complete code、debug，或生成 boilerplate。
+Given a single iSCAT video (T × H × W), the network recovers dense maps of **gamma** (diffusion coefficient) and **alpha** (anomalous exponent) at every pixel — supervised only by the physics of the autocorrelation decay, with no external labels.
 
-## 1. 專案背景與來龍去脈 (Context)
-### 1.1 原始問題與痛點
-- **問題**：在 spiral iSCAT（高速干涉散射顯微）中，追蹤單顆或少數粒子的 free diffusion 軌跡，需要從 noisy 影像序列中估計每幀的 (x(t), y(t), z(t))，尤其是 z(t) 最難（受 SNR 不穩、speckle、背景漂移影響）。
-- **現有解法**：逐幀 parametric fitting（基於 analytic interference pattern 的 nonlinear fitting），本質是壓縮的 forward model，但忽略 temporal continuity，易受 noise/mismatch 影響。
-- **痛點**：
-  - 逐幀對抗 noise，浪費時間結構（粒子軌跡是連續的）。
-  - Forward model mismatch 直接毒害結果，無退路。
+See [EXPERIMENTS.md](EXPERIMENTS.md) for full version history and insights.
 
-### 1.2 FAST 啟發與新世界觀
-- **FAST 啟發**：FAST (FrAme-multiplexed SpatioTemporal learning strategy) 不精準建模 forward，而是用 sampling + consistency marginalize nuisance。核心：signal 在時空維度可預測，noise 不可預測。
-- **類比到 iSCAT**：z(t) 是低頻連續軌跡 (signal)，noise/speckle 是 nuisance → 用 temporal redundancy 逼出 z(t)，而不逐幀 fit。
-- **新方案**：用 FAST-like temporal learning + latent trajectory 表示，marginalize nuisance。重點：weak forward constraint (physics gauge)，加上 MSD consistency 作為 identity 破壞測試。
-- **MVP 目標**：證明在 imperfect forward model 下，latent + MSD consistency 能 recover 正確 identity 與 z(t) 結構。無 supervision，只用 self-supervised loss。
+---
 
-### 1.3 專案目標與範圍
-- **MVP 定義**：用模擬數據 (從 xyt generator 生成) 訓練 FAST-like encoder，輸出 latent z_i(t)，用 MSD loss 確保 consistency。驗證終點：
-  - 單粒子：latent smooth, MSD 穩定, z(t) phase-consistent。
-  - 多粒子：identity 不 swap, 每條有穩定 MSD signature。
-  - Stress test：改 noise/mismatch, MSD 仍穩定。
-- **不包含**：重建影像、pixel-wise loss、真實數據橋接（留給 Phase 3）。
-- **輸出**：一個 PyTorch 專案，能生成數據、訓練模型、視覺化結果 (e.g., MSD 曲線、軌跡 plot)。
+## Problem
 
-## 2. 技術堆疊與依賴
-- **語言/框架**：Python 3.9+, PyTorch 2.0+ (與 FAST 相容)。
-- **關鍵組件**：
-  - FAST repo: https://github.com/FDU-donglab/FAST (lightweight U-Net + self-supervised loss)。
-  - xyt_dataset_generator.py: 提供的 generator code，用來產生 iSCAT-like 影片數據。
-- **依賴** (從 FAST 的 requirements.txt + 你的 generator):
-  ```
-  numpy==1.24.1
-  torch==2.5.1
-  torchvision==0.20.1
-  torchaudio==2.5.1
-  scikit-image==0.24.0
-  tqdm==4.66.5
-  pyqt5==5.15.7  # 如果用 GUI，可選
-  csbdeep==0.8.1
-  matplotlib  # 加這個用來 plot MSD/軌跡
-  tifffile  # generator 需要
-  ```
-- **環境設置**：用 Conda (如 FAST 建議)。
+Traditional iSCORS computes autocorrelation G(τ) pixel-by-pixel and fits:
 
-## 3. 專案結構建議
-在 Cursor 中新建目錄結構：
 ```
-iscat_fast_mvp/
-├── README.md  # 這個 Spec
-├── main.py  # 入口：生成數據、訓練、測試
-├── train.py  # 訓練邏輯 (從 FAST 修改)
-├── test.py  # 測試/視覺化 (從 FAST 修改)
-├── models/  # 從 FAST clone: Unet_Lite.py, loss/loss.py
-├── datasets/  # 從 FAST clone + 整合 generator
-│   └── xyt_dataset_generator.py  # 你的 generator
-├── utils/  # 從 FAST clone
-├── data/  # 生成的數據: train/ (tif stacks), test/
-├── checkpoint/  # 模型權重
-├── result/  # 輸出: latent 軌跡, MSD plots
-├── params.json  # 配置 (從 FAST 修改，加 iSCAT params)
-└── requirements.txt  # 上述依賴
+G(τ) = A / (1 + γ · τ^α)
 ```
 
-## 4. 實施步驟 (Step-by-Step Guide)
-用 Cursor 的 AI 幫你生成 code，按步驟執行。
+This is O(H·W·T) and takes hours on a full cell video. We replace curve-fitting with a U-Net that learns to predict (γ, α) spatially from normalised G channels, trained self-supervisedly on the video itself.
 
-### 步驟 1: Clone FAST 並設置環境
-- 在終端 (或 Cursor 內建終端)：
-  ```
-  git clone https://github.com/FDU-donglab/FAST.git
-  cd FAST
-  conda create -n iscat_mvp python=3.9 -y
-  conda activate iscat_mvp
-  pip install -r requirements.txt
-  ```
-- 複製 FAST 的 models/, utils/, datasets/ 到你的專案。
-- 加你的 `xyt_dataset_generator.py` 到 datasets/。
-- 修改 params.json：加 iSCAT params 如 'n_particles': 1, 'z_range': [70e-9, 70e-9], 'photon_scale_range': [40000, 40000]。
+---
 
-### 步驟 2: 生成數據 (用 xyt generator)
-- 在 main.py 中呼叫 generator 生成 tif stacks。
-- 示例 code (讓 Cursor 生成完整版)：
-  ```python
-  from datasets.xyt_dataset_generator import EnhancedSimulationPipeline
+## Method (v3.x)
 
-  def generate_data(config):
-      optical_params = {  # 從你的對話抄 iSCAT params
-          'wavelength': 532e-9, 'NA': 1.4, 'scattering_model': 'rayleigh',
-          # ... 其他 params
-      }
-      pipeline = EnhancedSimulationPipeline(optical_params, noise_params={})
-      rough_surfaces, _ = pipeline.generate_rough_surfaces(n_surfaces=10)
-      particle_coords_list = pipeline.generate_particle_coordinates(n_configs=10, n_particles=1)  # Phase 1: 單粒子
-      dataset_2d = pipeline.generate_integrated_dataset_with_variations(particle_coords_list, rough_surfaces)
-      dataset_xyt = pipeline.generate_xyt_dataset(dataset_2d, n_frames=100)  # 100 幀影片
-      # 保存到 data/train/ 作為 tif
-      return dataset_xyt
-  ```
-- 輸出：noisy_movies [N, T, H, W] 作為輸入，coords_physical [N, particles, T, 3] 作為 latent GT (但無 supervision，只用計算經驗 MSD)。
+### Input preparation
 
-### 步驟 3: 修改 FAST 模型為你的 Encoder
-- 用 FAST 的 Unet_Lite 作為 backbone，輸入 frame stack {I_{t-k} ... I_{t+k}}。
-- 加 latent head：輸出 z_i(t) (e.g., 低維向量)。
-- 示例 (在 models/Unet_Lite.py 修改)：
-  ```python
-  import torch.nn as nn
+For each pixel, compute empirical G at fixed τ lags and normalise by τ=1:
 
-  class ISCATEncoder(nn.Module):  # 繼承 FAST 的 Unet_Lite
-      def __init__(self):
-          super().__init__()
-          self.backbone = Unet_Lite()  # 從 FAST
-          self.trajectory_head = nn.Linear(hidden_dim, latent_dim)  # 输出 z_i(t)
+```
+G_norm(τ; y,x) = G_empirical(τ; y,x) / G_empirical(τ₁; y,x)
+```
 
-      def forward(self, frame_stack):  # [B, window_size, H, W]
-          features = self.backbone(frame_stack)
-          latent = self.trajectory_head(features)  # [B, T, latent_dim]
-          return latent
-  ```
+This removes amplitude A; the model sees only the decay shape.
 
-### 步驟 4: 實現 MSD Consistency Loss (方案 B)
-- 在 loss/loss.py 加你的 loss。
-- 示例：
-  ```python
-  def msd_consistency_loss(latent_z, empirical_msd_func):
-      h_i = torch.mean(latent_z, dim=1)  # Pooling to embedding [B, embed_dim]
-      predicted_msd = neural_g(h_i, tau_range)  # neural_g: MLP(h_i, τ) → MSD(τ)
-      empirical_msd = empirical_msd_func(latent_z)  # 從 latent_z 計算 Δz(τ)^2 的經驗平均
-      return torch.mean((empirical_msd - predicted_msd)**2)
-  ```
-- 整合 FAST 的 consistency loss：總 loss = FAST_loss + λ * MSD_loss。
+### Spatial blind-spot (self-supervision)
 
-### 步驟 5: 訓練與測試 Pipeline
-- 在 train.py 修改：載入數據，用 encoder 輸出 latent，計算 loss (self-supervised + MSD)。
-- 加 constraints：smoothness (e.g., TV loss on z(t)), oscillatory (e.g., Fourier domain loss)。
-- 测试：生成 MSD 曲線，檢查 swap loss 爆炸。
-- 示例 main.py：
-  ```python
-  if __name__ == "__main__":
-      config = load_config('params.json')
-      data = generate_data(config)
-      model = ISCATEncoder()
-      optimizer = torch.optim.Adam(model.parameters())
-      for epoch in range(config['epochs']):
-          latent = model(data['noisy_movies'])
-          loss = fast_loss + msd_consistency_loss(latent, compute_empirical_msd)
-          optimizer.step()
-      visualize_msd(latent)  # Plot for paper
-  ```
+- 80% of cell pixels: G_norm visible in input → supervised by physics loss
+- 20% of cell pixels: G_norm zeroed in input, excluded from loss
+- The model must infer held-out pixels from neighbouring visible pixels
 
-### 步驟 6: 驗證 MVP 終點
-- 寫 test.py：計算 smoothness (e.g., diff(z(t))), MSD 穩定 (plot 曲線), identity test (swap 軌跡, check loss ↑)。
-- Stress test：改 generator params (noise, mismatch), re-train, compare。
+This gives a meaningful spatial generalisation test without any external GT.
 
-## 5. 潛在挑戰與 Debug Tips
-- **相容性**：FAST 用 3D data (xy-t)，你的 generator 輸出 XYT，完美 match。
-- **Debug**：用 matplotlib plot 軌跡/MSD；在 Cursor 用 "Debug with AI"。
-- **擴展**：Phase 2 加多粒子 (n_particles>1)；Phase 3 用真實數據替換 generator。
+### Loss: τ-weighted shape-only MSE
 
-## Running on Google Colab (Direct Upload)
+```
+G_theory_norm(τ) = (1+γ) / (1 + γ·τ^α)
 
-To run this project on Google Colab without linking Google Drive:
+L = Σ_k w_k · (G_theory_norm(τ_k) − G_norm(τ_k))²
+    w_k = log(τ_k) / Σ_j log(τ_j)
+```
 
-1.  **Zip the Project**: Zip the entire `iscat_fast_mvp` folder. Name it `iscat_fast_mvp.zip`.
-2.  **Open Notebook**: Open `colab_runner.ipynb` in Colab.
-3.  **Upload Zip**: In the Colab left sidebar ("Files" icon), click the Upload button and select your `iscat_fast_mvp.zip`.
-4.  **Run**: Execute the notebook cells to unzip and start training.
+τ=1 gets weight 0 (no α signal); large τ up-weighted where dG/dα is strongest.
 
-> **Note**: Data/Results will be lost when the runtime disconnects. Download `result/` folder if you want to keep them.
+### TV regularisation (v3.7)
 
+```
+L_total = L_physics + λ_γ · TV(γ) + λ_α · TV(α)
+```
 
+Separate strengths: γ is physically smooth (λ_γ=0.5); α has sharp region boundaries (λ_α=0.05).
+
+---
+
+## Architecture
+
+`PISSLTauEncoder` — U-Net with bilinear upsampling and skip connections.
+
+| Component | Detail |
+|---|---|
+| Input | (B, 2K, P, P) — K G_norm + K τ-PE channels, P=64 patch |
+| τ-PE | `tau_pe[k] = log(τ_k)/log(τ_max)` ∈ [0,1], broadcast spatially (v3.9) |
+| Encoder | 4 stages: 64→128→256→512 channels |
+| Decoder | Bilinear up + skip concat, DoubleConv at each scale |
+| Output | (B, 2, P, P) — γ and α |
+| γ activation | Sigmoid → (0, 1) |
+| α activation | ELU+1: `(F.elu(x)+1.001).clamp(max=2)` → (0.001, 2] |
+
+τ-PE makes the τ label for each G_norm channel explicit. Without it the model can use
+the set of G_norm magnitudes (bag-of-values shortcut) to identify (γ,α) without learning
+the τ-dependent curve shape — physics decoding only activates at region boundaries.
+
+---
+
+## Synthetic Test Video
+
+Three diffusion regions + near-static background (T=2000, H=128, W=128):
+
+| Region | γ | α | Notes |
+|---|---|---|---|
+| Large circle (cell body) | 0.10 | 1.0 | Normal diffusion |
+| Small circle 1 (upper-left) | 0.50 | 1.5 | Super-diffusion; G saturates at large τ |
+| Small circle 2 (lower-right) | 0.05 | 0.5 | Sub-diffusion; strongest dG/dα at large τ |
+| Background | 0.0 | 0.0 | CV=0.05%, skipped by CV filter |
+
+T=2000 rationale: G_empirical error ≈2.3% at τ=128 (vs 12% for T=200).
+
+---
+
+## τ Shuffle Test (diagnostic)
+
+After inference, randomly permute the K τ-channel order and re-run the model. Compare output maps with original permutation.
+
+- Large |Δγ|, |Δα| → model uses τ ordering (physics curve decoding active)
+- Small |Δγ|, |Δα| → model ignores τ ordering (spatial pattern matching only)
+
+| Version | |Δγ| | |Δα| | Pattern | Interpretation |
+|---|---|---|---|---|
+| v3.6 | 0.14 | 0.130 | Spatially separated regions | Physics active; TV suppressing output |
+| v3.7 | 0.037 | 0.122 | Uniform (dim) | γ collapsed; log(τ) starves fast-spot gradient |
+| v3.8 | 0.139 | 0.328 | **Ring (bright edge)** | Fisher weighting restores physics; interior shortcuts via spatial propagation |
+| v3.9 | 0.080 | 0.393 | **Uniform** | τ-PE broke bag-of-values shortcut ✓; |Δγ| low because γ itself collapsed to ≈0 |
+| v4.0 | TBD | TBD | Expected: uniform, |Δγ|↑ | Masked TV removes γ collapse → γ non-zero → larger shuffle sensitivity |
+
+**Ring pattern (v3.8):** The shuffle diff is large at region boundaries (physics decoding needed) and small in interiors (spatial propagation from consistent neighbours suffices). This duality is expected in a U-Net; the τ-PE and increased blind-spot (v3.9) are designed to push more interior pixels into physics-decoding mode.
+
+---
+
+## Version Summary
+
+| Version | Key change | Main insight |
+|---|---|---|
+| v2.x | Sparse GT (2%) supervision | Cannot generalize; blind-spot needed |
+| v3.0 | 80/20 spatial blind-spot, physics loss | Self-supervision works |
+| v3.1 | Shape-only G_norm loss | Amplitude dominates gradient; must remove |
+| v3.2 | 3-ch output (γ,α,A) | A re-introduces mean-regression attractor |
+| v3.3 | Masked G_norm as input | Aligns input/output in G space |
+| v3.4 | v3.1 + v3.3 combined | Grainy maps without TV |
+| v3.5 | log-MSE + TV | TV ineffective (λ not scaled to log-MSE magnitude) |
+| v3.6 | τ-weighted MSE + scaled TV + ELU-α | TV active; shuffle test reveals internal α structure |
+| v3.7 | Separate λ_TV for γ and α | Release α boundary formation; log(τ) starves fast-spot γ |
+| v3.8 | Fisher τ-weighting + physics-derived TV | Fast-spot γ recovered; shuffle ring pattern diagnosed |
+| v3.9 | τ-PE + 35% blind-spot | Break bag-of-values shortcut; force interior physics decoding |
+| **v4.0** | Masked Huber-TV (cell-cell pairs only) + α TV ×3 | Fix γ collapse: background→cell TV cascade eliminated |
+
+---
+
+## Running
+
+```bash
+pip install -r requirements.txt
+
+# Generate synthetic test video (T=2000)
+python utils/generate_test_video.py
+
+# Train
+python train_phys_recon.py
+```
+
+Outputs in `./result/`:
+- `inference_maps_v4.0.png` — predicted γ and α vs GT
+- `loss_curve_v4.0.png` — physics loss + masked TV_gamma + masked TV_alpha curves
+- `shuffle_test_v4.0.png` — τ shuffle diagnostic (expect uniform diff, large |Δγ|)
+- `generalisation_v4.0.txt` — seen vs held-out MAE report
+- `overfitting_test_v4.0.png` — cross-video generalisation (v1 train → v2 inference)
+
+---
+
+## Project Structure
+
+```
+train_phys_recon.py             Main training script (v4.0: masked_huber_tv)
+datasets/phys_recon_dataset.py  G_empirical precompute, 65/35 blind-spot, cell_mask_patch
+models/pissl_tau_encoder.py     U-Net, ELU+1 alpha, τ positional encoding (v3.9)
+loss/phys_recon_loss.py         Fisher-weighted shape-only MSE (v3.8)
+utils/traditional_iscors.py     FFT autocorrelation, G_empirical map
+utils/generate_test_video.py    Synthetic 3-region video generator
+EXPERIMENTS.md                  Full version history and insights
+```

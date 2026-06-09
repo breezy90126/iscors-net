@@ -3,25 +3,34 @@ from scipy.optimize import curve_fit
 
 def compute_autocorrelation(trace):
     """
-    Computes the temporal autocorrelation of a 1D intensity trace.
-    Uses numpy.correlate for efficiency.
+    FFT-based autocorrelation with Hann windowing (Wiener-Khinchin theorem).
+    Hann window reduces spectral leakage; FFT gives O(N log N) vs O(N^2).
+    Window bias is corrected by dividing by the window self-correlation per lag.
     """
-    # Normalize trace by subtracting mean
+    N = len(trace)
     mean_I = np.mean(trace)
     if mean_I == 0:
-        return np.zeros(len(trace) // 2)
-        
+        return np.zeros(N // 2)
+
     fluct = trace - mean_I
-    # Full cross-correlation of fluct with itself
-    corr = np.correlate(fluct, fluct, mode='full')
-    # Take the second half (tau >= 0)
-    corr = corr[len(corr)//2:]
-    
-    # Normalize by the number of overlapping points and mean intensity squared
-    N = len(trace)
-    lags = np.arange(len(corr))
+
+    # Hann window to reduce spectral leakage
+    window = np.hanning(N)
+    fluct_w = fluct * window
+
+    # Zero-pad to next power of 2 for FFT efficiency
+    fft_len = int(2 ** np.ceil(np.log2(2 * N)))
+
+    # Autocorrelation via Wiener-Khinchin: IFFT(|FFT(x)|^2)
+    F = np.fft.rfft(fluct_w, n=fft_len)
+    corr = np.fft.irfft(F * np.conj(F), n=fft_len)[:N].real
+
+    # Window bias correction: divide by window self-correlation at each lag
+    W = np.fft.rfft(window, n=fft_len)
+    w_corr = np.fft.irfft(W * np.conj(W), n=fft_len)[:N].real
+
     # G(tau) = <dI(t)dI(t+tau)> / <I>^2
-    g_tau = corr / ((N - lags) * (mean_I ** 2) + 1e-10)
+    g_tau = corr / (w_corr * mean_I ** 2 + 1e-10)
     return g_tau
 
 def theoretical_g_tau(tau, gamma, alpha, amplitude):
@@ -38,14 +47,20 @@ def theoretical_g_tau(tau, gamma, alpha, amplitude):
 
 def fit_physical_parameters(trace, max_tau=64):
     """
-    Given a single pixel's time trace (e.g., 500 frames), compute the 
-    autocorrelation and fit it to extract Gamma and Alpha.
-    
-    Returns:
-        gamma, alpha
+    Compute autocorrelation of a pixel trace and fit gamma / alpha.
+
+    Background detection uses coefficient of variation (CV = std/mean):
+        - Near-static background: CV < 0.5%  → return (0.0, 0.0)
+        - Cell pixels:            CV ≈ 3%    → proceed with fitting
+    This replaces the old `np.var < 1e-8` check, which missed background
+    pixels generated with white noise (variance=10, so var >> 1e-8).
     """
-    if np.var(trace) < 1e-8:
-        # Static background, no dynamics
+    mean_I = np.mean(trace)
+    if mean_I == 0:
+        return 0.0, 0.0
+
+    cv = np.std(trace) / (mean_I + 1e-10)
+    if cv < 0.005:   # CV < 0.5% → near-static, no dynamics to fit
         return 0.0, 0.0
         
     # 1. Compute empirical G_rough(tau)
@@ -67,17 +82,58 @@ def fit_physical_parameters(trace, max_tau=64):
     try:
         popt, pcov = curve_fit(theoretical_g_tau, taus_to_fit, g_to_fit, p0=p0, bounds=bounds, maxfev=1000)
         gamma_fit, alpha_fit, amp_fit = popt
-        return gamma_fit, alpha_fit
-    except Exception as e:
-        # If curve fitting fails (e.g., too noisy or flat), return safe defaults
-        return 0.0, 0.0
+        y_pred  = theoretical_g_tau(taus_to_fit, *popt)
+        ss_res  = np.sum((g_to_fit - y_pred) ** 2)
+        ss_tot  = np.sum((g_to_fit - g_to_fit.mean()) ** 2)
+        r2      = float(1.0 - ss_res / (ss_tot + 1e-10))
+        return gamma_fit, alpha_fit, r2
+    except Exception:
+        return 0.0, 0.0, 0.0
+
+def compute_g_empirical_map(video, taus, min_cv=0.005):
+    """
+    Vectorised autocorrelation G(τ) for every pixel at a chosen set of τ lags.
+    Used for self-supervised Physics Reconstruction training (v3.0+).
+
+    G(τ; y,x) = <δI(t)·δI(t+τ)>_t / <I>²
+
+    Args:
+        video:  (T, H, W) float array.
+        taus:   list/array of integer τ lags (e.g. [1,2,4,8,16,32,48,64]).
+        min_cv: temporal CV threshold; pixels below this are flagged background
+                and their G(τ) is forced to 0.
+
+    Returns:
+        g_map     : (H, W, len(taus)) float32 — empirical G(τ) per pixel.
+        cell_mask : (H, W) bool — True where CV ≥ min_cv (cell pixels).
+    """
+    video = video.astype(np.float32)
+    T, H, W = video.shape
+
+    mean_I = video.mean(axis=0)                       # (H, W)
+    std_I  = video.std(axis=0)
+    cv_map = std_I / (mean_I + 1e-10)
+    cell_mask = cv_map >= min_cv
+
+    delta_I = video - mean_I                          # (T, H, W)
+    denom = (mean_I ** 2) + 1e-10                     # (H, W)
+
+    g_map = np.zeros((H, W, len(taus)), dtype=np.float32)
+    for i, tau in enumerate(taus):
+        n = T - int(tau)
+        # <δI(t)·δI(t+τ)> averaged over valid t
+        g_map[:, :, i] = (delta_I[:n] * delta_I[int(tau):]).mean(axis=0) / denom
+
+    # Background pixels: G(τ) is meaningless — set to 0
+    g_map[~cell_mask] = 0.0
+    return g_map, cell_mask
+
 
 if __name__ == "__main__":
-    # Test the traditional algorithm
     t = np.arange(500)
     # Generate a dummy trace with some decay-like correlation 
     # (just random walk to simulate Brownian-ish motion)
     trace = np.cumsum(np.random.randn(500)) + 1000 
     
-    gamma, alpha = fit_physical_parameters(trace)
-    print(f"Fitted Gamma: {gamma:.4f}, Fitted Alpha: {alpha:.4f}")
+    gamma, alpha, r2 = fit_physical_parameters(trace)
+    print(f"Fitted Gamma: {gamma:.4f}, Fitted Alpha: {alpha:.4f}, R²: {r2:.4f}")

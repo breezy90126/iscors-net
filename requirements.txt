@@ -1,4 +1,5 @@
 numpy>=1.24.1
+scipy>=1.10.0
 torch>=2.0.0
 torchvision
 torchaudio
@@ -10,3 +11,5 @@ pyqt5-sip==12.11.0
 csbdeep==0.8.1
 matplotlib
 tifffile
+gradio
+h5py

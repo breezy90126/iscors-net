@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+
 class DoubleConv(nn.Module):
     """(convolution => [BN] => ReLU) * 2"""
     def __init__(self, in_channels, out_channels):
@@ -17,99 +18,175 @@ class DoubleConv(nn.Module):
     def forward(self, x):
         return self.double_conv(x)
 
-class SubPixelConvUp(nn.Module):
+
+class BilinearUp(nn.Module):
     """
-    Sub-Pixel Convolution (PixelShuffle) for upsampling.
-    Avoids the checkerboard artifacts commonly caused by ConvTranspose2d.
+    Bilinear upsampling + 1x1 conv. No checkerboard artifacts.
+    PixelShuffle without ICNR initialisation produces 2x2 grid artifacts.
     """
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        # Expand channels by 4 for r=2 PixelShuffle
-        self.conv = nn.Conv2d(in_channels, out_channels * 4, kernel_size=1)
-        self.pixel_shuffle = nn.PixelShuffle(2)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
     def forward(self, x):
-        return self.pixel_shuffle(self.conv(x))
+        return self.conv(self.up(x))
+
 
 class PISSLTauEncoder(nn.Module):
     """
-    A 2D U-Net architecture specifically designed for Physics-Informed Temporal Sampling.
-    The input channels represent fixed exponential time delays (tau).
+    U-Net for Physics-Informed Spatial Sampling.
+
+    v3.9+: input is (B, 2K, P, P) = K G_norm channels || K τ-PE channels.
+    v4.1+: optionally (B, 3K, P, P) = K G_norm || K τ-PE || K σ_G_norm channels
+           when use_sigma=True. σ_G_norm lets the model learn to down-weight
+           unreliable τ channels (high noise) automatically.
+
+    τ positional encoding (v3.9):
+        tau_pe[k] = log(τ_k) / log(τ_max)  ∈ [0, 1], constant spatially.
+        Concatenated as K extra channels before the first conv.
+
+    Why τ-PE matters:
+        Without PE, the model sees K G_norm values with implicit ordering. It can
+        identify (γ,α) from the SET of values (bag-of-values) without needing τ order.
+        Consequence: shuffle test shows small diff in homogeneous regions (spatial
+        propagation dominates), large diff only at boundaries.
+
+        With PE, each G_norm channel carries an explicit τ label. Shuffling G_norm
+        while PE stays fixed creates G_norm(τ_k) ↔ τ_{perm(k)} mismatch everywhere.
+        The model MUST learn the τ→G_norm functional relationship, not just value patterns.
+        Shuffle test diff becomes large at every pixel, not just boundaries.
+
+    Spatial context is still used (U-Net), exploiting the microscopy redundancy prior
+    (nearby pixels share similar physics). Per-pixel MLP is not used.
+
+    Output activations (v4.6, Direction E — scaled-sigmoid):
+        γ: gamma_scale · Sigmoid(x) → (0, gamma_scale), default scale 2.0
+            Empirical g0_norm fits reach ≈1.7–2.0 — plain Sigmoid (0,1)
+            (v4.5) was clipping real signal at the upper end.
+        α: 2 · Sigmoid(x) → (0, 2)
+            x=0 → α=1.0 (healthy default, same as v4.5 ELU+1)
+            Smooth saturation at both ends — gradient shrinks but never
+            hits exactly zero, so there is no boundary "pile-up" the way
+            the v4.5 hard .clamp(max=2.0) produced at α=2.0.
     """
-    def __init__(self, num_tau_channels=8):
-        super(PISSLTauEncoder, self).__init__()
-        
-        # 1. Encoder (Downsampling)
-        # Input channels = number of tau slices (e.g., 8)
-        self.inc = DoubleConv(num_tau_channels, 64)
+    def __init__(self, recon_taus, predict_amplitude=False, use_sigma=False, gamma_scale=2.0):
+        super().__init__()
+        self.predict_amplitude = predict_amplitude
+        self.use_sigma = use_sigma
+        self.gamma_scale = gamma_scale
+        out_channels = 3 if predict_amplitude else 2
+
+        K = len(recon_taus)
+        self.K = K
+
+        # τ positional encoding: log(τ_k) / log(τ_max) ∈ [0, 1]
+        tau_t   = torch.tensor(list(recon_taus), dtype=torch.float32)
+        log_tau = torch.log(tau_t.clamp(min=1.0))
+        tau_pe  = log_tau / (log_tau.max() + 1e-8)            # (K,)
+        self.register_buffer("tau_pe", tau_pe)
+
+        # Encoder — 2K channels (G_norm + τ-PE) or 3K (+ σ_G_norm) if use_sigma
+        in_ch = K * 3 if use_sigma else K * 2
+        self.inc   = DoubleConv(in_ch, 64)
         self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
         self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
         self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512))
-        
-        # 2. Decoder (Upsampling) with PixelShuffle
-        self.up1 = SubPixelConvUp(512, 256)
-        self.conv_up1 = DoubleConv(512, 256) # 256 + skip 256
-        
-        self.up2 = SubPixelConvUp(256, 128)
-        self.conv_up2 = DoubleConv(256, 128)
-        
-        self.up3 = SubPixelConvUp(128, 64)
-        self.conv_up3 = DoubleConv(128, 64)
-        
-        # 3. Physics-Guided Latent Projection Layer
-        # Maps the high-dimensional features (64 channels) to exactly 2 parameter maps:
-        # Channel 0: Gamma (Diffusion coefficient)
-        # Channel 1: Alpha (Anomalous exponent)
-        self.physics_projection = nn.Conv2d(64, 2, kernel_size=1)
-        
-        # Optional activations to enforce physical constraints:
-        # Gamma > 0 (Softplus ensures positivity without hard thresholding)
-        self.gamma_activation = nn.Softplus()
-        # Alpha is typically between 0.0 and 2.0. A scaled sigmoid can enforce this bound.
-        self.alpha_activation = nn.Sigmoid()
 
-    def forward(self, x):
-        # x shape: (B, num_tau_channels, H, W)
-        
+        # Decoder
+        self.up1      = BilinearUp(512, 256)
+        self.conv_up1 = DoubleConv(512, 256)
+
+        self.up2      = BilinearUp(256, 128)
+        self.conv_up2 = DoubleConv(256, 128)
+
+        self.up3      = BilinearUp(128, 64)
+        self.conv_up3 = DoubleConv(128, 64)
+
+        # Physics projection: ch0=γ, ch1=α, ch2=A (optional)
+        self.physics_projection = nn.Conv2d(64, out_channels, kernel_size=1)
+
+        if predict_amplitude:
+            with torch.no_grad():
+                self.physics_projection.bias[2].fill_(-6.9)  # Softplus(-6.9) ≈ 1e-3
+
+        # v4.6: smooth scaled-sigmoid activations (Direction E).
+        # Both replace hard clamps with saturating-but-never-flat curves —
+        # gradient is small but never exactly zero anywhere in range, so
+        # there is no boundary "pile-up" (cf. v4.5 ELU+1 clamp at α=2.0).
+        # γ ∈ (0, gamma_scale): empirical g0_norm fits (checkerboard gridA,
+        #   1/D_map GT) reach ≈1.7–2.0 — γ ∈ (0,1) was clipping real signal.
+        #   gamma_scale=2.0 gives headroom while keeping training stable
+        #   (a fully unbounded Softplus risks early-training blow-up).
+        # α ∈ (0, 2): 2 is the genuine physical ceiling (ballistic motion,
+        #   MSD ~ t²). 2·sigmoid(x) is symmetric: x=0 → α=1.0 (healthy
+        #   default, same as v4.5), and approaches 0 / 2 smoothly from
+        #   both sides — no more asymmetric ELU compression of α<1.
+        self.gamma_activation = nn.Sigmoid()   # scaled to (0, gamma_scale) in forward()
+        self.alpha_activation = nn.Sigmoid()   # scaled to (0, 2) in forward()
+        self.amp_activation   = nn.Softplus()  # A > 0
+
+    def forward(self, x, sigma_g_norm=None):
+        """
+        Args:
+            x:            (B, K, H, W) — K masked G_norm channels.
+            sigma_g_norm: (B, K, H, W) optional — normalised σ_G channels.
+                          Required when use_sigma=True; ignored otherwise.
+        """
+        B, K, H, W = x.shape
+        # τ-PE broadcast: (K,) → (1, K, 1, 1) → (B, K, H, W)
+        tau_pe_sp = self.tau_pe.view(1, K, 1, 1).expand(B, K, H, W)
+        if self.use_sigma and sigma_g_norm is not None:
+            # 3K channels: G_norm || τ-PE || σ_G_norm
+            x_in = torch.cat([x, tau_pe_sp, sigma_g_norm], dim=1)  # (B, 3K, H, W)
+        else:
+            # 2K channels: G_norm || τ-PE  (backward-compatible default)
+            x_in = torch.cat([x, tau_pe_sp], dim=1)               # (B, 2K, H, W)
+
         # Encode
-        x1 = self.inc(x)
+        x1 = self.inc(x_in)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
-        
+
         # Decode with skip connections
         u1 = self.up1(x4)
-        u1 = torch.cat([x3, u1], dim=1)
-        u1 = self.conv_up1(u1)
-        
+        u1 = self.conv_up1(torch.cat([x3, u1], dim=1))
+
         u2 = self.up2(u1)
-        u2 = torch.cat([x2, u2], dim=1)
-        u2 = self.conv_up2(u2)
-        
+        u2 = self.conv_up2(torch.cat([x2, u2], dim=1))
+
         u3 = self.up3(u2)
-        u3 = torch.cat([x1, u3], dim=1)
-        u3 = self.conv_up3(u3)
-        
-        # Physical Projection
-        # physics_maps shape: (B, 2, H, W)
-        physics_maps = self.physics_projection(u3)
-        
-        # Enforce physical constraints on the two channels
-        gamma_map = self.gamma_activation(physics_maps[:, 0:1, :, :])
-        # Scale alpha to be strictly between 0 and 2 (or customize limits based on theory)
-        alpha_map = self.alpha_activation(physics_maps[:, 1:2, :, :]) * 2.0 
-        
-        # Return as (B, 2, H, W)
-        return torch.cat([gamma_map, alpha_map], dim=1)
+        u3 = self.conv_up3(torch.cat([x1, u3], dim=1))
+
+        p = self.physics_projection(u3)
+
+        # Direction E: scaled-sigmoid — smooth saturation, no zero-gradient
+        # pile-up at either boundary (cf. v4.5 hard clamp at α=2.0).
+        gamma_map = self.gamma_scale * self.gamma_activation(p[:, 0:1])  # (0, gamma_scale)
+        alpha_map = 2.0 * self.alpha_activation(p[:, 1:2])               # (0, 2)
+
+        if self.predict_amplitude:
+            amp_map = self.amp_activation(p[:, 2:3])
+            return torch.cat([gamma_map, alpha_map, amp_map], dim=1)
+        return torch.cat([gamma_map, alpha_map], dim=1)         # (B, 2, H, W)
+
 
 if __name__ == "__main__":
-    # Test the model structure
-    # Batch size 4, 8 Tau channels, 64x64 patch
-    dummy_input = torch.randn(4, 8, 64, 64)
-    model = PISSLTauEncoder(num_tau_channels=8)
-    output = model(dummy_input)
-    
-    print(f"Input shape (B, Tau, H, W): {dummy_input.shape}")
-    print(f"Output shape (B, Gamma/Alpha, H, W): {output.shape}")
-    print(f"Gamma Map range: [{output[:,0].min().item():.3f}, {output[:,0].max().item():.3f}]")
-    print(f"Alpha Map range: [{output[:,1].min().item():.3f}, {output[:,1].max().item():.3f}]")
+    taus  = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)   # K=10
+    model = PISSLTauEncoder(recon_taus=taus, predict_amplitude=False)
+    x     = torch.randn(4, 10, 64, 64)               # (B, K, H, W)
+    out   = model(x)
+
+    print(f"Input  (B, K, H, W)    : {x.shape}")
+    print(f"Output (B, [γ,α], H, W): {out.shape}")
+    print(f"Gamma range: [{out[:,0].min():.4f}, {out[:,0].max():.4f}]")
+    print(f"Alpha range: [{out[:,1].min():.4f}, {out[:,1].max():.4f}]")
+    print(f"τ-PE values: {model.tau_pe.tolist()}")
+
+    # Verify shuffle test detects physics mismatch
+    perm     = torch.randperm(10)
+    out_shuf = model(x[:, perm, :, :])               # shuffled G_norm, fixed τ-PE
+    dg = (out[:,0] - out_shuf[:,0]).abs().mean().item()
+    da = (out[:,1] - out_shuf[:,1]).abs().mean().item()
+    print(f"\nShuffle diff (random init, no training): |Δγ|={dg:.4f}  |Δα|={da:.4f}")

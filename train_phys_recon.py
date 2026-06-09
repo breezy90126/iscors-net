@@ -118,6 +118,16 @@ GAMMA_SCALE  = 2.0
 USE_RELIABILITY  = True
 USE_SIGMA_INPUT  = False   # True enables 3K model (requires retraining from scratch)
 
+# ---- v4.6+: α variance regularizer -----------------------------------------
+# The single power-law G(τ)=1/(1+γτ^α) is misspecified for multi-component
+# real curves, so the network minimises residual by collapsing α toward a mid
+# value (mean-regression — the compressed α band in checkerboard CV). Hinge-
+# penalise the within-cell α std below ALPHA_STD_TARGET to restore dynamic
+# range; spatial coherence is supplied by the masked TV term. Set
+# LAMBDA_ALPHA_VAR=0 to disable. (Kept in sync with iscors_real_runner.ipynb.)
+LAMBDA_ALPHA_VAR = 0.05
+ALPHA_STD_TARGET = 0.25
+
 # ---- Fisher information τ-weighting prior -----------------------------------
 # Evaluated at (γ₀, α₀) representing a "typical cell pixel" (not from GT).
 # Stable training: use fixed prior, not per-pixel dynamic weights.
@@ -239,6 +249,9 @@ def train_physics_reconstruction():
           f"λ_TV_gamma={LAMBDA_TV_GAMMA:.3e}  "
           f"λ_TV_alpha={LAMBDA_TV_ALPHA * TV_ALPHA_EXTRA_SCALE:.3e} "
           f"(={LAMBDA_TV_ALPHA:.3e} × {TV_ALPHA_EXTRA_SCALE})")
+    print(f"[{VERSION}] α-variance reg: λ={LAMBDA_ALPHA_VAR}  "
+          f"target α-std={ALPHA_STD_TARGET}  "
+          f"({'ON' if LAMBDA_ALPHA_VAR > 0 else 'OFF'})")
     history = {"loss": [], "phys_loss": [], "tv_gamma": [], "tv_alpha": []}
 
     model.train()
@@ -268,9 +281,18 @@ def train_physics_reconstruction():
                    if LAMBDA_TV_GAMMA > 0 else torch.tensor(0.0)
             tv_a = masked_huber_tv(preds[:, 1:2], cell_mask_patch) \
                    if LAMBDA_TV_ALPHA > 0 else torch.tensor(0.0)
+            # α variance regularizer: hinge-penalise collapsed within-cell α
+            # spread (counters mean-regression from single-power-law misfit).
+            cb_a = cell_mask_patch.bool()
+            if LAMBDA_ALPHA_VAR > 0 and cb_a.any():
+                var_pen = torch.relu(ALPHA_STD_TARGET - preds[:, 1][cb_a].std())
+            else:
+                var_pen = torch.zeros((), device=device)
+
             loss = (phys_loss
                     + LAMBDA_TV_GAMMA * tv_g
-                    + LAMBDA_TV_ALPHA * TV_ALPHA_EXTRA_SCALE * tv_a)
+                    + LAMBDA_TV_ALPHA * TV_ALPHA_EXTRA_SCALE * tv_a
+                    + LAMBDA_ALPHA_VAR * var_pen)
 
             loss.backward()
             optimizer.step()
@@ -288,8 +310,10 @@ def train_physics_reconstruction():
                 mean_g = gamma_sum / (pix_count + 1e-10)
                 mean_a = alpha_sum / (pix_count + 1e-10)
 
+            asg = preds[:, 1][cb_a].std().item() if cb_a.any() else 0.0
             pbar.set_postfix({"L": f"{loss.item():.5e}",
-                              "γ": f"{mean_g:.3f}", "α": f"{mean_a:.3f}"})
+                              "γ": f"{mean_g:.3f}", "α": f"{mean_a:.3f}",
+                              "ασ": f"{asg:.3f}"})
 
         n = len(train_loader)
         scheduler.step()

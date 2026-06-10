@@ -161,8 +161,14 @@ def _coord(arr, Hm, Wm):
 
 
 def compare_with_gt(mat_path, gamma_pred, cell_mask, gt_gamma_key=None):
-    """Replicates p2-gt-compare γ branch: GT field assumed to be D (iSCORS convention),
-    inverted to 1/D and compared against model γ. iSCORS GT has no true α field."""
+    """Replicates p2-gt-compare γ branch. GT field is D (iSCORS convention).
+
+    PHYSICS: γ is the decay rate of G(τ)=1/(1+γτ^α), so faster diffusion
+    (larger D) → larger γ → γ ∝ D. We compare model γ vs D_map DIRECTLY
+    (expect POSITIVE corr). The earlier 1/D inversion was a sign error that
+    flipped Pearson negative and made a working model look broken.
+    iSCORS GT has no true α field.
+    """
     mat, mat_keys = _load_mat(mat_path)
     Hm, Wm = gamma_pred.shape
 
@@ -182,9 +188,7 @@ def compare_with_gt(mat_path, gamma_pred, cell_mask, gt_gamma_key=None):
     gt_gamma_r = _align(gt_gamma_raw, Hm, Wm)
     gt_gamma_r = _coord(gt_gamma_r, Hm, Wm)
 
-    eps_d = (np.nanpercentile(gt_gamma_r[gt_gamma_r > 0], 1) * 0.1
-             if (gt_gamma_r > 0).any() else 1e-6)
-    gt_gamma_r = 1.0 / (gt_gamma_r + eps_d)         # D → 1/D  (∝ γ)
+    # γ ∝ D — compare against D_map directly (no 1/D inversion).
     gt_gamma_r[~cell_mask] = np.nan
 
     ok_g = (cell_mask & np.isfinite(gt_gamma_r) & np.isfinite(gamma_pred) & (gt_gamma_r > 0))
@@ -193,9 +197,14 @@ def compare_with_gt(mat_path, gamma_pred, cell_mask, gt_gamma_key=None):
     pg, _ = pearsonr(gg, mg)
     sg = spearmanr(gg, mg).statistic
     eg = np.abs(mg - gg).mean()
+    # scale-free MAE: γ (dimensionless rate) and D (physical units) live on
+    # different scales, so raw MAE is dominated by the scale gap. z-score both.
+    zg = (gg - gg.mean()) / (gg.std() + 1e-10)
+    zm = (mg - mg.mean()) / (mg.std() + 1e-10)
+    eg_z = float(np.abs(zm - zg).mean())
 
-    stats = dict(pearson=float(pg), spearman=float(sg), mae=float(eg), n=int(ok_g.sum()),
-                 gt_mean=float(gg.mean()), model_mean=float(mg.mean()))
+    stats = dict(pearson=float(pg), spearman=float(sg), mae=float(eg), mae_z=eg_z,
+                 n=int(ok_g.sum()), gt_mean=float(gg.mean()), model_mean=float(mg.mean()))
     return gt_gamma_r, stats
 
 
@@ -231,11 +240,11 @@ def make_physical_figure(gamma_pred, time_map, D_alpha, time_lbl, d_unit, l_psf,
 def make_gt_figure(gt_gamma_r, gamma_pred, stats):
     diff = np.abs(gamma_pred - gt_gamma_r)
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    _imshow_panel(axes[0], gt_gamma_r, 'magma', 'γ iSCORS GT  (1/D_map)')
+    _imshow_panel(axes[0], gt_gamma_r, 'magma', 'γ iSCORS GT  (D_map)')
     _imshow_panel(axes[1], gamma_pred, 'magma', 'γ model')
-    _imshow_panel(axes[2], diff, 'hot', f'|Δγ|  MAE={stats["mae"]:.4f}')
-    fig.suptitle(f'Model vs iSCORS GT — γ vs 1/D   '
-                 f'Pearson={stats["pearson"]:.3f}  Spearman={stats["spearman"]:.3f}', fontsize=13)
+    _imshow_panel(axes[2], diff, 'hot', f'|Δγ| (raw)  z-MAE={stats["mae_z"]:.3f}')
+    fig.suptitle(f'Model vs iSCORS GT — γ vs D (expect +)   '
+                 f'Pearson={stats["pearson"]:+.3f}  Spearman={stats["spearman"]:+.3f}', fontsize=13)
     fig.tight_layout()
     return fig
 
@@ -296,10 +305,11 @@ def run_pipeline(video_file, ckpt_file, mat_file,
             gt_fig = make_gt_figure(gt_gamma_r, gamma_pred, stats)
             lines += [
                 '',
-                '=== Model vs iSCORS GT (γ vs 1/D) ===',
-                f'  Pearson={stats["pearson"]:.3f}  Spearman={stats["spearman"]:.3f}  '
-                f'MAE={stats["mae"]:.4f}  N={stats["n"]}  '
-                f'GT_mean={stats["gt_mean"]:.4f}  model_mean={stats["model_mean"]:.4f}',
+                '=== Model vs iSCORS GT (γ vs D, expect +) ===',
+                f'  Pearson={stats["pearson"]:+.3f}  Spearman={stats["spearman"]:+.3f}  '
+                f'(|Spearman| is the metric; checkerboard-CV γ is primary)  N={stats["n"]}',
+                f'  raw MAE={stats["mae"]:.4f} (scale-mismatched — ignore)  '
+                f'z-scored MAE={stats["mae_z"]:.4f}',
             ]
             tifffile.imwrite(os.path.join(work_dir, 'gt_gamma_aligned.tif'),
                              np.nan_to_num(gt_gamma_r).astype(np.float32))
@@ -390,8 +400,9 @@ with gr.Blocks(title='iSCORS-Net Inference') as demo:
         '- 影片前處理流程（空間合併 → flat-field → 逐幀高斯背景去除）與訓練 notebook 完全相同；'
         'BIN_FACTOR / RECON_TAUS / GAMMA_SCALE / USE_SIGMA 必須與該權重訓練時的設定一致，'
         '否則推論結果無意義，甚至會因張量形狀不符而報錯。\n'
-        '- GT 比對假設 `.mat` 內含 MATLAB iSCORS 的 `D_map`（或同義欄位），'
-        '會自動換算為 `1/D` 後與模型 γ 比較；iSCORS GT 沒有真實的 α，因此不比對 α。\n'
+        '- GT 比對假設 `.mat` 內含 MATLAB iSCORS 的 `D_map`（或同義欄位）。'
+        'γ 是 G(τ)=1/(1+γτ^α) 的衰減率，γ ∝ D，故與 `D_map` 直接比較（預期正相關）；'
+        '舊版錯誤地反轉成 `1/D` 導致相關係數變負。iSCORS GT 沒有真實的 α，因此不比對 α。\n'
         '- τ_D、D_α 為後處理物理單位換算，模型本身維持無因次空間，'
         '同一份權重可重複用於不同光學設定的影片。'
     )

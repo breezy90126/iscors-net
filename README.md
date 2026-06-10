@@ -150,6 +150,14 @@ After inference, randomly permute the K τ-channel order and re-run the model. C
 | v4.2 | Real-data self-train + R² confidence map + checkerboard CV | Validate on real video without external GT |
 | v4.5 | **G(0)=CV² normalisation** (target `1/(1+γτ^α)`) | γ fully identifiable; matches MATLAB `nor_1` |
 | **v4.6** | Kurtosis artifact mask + scaled-sigmoid γ/α + Gradio frontend | Drop hot pixels; widen γ range; HF Spaces deploy |
+| v4.6+ | Eval fix (γ ∝ D, not 1/D) + α variance regularizer | −0.426 was an inversion artifact; γ is actually good (checkerboard 0.80); α compression is the open problem |
+
+> **Evaluating quality:** the trustworthy γ metric is the **checkerboard cross-validation**
+> Pearson (model vs traditional curve-fit, same physics and coordinates). The `γ vs D_map`
+> comparison is unit-scale-mismatched (report z-scored MAE and signed Pearson, expecting
+> **positive** — γ is the decay rate, so γ ∝ D). α compression (mean-regression from
+> single-power-law misspecification) is the main remaining limitation; the `LAMBDA_ALPHA_VAR`
+> variance regularizer mitigates the symptom, a multi-component forward model is the cure.
 
 ---
 

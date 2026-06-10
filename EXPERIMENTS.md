@@ -557,6 +557,37 @@ synthetic trainer `train_phys_recon.py` was synced to the notebook here: `g0_nor
 
 ---
 
+### v4.6+ — Baseline post-mortem: evaluation fix + α variance regularizer
+
+After re-training a clean v4.6 baseline on the real cell, the headline `γ vs 1/D_map`
+Pearson read **−0.426** — looking like failure. Diagnosis: that number was an
+**evaluation artifact**, not a model failure.
+
+**Evaluation fix (γ ∝ D):** γ is the decay RATE in G(τ)=1/(1+γτ^α), so faster
+diffusion (larger D) → larger γ → **γ ∝ D, not 1/D**. The earlier `D → 1/D`
+inversion flipped the sign. Comparing γ vs `D_map` directly gives the expected
+positive correlation, and the raw MAE (1.58) was meaningless because γ∈(0,2) and D
+live on different unit scales — replaced by a **z-scored MAE**. The trustworthy
+number was always the **checkerboard CV** (model gridB vs traditional curve-fit
+gridA, same physics + coords, no unit gap): **γ Pearson 0.80**, confirming γ is well
+recovered. Applied to `iscors_real_runner.ipynb` (p2-gt-compare) and `app.py`.
+
+**α compression is the real problem.** Checkerboard α Pearson 0.64 but the dynamic
+range collapses to ~0.5–0.9 (traditional fit spans 0.2–2.0). Root cause is a
+loss-landscape loophole: the single power-law is misspecified for multi-component
+real curves (R²≈0.70, theory misses the mean G_norm curve at mid-τ), so the minimum-
+MSE strategy is to predict a mid α everywhere (mean-regression); α's gradient is also
+shallow (signal only at noisy, reliability-down-weighted large τ).
+
+**α variance regularizer (band-aid):** hinge-penalise within-cell α std below
+`ALPHA_STD_TARGET` (`LAMBDA_ALPHA_VAR·relu(target − std(α_cell))`) so "predict the
+mean" is no longer free; spatial coherence comes from the existing adaptive TV.
+Tunable, off by setting λ=0; live α-std shown in the progress bar. This treats the
+symptom — the cure (single-power-law misspecification, α/σ_D degeneracy) needs a
+multi-component forward model or a second projection (STICS/DDM, see brief).
+
+---
+
 ## Key Insights Summary
 
 | # | Insight | Version |
@@ -594,6 +625,8 @@ synthetic trainer `train_phys_recon.py` was synced to the notebook here: `g0_nor
 | 31 | Under G(0) normalisation τ=1 still carries γ signal, so it must NOT be zeroed — Fisher weights switch from the τ_ref formula (which zeroes τ_ref) to the g0 formula. Loss theory must drop self-normalisation (g0_norm=True); leaving shape_only=True silently mismatches the dataset target. | v4.5 |
 | 32 | Saturated/hot pixels have abnormally high temporal-trace kurtosis and produce non-physical G(τ) curves → extreme-γ blobs. Excess-kurtosis masking before normalisation removes them more reliably than a CV threshold alone. | v4.6 |
 | 33 | Activation range must match the data: empirical g0_norm fits reach γ≈1.7–2.0, so γ∈(0,1) clips signal — use scaled-sigmoid γ∈(0,gamma_scale). Hard clamps (ELU+1.clamp at α=2) pile gradients up at the boundary; smooth saturating sigmoids avoid this. TV priors and γ colormaps must track gamma_scale, not a hard-coded γ_max=1. | v4.6 |
+| 34 | γ ∝ D (γ is the decay rate; faster diffusion → larger γ). Comparing γ vs 1/D_map gave a spurious −0.426 Pearson that masqueraded as model failure. Compare vs D_map directly; the real metric is checkerboard-CV γ (0.80). Raw MAE across γ/D unit scales is meaningless — z-score first. | v4.6+ |
+| 35 | α mean-regression is a loss-landscape loophole, not an evaluation issue: single-power-law misfit makes a mid-α the minimum-MSE answer, and α's gradient is shallow (large-τ only, down-weighted by reliability). A within-cell α-variance hinge removes the loophole, but the cure is a multi-component forward model / second projection — α and σ_D are degenerate under a single ACF. | v4.6+ |
 
 ---
 

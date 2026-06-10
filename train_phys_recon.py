@@ -111,6 +111,18 @@ TV_ALPHA_EXTRA_SCALE  = 3.0
 G0_NORM      = True
 GAMMA_SCALE  = 2.0
 
+# ---- v4.7: two-component forward model (toggle) ----------------------------
+# N_COMPONENTS=1 (default): single power-law G_norm=1/(1+γτ^α) — UNCHANGED baseline.
+# N_COMPONENTS=2: shared-α two-rate mixture
+#     G_norm(τ) = f/(1+γ_fast τ^α) + (1-f)/(1+γ_slow τ^α)
+#   Gives heterogeneity its own d.o.f. (f, γ_fast-γ_slow) so α represents genuine
+#   anomaly instead of absorbing distribution width (fixes α mean-regression and
+#   raises R² where the single power-law misfits the curve). Requires G0_NORM=True.
+#   LAMBDA_OCCAM: parsimony penalty min(f,1-f)·(γ_fast-γ_slow) → collapse to a single
+#   component unless the data demands two (guards the extra d.o.f. against fitting noise).
+N_COMPONENTS = 1
+LAMBDA_OCCAM = 0.02        # only used when N_COMPONENTS=2
+
 # ---- v4.1: Reliability weighting & σ model input ---------------------------
 # USE_RELIABILITY: pass σ_G_norm to loss for Fisher × Reliability combined weights.
 # USE_SIGMA_INPUT: also add σ_G as 3rd input block (3K channels).
@@ -185,6 +197,23 @@ def masked_huber_tv(x, cell_mask, delta=0.05):
     return (_h(dx) * mx).sum() / n + (_h(dy) * my).sum() / n
 
 
+def decode_preds(preds, n_components):
+    """Map raw model output to (γ_effective, α, extras) regardless of n_components.
+
+    1 component: preds=[γ,α]            → (γ, α, None)
+    2 components: preds=[f,γ_s,γ_f,α]   → (γ_eff=f·γ_f+(1-f)·γ_s, α, {f,γ_s,γ_f})
+      γ_eff is the amplitude-weighted mean rate — the single-number summary that the
+      downstream maps / GT comparison / colormaps consume unchanged.
+    All returned γ/α tensors keep the (B,1,H,W) channel dim.
+    """
+    if n_components == 1:
+        return preds[:, 0:1], preds[:, 1:2], None
+    f, g_slow, g_fast, alpha = (preds[:, 0:1], preds[:, 1:2],
+                                preds[:, 2:3], preds[:, 3:4])
+    gamma_eff = f * g_fast + (1.0 - f) * g_slow
+    return gamma_eff, alpha, {"f": f, "g_slow": g_slow, "g_fast": g_fast}
+
+
 def train_physics_reconstruction():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[{VERSION}] Using device: {device}")
@@ -225,7 +254,8 @@ def train_physics_reconstruction():
     model     = PISSLTauEncoder(recon_taus=RECON_TAUS,
                                 predict_amplitude=False,
                                 use_sigma=USE_SIGMA_INPUT,
-                                gamma_scale=GAMMA_SCALE).to(device)
+                                gamma_scale=GAMMA_SCALE,
+                                n_components=N_COMPONENTS).to(device)
     criterion = PhysicsReconLoss(
         recon_taus=RECON_TAUS,
         g0_norm=G0_NORM,                 # v4.5: target = G(τ)/G(0) = 1/(1+γτ^α)
@@ -233,7 +263,10 @@ def train_physics_reconstruction():
         fisher_weighted=True,
         fisher_gamma_prior=FISHER_GAMMA_PRIOR,
         fisher_alpha_prior=FISHER_ALPHA_PRIOR,
+        n_components=N_COMPONENTS,
     ).to(device)
+    print(f"[{VERSION}] N_COMPONENTS={N_COMPONENTS}"
+          + (f"  λ_occam={LAMBDA_OCCAM}" if N_COMPONENTS == 2 else ""))
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS,
                                                       eta_min=1e-6)
@@ -275,24 +308,41 @@ def train_physics_reconstruction():
 
             sigma_for_loss = sigma_patch if USE_RELIABILITY else None
             phys_loss = criterion(preds, g_target, train_mask, sigma_g_norm=sigma_for_loss)
+
+            # Decode to effective (γ, α) so TV / variance reg / tracking are
+            # identical for 1- and 2-component models (TV on γ_eff, the map we care
+            # about spatially; the component split is regularised by Occam below).
+            gamma_eff, alpha_ch, extras = decode_preds(preds, N_COMPONENTS)
+
             # Masked TV: only cell-cell adjacent pairs (excludes background-cell
             # boundaries that previously caused γ collapse via pulling cascade).
-            tv_g = masked_huber_tv(preds[:, 0:1], cell_mask_patch) \
+            tv_g = masked_huber_tv(gamma_eff, cell_mask_patch) \
                    if LAMBDA_TV_GAMMA > 0 else torch.tensor(0.0)
-            tv_a = masked_huber_tv(preds[:, 1:2], cell_mask_patch) \
+            tv_a = masked_huber_tv(alpha_ch, cell_mask_patch) \
                    if LAMBDA_TV_ALPHA > 0 else torch.tensor(0.0)
             # α variance regularizer: hinge-penalise collapsed within-cell α
             # spread (counters mean-regression from single-power-law misfit).
             cb_a = cell_mask_patch.bool()
             if LAMBDA_ALPHA_VAR > 0 and cb_a.any():
-                var_pen = torch.relu(ALPHA_STD_TARGET - preds[:, 1][cb_a].std())
+                var_pen = torch.relu(ALPHA_STD_TARGET - alpha_ch[:, 0][cb_a].std())
             else:
                 var_pen = torch.zeros((), device=device)
+
+            # Occam parsimony (2-comp only): min(f,1-f)·(γ_fast-γ_slow) is zero when
+            # one component dominates (f→0/1) or the rates collapse (γ_fast→γ_slow),
+            # so the model only "spends" the second component where data demands it.
+            if N_COMPONENTS == 2 and LAMBDA_OCCAM > 0 and cb_a.any():
+                f_c   = extras["f"][:, 0][cb_a]
+                gap_c = (extras["g_fast"] - extras["g_slow"])[:, 0][cb_a]
+                occam = (torch.minimum(f_c, 1.0 - f_c) * gap_c).mean()
+            else:
+                occam = torch.zeros((), device=device)
 
             loss = (phys_loss
                     + LAMBDA_TV_GAMMA * tv_g
                     + LAMBDA_TV_ALPHA * TV_ALPHA_EXTRA_SCALE * tv_a
-                    + LAMBDA_ALPHA_VAR * var_pen)
+                    + LAMBDA_ALPHA_VAR * var_pen
+                    + LAMBDA_OCCAM * occam)
 
             loss.backward()
             optimizer.step()
@@ -304,13 +354,13 @@ def train_physics_reconstruction():
 
             with torch.no_grad():
                 m = train_mask.unsqueeze(1)
-                gamma_sum += (preds[:, 0:1] * m).sum().item()
-                alpha_sum += (preds[:, 1:2] * m).sum().item()
+                gamma_sum += (gamma_eff * m).sum().item()
+                alpha_sum += (alpha_ch * m).sum().item()
                 pix_count += m.sum().item()
                 mean_g = gamma_sum / (pix_count + 1e-10)
                 mean_a = alpha_sum / (pix_count + 1e-10)
 
-            asg = preds[:, 1][cb_a].std().item() if cb_a.any() else 0.0
+            asg = alpha_ch[:, 0][cb_a].std().item() if cb_a.any() else 0.0
             pbar.set_postfix({"L": f"{loss.item():.5e}",
                               "γ": f"{mean_g:.3f}", "α": f"{mean_a:.3f}",
                               "ασ": f"{asg:.3f}"})
@@ -364,9 +414,10 @@ def train_physics_reconstruction():
     full_input = infer_dataset[0].unsqueeze(0).to(device)
     with torch.no_grad():
         preds_full = model(full_input)
+    gamma_eff_full, alpha_full, _ = decode_preds(preds_full, N_COMPONENTS)
 
-    gamma_map = preds_full[0, 0].cpu().numpy()
-    alpha_map = preds_full[0, 1].cpu().numpy()
+    gamma_map = gamma_eff_full[0, 0].cpu().numpy()
+    alpha_map = alpha_full[0, 0].cpu().numpy()
 
     bg_mask = ~train_dataset.cell_mask
     gamma_map[bg_mask] = 0.0
@@ -453,8 +504,9 @@ def train_physics_reconstruction():
         for _ in range(N_SHUFFLES):
             perm       = torch.randperm(NUM_TAU_CH)
             preds_shuf = model(full_input[:, perm, :, :])
-            dg = (preds_full[0, 0] - preds_shuf[0, 0]).abs()
-            da = (preds_full[0, 1] - preds_shuf[0, 1]).abs()
+            gs_eff, as_full, _ = decode_preds(preds_shuf, N_COMPONENTS)
+            dg = (gamma_eff_full[0, 0] - gs_eff[0, 0]).abs()
+            da = (alpha_full[0, 0] - as_full[0, 0]).abs()
             dg_list.append(dg[cell_mask_t].mean().item())
             da_list.append(da[cell_mask_t].mean().item())
 
@@ -483,8 +535,9 @@ def train_physics_reconstruction():
     with torch.no_grad():
         perm_vis  = torch.randperm(NUM_TAU_CH)
         preds_vis = model(full_input[:, perm_vis, :, :])
-    gm_shuf = preds_vis[0, 0].cpu().numpy(); gm_shuf[bg_mask] = 0.0
-    am_shuf = preds_vis[0, 1].cpu().numpy(); am_shuf[bg_mask] = 0.0
+    gv_eff, av_full, _ = decode_preds(preds_vis, N_COMPONENTS)
+    gm_shuf = gv_eff[0, 0].cpu().numpy(); gm_shuf[bg_mask] = 0.0
+    am_shuf = av_full[0, 0].cpu().numpy(); am_shuf[bg_mask] = 0.0
     diff_g  = np.abs(gamma_map - gm_shuf)
     diff_a  = np.abs(alpha_map - am_shuf)
 
@@ -530,9 +583,10 @@ def train_physics_reconstruction():
         v2_input = v2_infer[0].unsqueeze(0).to(device)
         with torch.no_grad():
             v2_preds = model(v2_input)
+        v2_g_eff, v2_a_full, _ = decode_preds(v2_preds, N_COMPONENTS)
 
-        v2_gamma = v2_preds[0, 0].cpu().numpy()
-        v2_alpha = v2_preds[0, 1].cpu().numpy()
+        v2_gamma = v2_g_eff[0, 0].cpu().numpy()
+        v2_alpha = v2_a_full[0, 0].cpu().numpy()
         v2_bg    = ~v2_infer.cell_mask
         v2_gamma[v2_bg] = 0.0
         v2_alpha[v2_bg] = 0.0

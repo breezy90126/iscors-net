@@ -66,8 +66,13 @@ def preprocess_video(video_path, bin_factor, n_frames_max, chunk_size=100, progr
     return video_proc
 
 
-def run_inference(video_proc, ckpt_path, recon_taus, gamma_scale, use_sigma, progress=None):
-    """Replicates p2-inference: build eval dataset → load checkpoint → full-frame forward pass."""
+def run_inference(video_proc, ckpt_path, recon_taus, gamma_scale, use_sigma,
+                  n_components=1, progress=None):
+    """Replicates p2-inference: build eval dataset → load checkpoint → full-frame forward pass.
+
+    n_components=2 loads a two-component (shared-α) checkpoint; the 4-channel output
+    [f, γ_slow, γ_fast, α] is reduced to the effective γ = f·γ_fast+(1-f)·γ_slow and α.
+    """
     if progress is not None:
         progress(0.62, desc='建立資料集 (G_empirical, σ_G)...')
     infer_ds = PhysReconDataset(video_tensor=video_proc, recon_taus=recon_taus,
@@ -75,7 +80,8 @@ def run_inference(video_proc, ckpt_path, recon_taus, gamma_scale, use_sigma, pro
     cell_mask = infer_ds.cell_mask
 
     model = PISSLTauEncoder(recon_taus=recon_taus, predict_amplitude=False,
-                            gamma_scale=gamma_scale, use_sigma=use_sigma).to(DEVICE)
+                            gamma_scale=gamma_scale, use_sigma=use_sigma,
+                            n_components=n_components).to(DEVICE)
     model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
     model.eval()
 
@@ -97,8 +103,15 @@ def run_inference(video_proc, ckpt_path, recon_taus, gamma_scale, use_sigma, pro
         preds_out = model(full_inp.unsqueeze(0).to(DEVICE),
                           sigma_g_norm=full_sigma.unsqueeze(0).to(DEVICE))
 
-    gamma_pred = preds_out[0, 0].cpu().numpy()[:Hv, :Wv]
-    alpha_pred = preds_out[0, 1].cpu().numpy()[:Hv, :Wv]
+    if n_components == 2:
+        f_o, gs_o, gf_o, a_o = (preds_out[:, 0:1], preds_out[:, 1:2],
+                                preds_out[:, 2:3], preds_out[:, 3:4])
+        gamma_t = f_o * gf_o + (1.0 - f_o) * gs_o          # effective γ
+        gamma_pred = gamma_t[0, 0].cpu().numpy()[:Hv, :Wv]
+        alpha_pred = a_o[0, 0].cpu().numpy()[:Hv, :Wv]
+    else:
+        gamma_pred = preds_out[0, 0].cpu().numpy()[:Hv, :Wv]
+        alpha_pred = preds_out[0, 1].cpu().numpy()[:Hv, :Wv]
     gamma_pred[~cell_mask] = np.nan
     alpha_pred[~cell_mask] = np.nan
     return infer_ds, cell_mask, gamma_pred, alpha_pred
@@ -252,7 +265,7 @@ def make_gt_figure(gt_gamma_r, gamma_pred, stats):
 # ───────────────────────────── pipeline ─────────────────────────────────────
 def run_pipeline(video_file, ckpt_file, mat_file,
                  recon_taus_str, bin_factor, n_frames, gamma_scale, use_sigma,
-                 wavelength_nm, na, pixel_size_nm, frame_rate_hz,
+                 n_components, wavelength_nm, na, pixel_size_nm, frame_rate_hz,
                  progress=gr.Progress()):
     if video_file is None or ckpt_file is None:
         raise gr.Error('請至少上傳影片 (.tif) 與模型權重 (.pth)')
@@ -270,7 +283,8 @@ def run_pipeline(video_file, ckpt_file, mat_file,
 
     progress(0.60, desc='建立資料集並執行模型推論...')
     infer_ds, cell_mask, gamma_pred, alpha_pred = run_inference(
-        video_proc, ckpt_file, recon_taus, float(gamma_scale), bool(use_sigma), progress=progress)
+        video_proc, ckpt_file, recon_taus, float(gamma_scale), bool(use_sigma),
+        n_components=int(n_components), progress=progress)
 
     gc, ac = gamma_pred[cell_mask], alpha_pred[cell_mask]
     lines = [
@@ -364,6 +378,8 @@ with gr.Blocks(title='iSCORS-Net Inference') as demo:
                 gamma_scale = gr.Number(label='GAMMA_SCALE（γ 輸出上限，需與訓練時一致）', value=2.0)
                 use_sigma   = gr.Checkbox(label='USE_SIGMA（模型是否使用 σ_G_norm 輸入通道，需與訓練時一致）',
                                           value=True)
+                n_components = gr.Dropdown(label='N_COMPONENTS（前向模型成分數，需與訓練時一致）',
+                                           choices=[1, 2], value=1)
 
             with gr.Accordion('光學與物理參數（用於 τ_D / D_α 換算）', open=False):
                 wavelength_nm = gr.Number(label='WAVELENGTH_NM（激發波長, nm）', value=532.0)
@@ -390,7 +406,7 @@ with gr.Blocks(title='iSCORS-Net Inference') as demo:
         fn=run_pipeline,
         inputs=[video_file, ckpt_file, mat_file,
                 recon_taus_str, bin_factor, n_frames, gamma_scale, use_sigma,
-                wavelength_nm, na, pixel_size_nm, frame_rate_hz],
+                n_components, wavelength_nm, na, pixel_size_nm, frame_rate_hz],
         outputs=[maps_plot, phys_plot, gt_plot, stats_box, zip_out],
     )
 
@@ -398,8 +414,9 @@ with gr.Blocks(title='iSCORS-Net Inference') as demo:
         '---\n'
         '**注意事項**\n'
         '- 影片前處理流程（空間合併 → flat-field → 逐幀高斯背景去除）與訓練 notebook 完全相同；'
-        'BIN_FACTOR / RECON_TAUS / GAMMA_SCALE / USE_SIGMA 必須與該權重訓練時的設定一致，'
-        '否則推論結果無意義，甚至會因張量形狀不符而報錯。\n'
+        'BIN_FACTOR / RECON_TAUS / GAMMA_SCALE / USE_SIGMA / N_COMPONENTS 必須與該權重訓練時的設定一致，'
+        '否則推論結果無意義，甚至會因張量形狀不符而報錯。N_COMPONENTS=2 時模型輸出 '
+        '[f, γ_slow, γ_fast, α]，會自動換算為有效 γ = f·γ_fast+(1-f)·γ_slow 後顯示。\n'
         '- GT 比對假設 `.mat` 內含 MATLAB iSCORS 的 `D_map`（或同義欄位）。'
         'γ 是 G(τ)=1/(1+γτ^α) 的衰減率，γ ∝ D，故與 `D_map` 直接比較（預期正相關）；'
         '舊版錯誤地反轉成 `1/D` 導致相關係數變負。iSCORS GT 沒有真實的 α，因此不比對 α。\n'

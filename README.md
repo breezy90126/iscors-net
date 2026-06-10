@@ -151,6 +151,7 @@ After inference, randomly permute the K τ-channel order and re-run the model. C
 | v4.5 | **G(0)=CV² normalisation** (target `1/(1+γτ^α)`) | γ fully identifiable; matches MATLAB `nor_1` |
 | **v4.6** | Kurtosis artifact mask + scaled-sigmoid γ/α + Gradio frontend | Drop hot pixels; widen γ range; HF Spaces deploy |
 | v4.6+ | Eval fix (γ ∝ D, not 1/D) + α variance regularizer | −0.426 was an inversion artifact; γ is actually good (checkerboard 0.80); α compression is the open problem |
+| v4.7 | Two-component forward model toggle (`N_COMPONENTS=1/2`) | Optional shared-α two-rate mixture: gives heterogeneity its own d.o.f. so α stops absorbing distribution width (targets α compression + low R²); default stays single-component |
 
 > **Evaluating quality:** the trustworthy γ metric is the **checkerboard cross-validation**
 > Pearson (model vs traditional curve-fit, same physics and coordinates). The `γ vs D_map`

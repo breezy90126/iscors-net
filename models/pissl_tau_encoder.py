@@ -70,12 +70,20 @@ class PISSLTauEncoder(nn.Module):
             hits exactly zero, so there is no boundary "pile-up" the way
             the v4.5 hard .clamp(max=2.0) produced at α=2.0.
     """
-    def __init__(self, recon_taus, predict_amplitude=False, use_sigma=False, gamma_scale=2.0):
+    def __init__(self, recon_taus, predict_amplitude=False, use_sigma=False, gamma_scale=2.0,
+                 n_components=1):
         super().__init__()
+        assert n_components in (1, 2), "n_components must be 1 or 2"
         self.predict_amplitude = predict_amplitude
         self.use_sigma = use_sigma
         self.gamma_scale = gamma_scale
-        out_channels = 3 if predict_amplitude else 2
+        self.n_components = n_components
+        if n_components == 2:
+            assert not predict_amplitude, \
+                "predict_amplitude is only supported for n_components=1"
+            out_channels = 4               # f, γ_slow, Δγ(→softplus), α
+        else:
+            out_channels = 3 if predict_amplitude else 2
 
         K = len(recon_taus)
         self.K = K
@@ -125,6 +133,7 @@ class PISSLTauEncoder(nn.Module):
         self.gamma_activation = nn.Sigmoid()   # scaled to (0, gamma_scale) in forward()
         self.alpha_activation = nn.Sigmoid()   # scaled to (0, 2) in forward()
         self.amp_activation   = nn.Softplus()  # A > 0
+        self.delta_activation = nn.Softplus()  # Δγ ≥ 0 → γ_fast = γ_slow + Δγ (2-comp)
 
     def forward(self, x, sigma_g_norm=None):
         """
@@ -161,8 +170,26 @@ class PISSLTauEncoder(nn.Module):
 
         p = self.physics_projection(u3)
 
-        # Direction E: scaled-sigmoid — smooth saturation, no zero-gradient
-        # pile-up at either boundary (cf. v4.5 hard clamp at α=2.0).
+        if self.n_components == 2:
+            # Two-component (shared-α) mixture. Output channels:
+            #   f       ∈ (0,1)             fast-component fractional amplitude
+            #   γ_slow  ∈ (0, gamma_scale)
+            #   γ_fast  = γ_slow + Δγ       (Δγ = softplus ≥ 0 → enforces γ_fast ≥ γ_slow,
+            #                                breaking the label-swap symmetry that would
+            #                                otherwise give the loss two equivalent minima)
+            #   α       ∈ (0, 2)            shared anomalous exponent
+            # The loss builds G_norm(τ)=f/(1+γ_fast τ^α)+(1-f)/(1+γ_slow τ^α). Giving
+            # heterogeneity its own d.o.f. (f, γ_fast-γ_slow) frees α to represent genuine
+            # anomaly instead of absorbing distribution width (the single-component
+            # mean-regression). Returns (B, 4, H, W) = [f, γ_slow, γ_fast, α].
+            f_map  = self.gamma_activation(p[:, 0:1])                      # sigmoid → (0,1)
+            g_slow = self.gamma_scale * self.gamma_activation(p[:, 1:2])   # (0, gamma_scale)
+            g_fast = g_slow + self.delta_activation(p[:, 2:3])             # ≥ γ_slow
+            alpha_map = 2.0 * self.alpha_activation(p[:, 3:4])             # (0, 2)
+            return torch.cat([f_map, g_slow, g_fast, alpha_map], dim=1)    # (B, 4, H, W)
+
+        # Single component (default). Direction E scaled-sigmoid — smooth saturation,
+        # no zero-gradient pile-up at either boundary (cf. v4.5 hard clamp at α=2.0).
         gamma_map = self.gamma_scale * self.gamma_activation(p[:, 0:1])  # (0, gamma_scale)
         alpha_map = 2.0 * self.alpha_activation(p[:, 1:2])               # (0, 2)
 
@@ -190,3 +217,15 @@ if __name__ == "__main__":
     dg = (out[:,0] - out_shuf[:,0]).abs().mean().item()
     da = (out[:,1] - out_shuf[:,1]).abs().mean().item()
     print(f"\nShuffle diff (random init, no training): |Δγ|={dg:.4f}  |Δα|={da:.4f}")
+
+    # ── Two-component model smoke test ───────────────────────────────────────
+    m2  = PISSLTauEncoder(recon_taus=taus, n_components=2)
+    o2  = m2(x)
+    print(f"\n[n_components=2] output shape: {o2.shape}  (expect (B,4,H,W))")
+    f_, gs_, gf_, a_ = o2[:, 0], o2[:, 1], o2[:, 2], o2[:, 3]
+    print(f"  f      range: [{f_.min():.3f}, {f_.max():.3f}]   (expect ⊂ (0,1))")
+    print(f"  γ_slow range: [{gs_.min():.3f}, {gs_.max():.3f}]")
+    print(f"  γ_fast range: [{gf_.min():.3f}, {gf_.max():.3f}]")
+    print(f"  α      range: [{a_.min():.3f}, {a_.max():.3f}]")
+    assert bool((gf_ >= gs_ - 1e-5).all()), "ordering γ_fast ≥ γ_slow violated"
+    print("  ordering γ_fast ≥ γ_slow: OK ✓")

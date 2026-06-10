@@ -588,6 +588,36 @@ multi-component forward model or a second projection (STICS/DDM, see brief).
 
 ---
 
+### v4.7 — Two-component forward model (toggle: `N_COMPONENTS=1/2`)
+
+Addresses the α-compression root cause (not the symptom). The single power-law forces
+α to absorb BOTH genuine sub-diffusion AND heterogeneity-induced stretching — they are
+confounded in one d.o.f., so α regresses to a mid value and R²≈0.70.
+
+**Model (`N_COMPONENTS=2`):** shared-α two-rate mixture
+```
+G_norm(τ) = f / (1 + γ_fast·τ^α) + (1-f) / (1 + γ_slow·τ^α)
+```
+Output `[f, γ_slow, γ_fast, α]` with `γ_fast = γ_slow + softplus(Δ)` (ordering breaks the
+label-swap symmetry). Heterogeneity now lives in `(f, γ_fast-γ_slow)`, freeing α to mean
+genuine anomaly → α should de-compress and R² should rise where the curve is "fatter"
+than a single Lorentzian. Post-hoc `μ_D ∝ f·γ_fast+(1-f)·γ_slow` and a σ_D-like spread
+come for free, without the Laplace-inversion integral.
+
+**Identifiability safeguards (essential — 4 params from 10 noisy τ is more ill-posed):**
+- ordering `γ_fast ≥ γ_slow` (softplus Δ) removes the two-equivalent-minima degeneracy;
+- Occam penalty `LAMBDA_OCCAM · min(f,1-f)·(γ_fast-γ_slow)` collapses to one component
+  unless the data demands two (it is a strict superset of single-component, so it can
+  never do worse) — guards the extra d.o.f. against fitting noise;
+- existing adaptive TV supplies spatial coherence.
+
+Default is `N_COMPONENTS=1` (the v4.6 baseline, byte-identical). Toggle to 2 and compare
+**R²** (should rise from ~0.70) and **within-cell α std** (should rise without the α-variance
+band-aid) before adopting. Wired through `train_phys_recon.py`, `iscors_real_runner.ipynb`
+(train / inference / R² / checkerboard), and `app.py`.
+
+---
+
 ## Key Insights Summary
 
 | # | Insight | Version |

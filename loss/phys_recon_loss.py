@@ -47,8 +47,11 @@ class PhysicsReconLoss(nn.Module):
     def __init__(self, recon_taus, shape_only=False, legacy_2ch=False,
                  log_space=False, tau_weighted=False,
                  fisher_weighted=False, fisher_gamma_prior=0.1, fisher_alpha_prior=1.0,
-                 g0_norm=False):
+                 g0_norm=False, n_components=1):
         super().__init__()
+        assert n_components in (1, 2), "n_components must be 1 or 2"
+        if n_components == 2:
+            assert g0_norm, "n_components=2 requires g0_norm=True (G(τ)/G(0) target)"
         taus = torch.as_tensor(recon_taus, dtype=torch.float32)
         self.register_buffer("taus", taus.view(1, 1, 1, -1))          # (1,1,1,K)
 
@@ -76,6 +79,7 @@ class PhysicsReconLoss(nn.Module):
         self.tau_weighted    = tau_weighted
         self.fisher_weighted = fisher_weighted
         self.g0_norm         = g0_norm
+        self.n_components    = n_components
 
     @staticmethod
     def _fisher_weights(taus, gamma_0=0.1, alpha_0=1.0, tau_ref=1.0):
@@ -151,7 +155,10 @@ class PhysicsReconLoss(nn.Module):
         """
         Args:
             preds:          (B, 2, H, W) [γ,α] for shape_only/legacy_2ch;
-                            (B, 3, H, W) [γ,α,A] for amplitude mode.
+                            (B, 3, H, W) [γ,α,A] for amplitude mode;
+                            (B, 4, H, W) [f,γ_slow,γ_fast,α] for n_components=2.
+                            Fisher τ-weights reuse the single-component prior (a τ-prior,
+                            not exact for the mixture) — acceptable as a heuristic weight.
             g_empirical:    (B, H, W, K)
             train_mask:     (B, H, W) — 1.0 at supervised pixels.
             sigma_g_norm:   (B, H, W, K) optional — per-pixel normalised σ_G.
@@ -159,25 +166,39 @@ class PhysicsReconLoss(nn.Module):
                             weights are used (fisher_weighted must be True).
                             When None, falls back to original fisher/tau/uniform.
         """
-        gamma = preds[:, 0].unsqueeze(-1)   # (B, H, W, 1)
-        alpha = preds[:, 1].unsqueeze(-1)
-        eps   = 1e-10
+        eps = 1e-10
 
-        g_theory = 1.0 / (1.0 + gamma * torch.pow(self.taus, alpha))  # (B,H,W,K)
-
-        if self.g0_norm:
-            pass  # g_theory = 1/(1+γτ^α) already matches G(τ)/G(0) target
-
-        elif self.shape_only:
-            g_theory = g_theory / (g_theory[..., 0:1] + eps)
-
-        elif self.legacy_2ch:
-            g_theory    = g_theory    / (g_theory[..., 0:1] + eps)
-            g_empirical = g_empirical / (g_empirical[..., 0:1].abs() + eps)
+        if self.n_components == 2:
+            # Two-component (shared-α) mixture: preds = [f, γ_slow, γ_fast, α].
+            # G_norm(τ) = f/(1+γ_fast τ^α) + (1-f)/(1+γ_slow τ^α) — already a convex
+            # combination equal to 1 at τ→0, i.e. the G(τ)/G(0) (g0_norm) target.
+            f      = preds[:, 0].unsqueeze(-1)   # (B,H,W,1)
+            g_slow = preds[:, 1].unsqueeze(-1)
+            g_fast = preds[:, 2].unsqueeze(-1)
+            alpha  = preds[:, 3].unsqueeze(-1)
+            t_a    = torch.pow(self.taus, alpha)                          # (B,H,W,K)
+            g_theory = (f          / (1.0 + g_fast * t_a)
+                        + (1.0 - f) / (1.0 + g_slow * t_a))               # (B,H,W,K)
 
         else:
-            amp = preds[:, 2].unsqueeze(-1)
-            g_theory = amp / (1.0 + gamma * torch.pow(self.taus, alpha))
+            gamma = preds[:, 0].unsqueeze(-1)   # (B, H, W, 1)
+            alpha = preds[:, 1].unsqueeze(-1)
+
+            g_theory = 1.0 / (1.0 + gamma * torch.pow(self.taus, alpha))  # (B,H,W,K)
+
+            if self.g0_norm:
+                pass  # g_theory = 1/(1+γτ^α) already matches G(τ)/G(0) target
+
+            elif self.shape_only:
+                g_theory = g_theory / (g_theory[..., 0:1] + eps)
+
+            elif self.legacy_2ch:
+                g_theory    = g_theory    / (g_theory[..., 0:1] + eps)
+                g_empirical = g_empirical / (g_empirical[..., 0:1].abs() + eps)
+
+            else:
+                amp = preds[:, 2].unsqueeze(-1)
+                g_theory = amp / (1.0 + gamma * torch.pow(self.taus, alpha))
 
         if self.log_space:
             sq_err = (torch.log(g_theory.clamp(min=1e-8))

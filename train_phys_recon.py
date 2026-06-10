@@ -215,8 +215,17 @@ def decode_preds(preds, n_components):
 
 
 def train_physics_reconstruction():
+    global LAMBDA_ALPHA_VAR
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[{VERSION}] Using device: {device}")
+
+    # Guard: the two-component model de-compresses α through physics; the α-variance
+    # hinge would fight it and manufacture fake α structure (perinuclear blob, R²
+    # collapse). They must not run together — force the hinge off.
+    if N_COMPONENTS == 2 and LAMBDA_ALPHA_VAR > 0:
+        print(f"[{VERSION}] [guard] N_COMPONENTS=2 → LAMBDA_ALPHA_VAR "
+              f"{LAMBDA_ALPHA_VAR} → 0.0 (2-comp handles α range; hinge would fake it)")
+        LAMBDA_ALPHA_VAR = 0.0
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(RESULT_DIR, exist_ok=True)

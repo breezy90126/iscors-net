@@ -122,6 +122,10 @@ GAMMA_SCALE  = 2.0
 #   component unless the data demands two (guards the extra d.o.f. against fitting noise).
 N_COMPONENTS = 1
 LAMBDA_OCCAM = 0.02        # only used when N_COMPONENTS=2
+# FIX_ALPHA (N_COMPONENTS=2 only): force shared α=1 → pure two-rate NORMAL diffusion.
+# Test whether the apparent anomaly is real or just heterogeneity: if R² stays high
+# with α=1, the per-pixel α was a weakly-identified nuisance (the perinuclear blob).
+FIX_ALPHA    = False
 
 # ---- v4.1: Reliability weighting & σ model input ---------------------------
 # USE_RELIABILITY: pass σ_G_norm to loss for Fisher × Reliability combined weights.
@@ -264,7 +268,8 @@ def train_physics_reconstruction():
                                 predict_amplitude=False,
                                 use_sigma=USE_SIGMA_INPUT,
                                 gamma_scale=GAMMA_SCALE,
-                                n_components=N_COMPONENTS).to(device)
+                                n_components=N_COMPONENTS,
+                                fix_alpha=FIX_ALPHA).to(device)
     criterion = PhysicsReconLoss(
         recon_taus=RECON_TAUS,
         g0_norm=G0_NORM,                 # v4.5: target = G(τ)/G(0) = 1/(1+γτ^α)
@@ -275,7 +280,7 @@ def train_physics_reconstruction():
         n_components=N_COMPONENTS,
     ).to(device)
     print(f"[{VERSION}] N_COMPONENTS={N_COMPONENTS}"
-          + (f"  λ_occam={LAMBDA_OCCAM}" if N_COMPONENTS == 2 else ""))
+          + (f"  λ_occam={LAMBDA_OCCAM}  fix_alpha={FIX_ALPHA}" if N_COMPONENTS == 2 else ""))
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS,
                                                       eta_min=1e-6)

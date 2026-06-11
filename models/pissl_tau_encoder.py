@@ -71,13 +71,19 @@ class PISSLTauEncoder(nn.Module):
             the v4.5 hard .clamp(max=2.0) produced at α=2.0.
     """
     def __init__(self, recon_taus, predict_amplitude=False, use_sigma=False, gamma_scale=2.0,
-                 n_components=1):
+                 n_components=1, fix_alpha=False):
         super().__init__()
         assert n_components in (1, 2), "n_components must be 1 or 2"
         self.predict_amplitude = predict_amplitude
         self.use_sigma = use_sigma
         self.gamma_scale = gamma_scale
         self.n_components = n_components
+        # fix_alpha (2-comp only): force the shared α=1 → pure two-rate NORMAL
+        # diffusion. With heterogeneity carried by (f, γ_fast, γ_slow), the shared α
+        # becomes a weakly-identified nuisance the U-Net fills with arbitrary smooth
+        # structure (the perinuclear blob). Fixing α=1 removes that d.o.f.; if R²
+        # stays high, the apparent anomaly was just heterogeneity.
+        self.fix_alpha = fix_alpha and n_components == 2
         if n_components == 2:
             assert not predict_amplitude, \
                 "predict_amplitude is only supported for n_components=1"
@@ -185,7 +191,10 @@ class PISSLTauEncoder(nn.Module):
             f_map  = self.gamma_activation(p[:, 0:1])                      # sigmoid → (0,1)
             g_slow = self.gamma_scale * self.gamma_activation(p[:, 1:2])   # (0, gamma_scale)
             g_fast = g_slow + self.delta_activation(p[:, 2:3])             # ≥ γ_slow
-            alpha_map = 2.0 * self.alpha_activation(p[:, 3:4])             # (0, 2)
+            if self.fix_alpha:
+                alpha_map = torch.ones_like(f_map)                        # α≡1 (normal)
+            else:
+                alpha_map = 2.0 * self.alpha_activation(p[:, 3:4])        # (0, 2)
             return torch.cat([f_map, g_slow, g_fast, alpha_map], dim=1)    # (B, 4, H, W)
 
         # Single component (default). Direction E scaled-sigmoid — smooth saturation,

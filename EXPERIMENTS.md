@@ -698,5 +698,6 @@ datasets/phys_recon_dataset.py  G_empirical + G(0)=CV² norm, σ_G map, kurtosis
 models/pissl_tau_encoder.py     U-Net, scaled-sigmoid γ/α, τ-PE (v3.9), optional σ input (v4.1)
 loss/phys_recon_loss.py         Fisher × Reliability weighted MSE; g0_norm + shape_only modes
 utils/traditional_iscors.py     FFT autocorrelation, curve fitting, G_empirical map
+utils/gpu_iscors_fit.py         GPU-batched classical (γ,α) fitter — ablation baseline + fast quasi-GT
 utils/generate_test_video.py    Synthetic v1 (nested circles) + v2 (concentric rings)
 ```

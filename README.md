@@ -197,6 +197,7 @@ datasets/phys_recon_dataset.py  G_empirical + G(0)=CV² norm, σ_G map, kurtosis
 models/pissl_tau_encoder.py     U-Net, scaled-sigmoid γ/α, τ positional encoding, optional σ input
 loss/phys_recon_loss.py         Fisher × Reliability weighted MSE; g0_norm + shape_only modes
 utils/traditional_iscors.py     FFT autocorrelation, G_empirical map
+utils/gpu_iscors_fit.py         GPU-batched classical (γ,α) fit — per-pixel ablation baseline + fast quasi-GT
 utils/generate_test_video.py    Synthetic 3-region video generator
 EXPERIMENTS.md                  Full version history and insights
 ```

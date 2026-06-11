@@ -33,6 +33,18 @@ import numpy as np
 import torch
 
 
+def _to_t(x, dtype, device):
+    """To a tensor on `device`, whether x is numpy or a (possibly CUDA) torch tensor.
+
+    np.asarray() on a CUDA tensor raises ('can't convert cuda tensor to numpy'),
+    so torch tensors must be moved with .to() rather than re-wrapped via numpy.
+    """
+    if isinstance(x, torch.Tensor):
+        return x.to(device=device, dtype=dtype)
+    return torch.as_tensor(np.asarray(x), dtype=dtype, device=device)
+
+
+
 # ───────────────────────── G_norm computation ──────────────────────────────
 def compute_g_norm_torch(video, recon_taus, norm='nor1', min_cv=0.005, device=None):
     """Vectorised C(τ)/C(0) (≡ correlation(δI,δI,'nor1')) for every pixel on GPU.
@@ -51,7 +63,7 @@ def compute_g_norm_torch(video, recon_taus, norm='nor1', min_cv=0.005, device=No
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    v = torch.as_tensor(np.asarray(video), dtype=torch.float32, device=device)
+    v = _to_t(video, torch.float32, device)
     T, H, W = v.shape
     taus = [int(t) for t in recon_taus]
     eps = 1e-10
@@ -116,8 +128,8 @@ def fit_gamma_alpha_batched(g_norm, cell_mask, recon_taus,
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    g_norm = torch.as_tensor(g_norm, dtype=torch.float32, device=device)
-    cm     = torch.as_tensor(np.asarray(cell_mask), dtype=torch.bool, device=device)
+    g_norm = _to_t(g_norm, torch.float32, device)
+    cm     = _to_t(cell_mask, torch.bool, device)
     taus_t = torch.tensor([int(t) for t in recon_taus], dtype=torch.float32, device=device)
     K, eps = taus_t.numel(), 1e-10
 
@@ -132,7 +144,7 @@ def fit_gamma_alpha_batched(g_norm, cell_mask, recon_taus,
     else:
         w = torch.full((1, K), 1.0 / K, device=device)
     if sigma_g_norm is not None:
-        s = torch.as_tensor(sigma_g_norm, dtype=torch.float32, device=device)[cm]  # (N,K)
+        s = _to_t(sigma_g_norm, torch.float32, device)[cm]  # (N,K)
         w = w * (1.0 / (s + eps))
     w = w / (w.sum(dim=-1, keepdim=True) + eps)             # normalise over τ
 

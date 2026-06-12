@@ -618,6 +618,55 @@ band-aid) before adopting. Wired through `train_phys_recon.py`, `iscors_real_run
 
 ---
 
+### v4.7 — ACF line conclusion: global-α deliverable + honest scope
+
+The α=1 diagnostic (`FIX_ALPHA`, VERSION `-a1`) and the GPU classical baseline resolved
+what a single ACF can and cannot deliver. The decisive number is the **R² ladder**:
+
+| Model | R² (model / classical per-pixel) |
+|---|---|
+| single-component (γ,α) | ~0.70 |
+| 2-component, free α | 0.91 / 0.96 |
+| 2-component, α=1 (FIX_ALPHA) | 0.886 / 0.91 |
+
+- **The big jump (0.70→0.91) is heterogeneity** (the two rates f, γ_fast, γ_slow), not α.
+- **Forcing α=1 costs only ~0.03–0.05 R²** → the apparent anomaly is ~95% heterogeneity
+  with a small genuine anomalous component. The perinuclear/edge **blob vanished** with
+  α=1, and γ got *cleaner* (model-vs-classical Pearson 0.853→0.890; checkerboard γ 0.874,
+  MAE 0.016) — confirming the free per-pixel α was a weakly-identified nuisance.
+
+**Why R² is not α-confidence (the blob proof):** the blob sits on HIGH R² (~0.9) while its
+α is arbitrary. R² is whole-curve fit quality; it is invariant to α once (f, γ_fast,
+γ_slow) explain the curve. The parameter-specific confidence is the Fisher curvature
+`I_αα = Σ_τ (∂G/∂α)²/σ_G²`, Cramér–Rao `σ_α ≈ 1/√I_αα` (the `p2-alpha-identifiability`
+cell). A per-pixel α that is BOTH unconfounded AND identifiable is **not extractable from
+one ACF** — it needs a second projection (STICS).
+
+**Final ACF deliverable (`GLOBAL_ALPHA`, VERSION `-ga`):**
+- **γ map** — the trustworthy primary product (checkerboard 0.80–0.87, classical 0.85–0.89).
+- **Heterogeneity maps** f, γ_fast, γ_slow — what actually carries the curve shape.
+- **ONE global α scalar** — a single cell-wide anomalous exponent, pinned jointly by every
+  pixel (no per-pixel α freedom → no blob). Recovers the small real anomaly as one number.
+- **α-identifiability map** — honest degradation: where α could be measured if free.
+- **NOT** a per-pixel α map (a single ACF cannot identify it).
+
+**Three shared-α modes (N_COMPONENTS=2), precedence FIX_ALPHA > GLOBAL_ALPHA > free:**
+free per-pixel α (blob; diagnostic only) · `FIX_ALPHA` α≡1 · `GLOBAL_ALPHA` one scalar (ship).
+
+**Speed (ablation, GPU):** `utils/gpu_iscors_fit.py` fits dense (γ,α) for all cell pixels
+in seconds — the same scale as one ML forward pass. The README's "hours" was a CPU/scipy
+per-pixel artifact, not a computational barrier. So the ML never won on *speed*; its only
+remaining justification is *quality* (spatial denoising), which the classical baseline now
+measures directly. The checkerboard quasi-GT was upgraded to this GPU fitter (same model
+family) so the cross-validation is apples-to-apples and fast.
+
+**Next line — STICS.** A per-pixel α needs the independent spatial projection: STICS encodes
+α (τ-scaling of the spatial spread) and σ_D (spatial non-Gaussianity at fixed τ) as separable
+features, breaking the α/σ_D degeneracy — but only where the spread exceeds the PSF (honest
+degradation again). ACF and STICS then cross-validate (γ/heterogeneity ↔ σ_D/v).
+
+---
+
 ## Key Insights Summary
 
 | # | Insight | Version |
@@ -657,6 +706,10 @@ band-aid) before adopting. Wired through `train_phys_recon.py`, `iscors_real_run
 | 33 | Activation range must match the data: empirical g0_norm fits reach γ≈1.7–2.0, so γ∈(0,1) clips signal — use scaled-sigmoid γ∈(0,gamma_scale). Hard clamps (ELU+1.clamp at α=2) pile gradients up at the boundary; smooth saturating sigmoids avoid this. TV priors and γ colormaps must track gamma_scale, not a hard-coded γ_max=1. | v4.6 |
 | 34 | γ ∝ D (γ is the decay rate; faster diffusion → larger γ). Comparing γ vs 1/D_map gave a spurious −0.426 Pearson that masqueraded as model failure. Compare vs D_map directly; the real metric is checkerboard-CV γ (0.80). Raw MAE across γ/D unit scales is meaningless — z-score first. | v4.6+ |
 | 35 | α mean-regression is a loss-landscape loophole, not an evaluation issue: single-power-law misfit makes a mid-α the minimum-MSE answer, and α's gradient is shallow (large-τ only, down-weighted by reliability). A within-cell α-variance hinge removes the loophole, but the cure is a multi-component forward model / second projection — α and σ_D are degenerate under a single ACF. | v4.6+ |
+| 36 | The R² ladder separates cause: single→2-component is +0.21 R² (heterogeneity, real, large); 2-comp free-α→α=1 is only −0.03–0.05 R² (the genuine anomaly, small). The apparent sub-diffusion was ~95% heterogeneity. Forcing α=1 also removed the blob AND improved γ consistency — the free per-pixel α was destabilising the whole fit. | v4.7 |
+| 37 | R² ≠ parameter confidence: the blob has high R² but arbitrary α. R² is whole-curve fit quality, invariant to α once f/γ explain the curve. Use Fisher curvature σ_α≈1/√(Σ(∂G/∂α)²/σ_G²) for honest per-parameter confidence. | v4.7 |
+| 38 | A per-pixel α that is both unconfounded and identifiable is not extractable from one ACF — information limit, not a modelling failure. Ship γ + heterogeneity (f,γ_fast,γ_slow) + ONE global α scalar (jointly pinned, no blob); push per-pixel α to STICS. | v4.7 |
+| 39 | GPU-batched classical fitting is seconds (≈ one ML forward pass); the "hours" was a CPU/scipy per-pixel artifact. ML acceleration of ACF is therefore a quality claim, not a speed claim — and the classical baseline measures the quality delta directly. | v4.7 |
 
 ---
 

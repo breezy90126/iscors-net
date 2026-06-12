@@ -152,6 +152,27 @@ After inference, randomly permute the K τ-channel order and re-run the model. C
 | **v4.6** | Kurtosis artifact mask + scaled-sigmoid γ/α + Gradio frontend | Drop hot pixels; widen γ range; HF Spaces deploy |
 | v4.6+ | Eval fix (γ ∝ D, not 1/D) + α variance regularizer | −0.426 was an inversion artifact; γ is actually good (checkerboard 0.80); α compression is the open problem |
 | v4.7 | Two-component forward model toggle (`N_COMPONENTS=1/2`) | Optional shared-α two-rate mixture: gives heterogeneity its own d.o.f. so α stops absorbing distribution width (targets α compression + low R²); default stays single-component |
+| **v4.7 (ACF final)** | Global-α deliverable + α-identifiability + GPU classical baseline | Per-pixel α is not identifiable from one ACF (the "blob"); ship γ + heterogeneity + ONE global α + honest confidence map. Anomaly is ~95% heterogeneity. Per-pixel α → STICS |
+
+### What to trust (honest scope of the ACF line)
+
+The R² ladder (single 0.70 → 2-comp 0.91/0.96 → α=1 0.886/0.91) shows the big gain is
+**heterogeneity** (the two rates), and the genuine anomaly is small (~0.05 R²).
+
+| Output | Trust? |
+|---|---|
+| **γ map** (≈ diffusion rate ∝ D) | ✅ primary product — checkerboard 0.80–0.87, classical agreement 0.85–0.89 |
+| **f, γ_fast, γ_slow** (heterogeneity) | ✅ where R² high (most of the cell) |
+| **global α** (one cell-wide scalar) | ✅ jointly pinned by all pixels — a single trustworthy anomaly number |
+| per-pixel **α map** | ❌ not identifiable from one ACF (high R² but arbitrary — the blob). Use the `α-identifiability` (Fisher σ_α) map, **not** R², to gate it; per-pixel α belongs to STICS |
+
+Three shared-α modes (`N_COMPONENTS=2`), precedence `FIX_ALPHA` > `GLOBAL_ALPHA` > free:
+free per-pixel α (diagnostic only) · `FIX_ALPHA` (α≡1, clean) · `GLOBAL_ALPHA` (one scalar — ship).
+
+**Speed:** GPU-batched classical fitting (`utils/gpu_iscors_fit.py`) is seconds — the same
+scale as one ML forward pass. The old "hours" was a CPU/scipy per-pixel artifact, so the
+network is justified by *quality* (spatial denoising), not speed; the classical baseline
+measures that delta directly.
 
 > **Evaluating quality:** the trustworthy γ metric is the **checkerboard cross-validation**
 > Pearson (model vs traditional curve-fit, same physics and coordinates). The `γ vs D_map`

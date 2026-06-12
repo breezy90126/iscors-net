@@ -67,7 +67,7 @@ def preprocess_video(video_path, bin_factor, n_frames_max, chunk_size=100, progr
 
 
 def run_inference(video_proc, ckpt_path, recon_taus, gamma_scale, use_sigma,
-                  n_components=1, progress=None):
+                  n_components=1, fix_alpha=False, global_alpha=False, progress=None):
     """Replicates p2-inference: build eval dataset → load checkpoint → full-frame forward pass.
 
     n_components=2 loads a two-component (shared-α) checkpoint; the 4-channel output
@@ -81,7 +81,8 @@ def run_inference(video_proc, ckpt_path, recon_taus, gamma_scale, use_sigma,
 
     model = PISSLTauEncoder(recon_taus=recon_taus, predict_amplitude=False,
                             gamma_scale=gamma_scale, use_sigma=use_sigma,
-                            n_components=n_components).to(DEVICE)
+                            n_components=n_components, fix_alpha=fix_alpha,
+                            global_alpha=global_alpha).to(DEVICE)
     model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
     model.eval()
 
@@ -265,7 +266,7 @@ def make_gt_figure(gt_gamma_r, gamma_pred, stats):
 # ───────────────────────────── pipeline ─────────────────────────────────────
 def run_pipeline(video_file, ckpt_file, mat_file,
                  recon_taus_str, bin_factor, n_frames, gamma_scale, use_sigma,
-                 n_components, wavelength_nm, na, pixel_size_nm, frame_rate_hz,
+                 n_components, alpha_mode, wavelength_nm, na, pixel_size_nm, frame_rate_hz,
                  progress=gr.Progress()):
     if video_file is None or ckpt_file is None:
         raise gr.Error('請至少上傳影片 (.tif) 與模型權重 (.pth)')
@@ -284,7 +285,10 @@ def run_pipeline(video_file, ckpt_file, mat_file,
     progress(0.60, desc='建立資料集並執行模型推論...')
     infer_ds, cell_mask, gamma_pred, alpha_pred = run_inference(
         video_proc, ckpt_file, recon_taus, float(gamma_scale), bool(use_sigma),
-        n_components=int(n_components), progress=progress)
+        n_components=int(n_components),
+        fix_alpha=(alpha_mode == 'fixed α=1'),
+        global_alpha=(alpha_mode == 'global α (shared scalar)'),
+        progress=progress)
 
     gc, ac = gamma_pred[cell_mask], alpha_pred[cell_mask]
     lines = [
@@ -380,6 +384,10 @@ with gr.Blocks(title='iSCORS-Net Inference') as demo:
                                           value=True)
                 n_components = gr.Dropdown(label='N_COMPONENTS（前向模型成分數，需與訓練時一致）',
                                            choices=[1, 2], value=1)
+                alpha_mode   = gr.Dropdown(
+                    label='α 模式（N_COMPONENTS=2，需與訓練時一致）',
+                    choices=['free (per-pixel)', 'fixed α=1', 'global α (shared scalar)'],
+                    value='free (per-pixel)')
 
             with gr.Accordion('光學與物理參數（用於 τ_D / D_α 換算）', open=False):
                 wavelength_nm = gr.Number(label='WAVELENGTH_NM（激發波長, nm）', value=532.0)
@@ -406,7 +414,7 @@ with gr.Blocks(title='iSCORS-Net Inference') as demo:
         fn=run_pipeline,
         inputs=[video_file, ckpt_file, mat_file,
                 recon_taus_str, bin_factor, n_frames, gamma_scale, use_sigma,
-                n_components, wavelength_nm, na, pixel_size_nm, frame_rate_hz],
+                n_components, alpha_mode, wavelength_nm, na, pixel_size_nm, frame_rate_hz],
         outputs=[maps_plot, phys_plot, gt_plot, stats_box, zip_out],
     )
 

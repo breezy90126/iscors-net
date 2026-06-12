@@ -105,6 +105,7 @@ def _fisher_weights_g0(taus_t, gamma_0=0.15, alpha_0=0.8):
 # ───────────────────────── batched non-linear fit ──────────────────────────
 def fit_gamma_alpha_batched(g_norm, cell_mask, recon_taus,
                             n_components=1, gamma_scale=2.0, fix_alpha=False,
+                            global_alpha=False,
                             weight='fisher', sigma_g_norm=None,
                             gamma0=0.15, alpha0=0.8,
                             n_steps=500, lr=0.05, lambda_occam=0.02,
@@ -161,7 +162,9 @@ def fit_gamma_alpha_batched(g_norm, cell_mask, recon_taus,
         tf  = torch.zeros(N, device=device, requires_grad=True)                       # f≈0.5
         tgs = torch.full((N,), _logit((gamma0 * 0.5) / gamma_scale), device=device, requires_grad=True)
         tgd = torch.zeros(N, device=device, requires_grad=True)                        # Δ via softplus
-        ta  = torch.full((N,), _logit(alpha0 / 2.0), device=device, requires_grad=True)
+        # α: per-pixel (free), or ONE shared scalar (global_alpha), or unused (fix_alpha)
+        ta_n = 1 if global_alpha else N
+        ta  = torch.full((ta_n,), _logit(alpha0 / 2.0), device=device, requires_grad=True)
         params = [tf, tgs, tgd, ta]
 
     opt = torch.optim.Adam(params, lr=lr)
@@ -177,7 +180,12 @@ def fit_gamma_alpha_batched(g_norm, cell_mask, recon_taus,
             f      = torch.sigmoid(tf)
             g_slow = gamma_scale * torch.sigmoid(tgs)
             g_fast = g_slow + sp(tgd)
-            alpha  = torch.ones_like(g_slow) if fix_alpha else 2.0 * torch.sigmoid(ta)
+            if fix_alpha:
+                alpha = torch.ones_like(g_slow)
+            elif global_alpha:
+                alpha = (2.0 * torch.sigmoid(ta)).expand_as(g_slow)     # shared scalar
+            else:
+                alpha = 2.0 * torch.sigmoid(ta)                          # per-pixel
             ta_    = taus_t[None, :] ** alpha[:, None]
             g_th   = (f[:, None] / (1.0 + g_fast[:, None] * ta_)
                       + (1 - f)[:, None] / (1.0 + g_slow[:, None] * ta_))
@@ -220,7 +228,7 @@ def fit_gamma_alpha_batched(g_norm, cell_mask, recon_taus,
 
 # ───────────────────────── one-call entry point ────────────────────────────
 def gpu_fit_maps(video, recon_taus, n_components=1, gamma_scale=2.0, fix_alpha=False,
-                 min_cv=0.005, weight='fisher', gamma0=0.15, alpha0=0.8,
+                 global_alpha=False, min_cv=0.005, weight='fisher', gamma0=0.15, alpha0=0.8,
                  n_steps=500, lr=0.05, device=None, verbose=True):
     """video (T,H,W) → dense classical (γ, α, R²) maps via GPU-batched fitting.
 
@@ -234,8 +242,8 @@ def gpu_fit_maps(video, recon_taus, n_components=1, gamma_scale=2.0, fix_alpha=F
               f"n_components={n_components}  steps={n_steps}")
     return fit_gamma_alpha_batched(
         g_norm, cell_mask, recon_taus, n_components=n_components,
-        gamma_scale=gamma_scale, fix_alpha=fix_alpha, weight=weight,
-        gamma0=gamma0, alpha0=alpha0,
+        gamma_scale=gamma_scale, fix_alpha=fix_alpha, global_alpha=global_alpha,
+        weight=weight, gamma0=gamma0, alpha0=alpha0,
         n_steps=n_steps, lr=lr, device=device, verbose=verbose)
 
 

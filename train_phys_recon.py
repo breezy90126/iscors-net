@@ -122,10 +122,13 @@ GAMMA_SCALE  = 2.0
 #   component unless the data demands two (guards the extra d.o.f. against fitting noise).
 N_COMPONENTS = 1
 LAMBDA_OCCAM = 0.02        # only used when N_COMPONENTS=2
-# FIX_ALPHA (N_COMPONENTS=2 only): force shared α=1 → pure two-rate NORMAL diffusion.
-# Test whether the apparent anomaly is real or just heterogeneity: if R² stays high
-# with α=1, the per-pixel α was a weakly-identified nuisance (the perinuclear blob).
+# Shared-α modes (N_COMPONENTS=2 only). Precedence: FIX_ALPHA > GLOBAL_ALPHA > free.
+#   FIX_ALPHA=True    : α≡1 (pure two-rate NORMAL diffusion) — diagnostic / clean ship.
+#   GLOBAL_ALPHA=True : ONE learned scalar α shared over all pixels — the final ACF
+#                       deliverable: a single trustworthy anomaly number, no per-pixel
+#                       α blob (per-pixel α is not identifiable from one ACF).
 FIX_ALPHA    = False
+GLOBAL_ALPHA = False
 
 # ---- v4.1: Reliability weighting & σ model input ---------------------------
 # USE_RELIABILITY: pass σ_G_norm to loss for Fisher × Reliability combined weights.
@@ -269,7 +272,8 @@ def train_physics_reconstruction():
                                 use_sigma=USE_SIGMA_INPUT,
                                 gamma_scale=GAMMA_SCALE,
                                 n_components=N_COMPONENTS,
-                                fix_alpha=FIX_ALPHA).to(device)
+                                fix_alpha=FIX_ALPHA,
+                                global_alpha=GLOBAL_ALPHA).to(device)
     criterion = PhysicsReconLoss(
         recon_taus=RECON_TAUS,
         g0_norm=G0_NORM,                 # v4.5: target = G(τ)/G(0) = 1/(1+γτ^α)
@@ -280,7 +284,13 @@ def train_physics_reconstruction():
         n_components=N_COMPONENTS,
     ).to(device)
     print(f"[{VERSION}] N_COMPONENTS={N_COMPONENTS}"
-          + (f"  λ_occam={LAMBDA_OCCAM}  fix_alpha={FIX_ALPHA}" if N_COMPONENTS == 2 else ""))
+          + (f"  λ_occam={LAMBDA_OCCAM}  fix_alpha={FIX_ALPHA}  global_alpha={GLOBAL_ALPHA}"
+             if N_COMPONENTS == 2 else ""))
+    if N_COMPONENTS == 2 and GLOBAL_ALPHA and not FIX_ALPHA:
+        import torch as _t
+        with _t.no_grad():
+            print(f"[{VERSION}] global α (init) = "
+                  f"{(2.0 * _t.sigmoid(model.alpha_global)).item():.4f}")
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS,
                                                       eta_min=1e-6)
@@ -395,6 +405,11 @@ def train_physics_reconstruction():
     ckpt_path = os.path.join(CHECKPOINT_DIR, f"pissl_phys_recon_{VERSION}.pth")
     torch.save(model.state_dict(), ckpt_path)
     print(f"Model saved -> {ckpt_path}")
+    if N_COMPONENTS == 2 and GLOBAL_ALPHA and not FIX_ALPHA:
+        with torch.no_grad():
+            ag = (2.0 * torch.sigmoid(model.alpha_global)).item()
+        print(f"[{VERSION}] *** global α (learned) = {ag:.4f} ***  "
+              f"(single cell-wide anomalous exponent; α=1 ⇒ normal diffusion)")
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     axes[0].plot(history["loss"], label="Total loss")

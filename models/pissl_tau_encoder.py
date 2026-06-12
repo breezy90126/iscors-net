@@ -71,19 +71,23 @@ class PISSLTauEncoder(nn.Module):
             the v4.5 hard .clamp(max=2.0) produced at α=2.0.
     """
     def __init__(self, recon_taus, predict_amplitude=False, use_sigma=False, gamma_scale=2.0,
-                 n_components=1, fix_alpha=False):
+                 n_components=1, fix_alpha=False, global_alpha=False):
         super().__init__()
         assert n_components in (1, 2), "n_components must be 1 or 2"
         self.predict_amplitude = predict_amplitude
         self.use_sigma = use_sigma
         self.gamma_scale = gamma_scale
         self.n_components = n_components
-        # fix_alpha (2-comp only): force the shared α=1 → pure two-rate NORMAL
-        # diffusion. With heterogeneity carried by (f, γ_fast, γ_slow), the shared α
-        # becomes a weakly-identified nuisance the U-Net fills with arbitrary smooth
-        # structure (the perinuclear blob). Fixing α=1 removes that d.o.f.; if R²
-        # stays high, the apparent anomaly was just heterogeneity.
-        self.fix_alpha = fix_alpha and n_components == 2
+        # Shared-α handling (2-comp only). Three mutually-exclusive modes for the
+        # anomalous exponent once heterogeneity is carried by (f, γ_fast, γ_slow):
+        #   free (default)   : per-pixel α — but it is weakly identified → the U-Net
+        #                      fills it with arbitrary smooth structure (perinuclear blob).
+        #   fix_alpha=True   : α≡1 (pure two-rate NORMAL diffusion). Diagnostic / clean ship.
+        #   global_alpha=True: ONE learned scalar α shared over all pixels — pinned by
+        #                      every pixel jointly → trustworthy single number, no blob.
+        # Precedence: fix_alpha > global_alpha > free.
+        self.fix_alpha    = fix_alpha and n_components == 2
+        self.global_alpha = global_alpha and n_components == 2 and not self.fix_alpha
         if n_components == 2:
             assert not predict_amplitude, \
                 "predict_amplitude is only supported for n_components=1"
@@ -140,6 +144,9 @@ class PISSLTauEncoder(nn.Module):
         self.alpha_activation = nn.Sigmoid()   # scaled to (0, 2) in forward()
         self.amp_activation   = nn.Softplus()  # A > 0
         self.delta_activation = nn.Softplus()  # Δγ ≥ 0 → γ_fast = γ_slow + Δγ (2-comp)
+        if self.global_alpha:
+            # one shared scalar; α = 2·sigmoid(·), init 0 → α=1.0
+            self.alpha_global = nn.Parameter(torch.zeros(1))
 
     def forward(self, x, sigma_g_norm=None):
         """
@@ -193,8 +200,11 @@ class PISSLTauEncoder(nn.Module):
             g_fast = g_slow + self.delta_activation(p[:, 2:3])             # ≥ γ_slow
             if self.fix_alpha:
                 alpha_map = torch.ones_like(f_map)                        # α≡1 (normal)
+            elif self.global_alpha:
+                a = 2.0 * torch.sigmoid(self.alpha_global)               # one scalar ∈ (0,2)
+                alpha_map = a.view(1, 1, 1, 1).expand_as(f_map)          # broadcast everywhere
             else:
-                alpha_map = 2.0 * self.alpha_activation(p[:, 3:4])        # (0, 2)
+                alpha_map = 2.0 * self.alpha_activation(p[:, 3:4])        # (0, 2) per-pixel
             return torch.cat([f_map, g_slow, g_fast, alpha_map], dim=1)    # (B, 4, H, W)
 
         # Single component (default). Direction E scaled-sigmoid — smooth saturation,
@@ -238,3 +248,13 @@ if __name__ == "__main__":
     print(f"  α      range: [{a_.min():.3f}, {a_.max():.3f}]")
     assert bool((gf_ >= gs_ - 1e-5).all()), "ordering γ_fast ≥ γ_slow violated"
     print("  ordering γ_fast ≥ γ_slow: OK ✓")
+
+    # ── global-α: one shared scalar, α uniform across pixels ─────────────────
+    mg  = PISSLTauEncoder(recon_taus=taus, n_components=2, global_alpha=True)
+    og  = mg(x)
+    a_g = og[:, 3]
+    print(f"\n[global_alpha] α has {a_g.unique().numel()} unique value(s) "
+          f"= {a_g.flatten()[0]:.4f}  (expect 1 → shared scalar)")
+    assert a_g.unique().numel() == 1, "global α must be a single shared value"
+    assert hasattr(mg, 'alpha_global') and mg.alpha_global.requires_grad
+    print("  α is a single learnable scalar: OK ✓")

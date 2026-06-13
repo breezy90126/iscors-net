@@ -156,8 +156,14 @@ def fit_gamma_alpha_batched(g_norm, cell_mask, recon_taus,
     # ---- parameters (initialised at the prior) ----
     if n_components == 1:
         tg = torch.full((N,), _logit(gamma0 / gamma_scale), device=device, requires_grad=True)
-        ta = torch.full((N,), _logit(alpha0 / 2.0),         device=device, requires_grad=True)
-        params = [tg, ta]
+        # α: per-pixel (free) | one shared scalar (global_alpha) | none (fix_alpha → α≡1)
+        if fix_alpha:
+            ta = None
+        elif global_alpha:
+            ta = torch.full((1,), _logit(alpha0 / 2.0), device=device, requires_grad=True)
+        else:
+            ta = torch.full((N,), _logit(alpha0 / 2.0), device=device, requires_grad=True)
+        params = [tg] if ta is None else [tg, ta]
     else:
         tf  = torch.zeros(N, device=device, requires_grad=True)                       # f≈0.5
         tgs = torch.full((N,), _logit((gamma0 * 0.5) / gamma_scale), device=device, requires_grad=True)
@@ -173,7 +179,12 @@ def fit_gamma_alpha_batched(g_norm, cell_mask, recon_taus,
     def _forward():
         if n_components == 1:
             gamma = gamma_scale * torch.sigmoid(tg)         # (N,)
-            alpha = 2.0 * torch.sigmoid(ta)
+            if fix_alpha:
+                alpha = torch.ones_like(gamma)               # α≡1 (1-param)
+            elif global_alpha:
+                alpha = (2.0 * torch.sigmoid(ta)).expand_as(gamma)  # one shared scalar
+            else:
+                alpha = 2.0 * torch.sigmoid(ta)              # per-pixel
             g_th  = 1.0 / (1.0 + gamma[:, None] * taus_t[None, :] ** alpha[:, None])
             extras = {}
         else:

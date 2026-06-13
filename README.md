@@ -219,6 +219,7 @@ models/pissl_tau_encoder.py     U-Net, scaled-sigmoid γ/α, τ positional encod
 loss/phys_recon_loss.py         Fisher × Reliability weighted MSE; g0_norm + shape_only modes
 utils/traditional_iscors.py     FFT autocorrelation, G_empirical map
 utils/gpu_iscors_fit.py         GPU-batched classical (γ,α) fit — per-pixel ablation baseline + fast quasi-GT
+utils/gpu_stics.py              GPU iMSD — independent α verifier (STICS spatial-spread projection)
 utils/generate_test_video.py    Synthetic 3-region video generator
 EXPERIMENTS.md                  Full version history and insights
 ```

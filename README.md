@@ -220,6 +220,7 @@ loss/phys_recon_loss.py         Fisher × Reliability weighted MSE; g0_norm + sh
 utils/traditional_iscors.py     FFT autocorrelation, G_empirical map
 utils/gpu_iscors_fit.py         GPU-batched classical (γ,α) fit — per-pixel ablation baseline + fast quasi-GT
 utils/gpu_stics.py              GPU iMSD — independent α verifier (STICS spatial-spread projection)
+utils/gpu_chi4.py               GPU χ4 — dynamic-heterogeneity probe (4-point susceptibility; τ* peak)
 utils/generate_test_video.py    Synthetic 3-region video generator
 EXPERIMENTS.md                  Full version history and insights
 ```

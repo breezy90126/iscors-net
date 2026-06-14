@@ -667,6 +667,48 @@ degradation again). ACF and STICS then cross-validate (γ/heterogeneity ↔ σ_D
 
 ---
 
+### v4.7 final (v4.6-1ga) — ACF-line conclusion: classical wins, α is unverifiable
+
+The single-component global-α run + the GPU iMSD verifier closed the line.
+
+**iMSD α verifier: NOT RESOLVED (and that is itself the answer).** σ²_space(τ) does not grow
+with τ — it hovers at the PSF floor (~11 px²), so the fit hits the α=0.1 bound (an artifact,
+not a measurement). The diffusion spread stays below the PSF over τ=1–128. Meaning:
+- STICS/iMSD **cannot arbitrate α** for this data at this resolution (slow/confined dynamics —
+  the brief's first-to-fail degradation). Per-region/sliding-window iMSD would be worse, not better.
+- But it revealed real physics: the ACF decorrelates strongly in time while STICS shows **no
+  spatial spreading** → the dynamics are **in-place / confined, not translational diffusion**.
+  So the recovered α is a *temporal-decorrelation* exponent, not a verified transport exponent.
+
+**α converged across methods at ≈0.6** once the spec is clean (single-component, global α):
+classical B=0.61, classical E=0.69, **1-comp global-α U-Net=0.63**. The earlier 0.85 was a
+**2-component shared-α artifact**; in the correct spec the U-Net and classical AGREE. So the
+"ML α biased high" worry was a model-spec artifact, not an ML property.
+
+**Speed: GPU classical wins decisively for the actual use (per-video self-supervised).**
+GPU-batched classical fit = seconds, no training; the U-Net needs minutes–hours of per-video
+training. The ML only wins at high throughput with a pre-trained model (ms inference), which is
+not how this is used. So ML is not justified on speed.
+
+**ML value reduces to one question (head-to-head):** does the U-Net's γ beat its classical twin
+(same spec, B) in held-out self-consistency? `p2-gamma-headtohead` reports `pM − p_matched` and
+writes `headtohead_VERSION.txt` with an explicit KEEP/RETIRE verdict. Even a positive gain cannot
+be proven to be denoising rather than smoothing (no true GT; STICS can't arbitrate). Given equal
+α, high γ agreement, and the classical speed win, the evidence already favours **retiring the
+U-Net for the γ/α deliverable**.
+
+**ACF-line deliverable (honest):**
+- **γ map** — primary, method-consistent; produced fastest by the GPU classical 1-component fit.
+- **apparent global α ≈ 0.6** — consistent across classical and ML; labelled a *temporal-
+  decorrelation* exponent (real-vs-heterogeneity/confinement **not** verifiable from this data).
+- **iMSD** — reports "sub-PSF, unresolved" (honest degradation) and shows the motion is in-place.
+- **Open / next:** generalisation tests (rotation / augmentation transforms) probe whether the
+  U-Net memorises geometry — relevant only if the network is kept; the classical fit has no
+  geometry-memorisation to test. Verifying α would need higher spatial resolution / faster
+  dynamics / a different lever, not more model complexity.
+
+---
+
 ## Key Insights Summary
 
 | # | Insight | Version |

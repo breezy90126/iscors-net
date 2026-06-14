@@ -78,16 +78,17 @@ class PISSLTauEncoder(nn.Module):
         self.use_sigma = use_sigma
         self.gamma_scale = gamma_scale
         self.n_components = n_components
-        # Shared-α handling (2-comp only). Three mutually-exclusive modes for the
-        # anomalous exponent once heterogeneity is carried by (f, γ_fast, γ_slow):
-        #   free (default)   : per-pixel α — but it is weakly identified → the U-Net
-        #                      fills it with arbitrary smooth structure (perinuclear blob).
-        #   fix_alpha=True   : α≡1 (pure two-rate NORMAL diffusion). Diagnostic / clean ship.
+        # Shared-α modes (work for n_components 1 AND 2). Three mutually-exclusive
+        # options for the anomalous exponent:
+        #   free (default)   : per-pixel α — weakly identified (the perinuclear blob).
+        #   fix_alpha=True   : α≡1 (pure normal diffusion). Diagnostic / clean ship.
         #   global_alpha=True: ONE learned scalar α shared over all pixels — pinned by
         #                      every pixel jointly → trustworthy single number, no blob.
         # Precedence: fix_alpha > global_alpha > free.
-        self.fix_alpha    = fix_alpha and n_components == 2
-        self.global_alpha = global_alpha and n_components == 2 and not self.fix_alpha
+        # n_components=1 + global_alpha = the "B" model (per-pixel γ + one shared α);
+        # its matched classical twin is gpu_iscors_fit(n_components=1, global_alpha=True).
+        self.fix_alpha    = fix_alpha
+        self.global_alpha = global_alpha and not self.fix_alpha
         if n_components == 2:
             assert not predict_amplitude, \
                 "predict_amplitude is only supported for n_components=1"
@@ -210,7 +211,13 @@ class PISSLTauEncoder(nn.Module):
         # Single component (default). Direction E scaled-sigmoid — smooth saturation,
         # no zero-gradient pile-up at either boundary (cf. v4.5 hard clamp at α=2.0).
         gamma_map = self.gamma_scale * self.gamma_activation(p[:, 0:1])  # (0, gamma_scale)
-        alpha_map = 2.0 * self.alpha_activation(p[:, 1:2])               # (0, 2)
+        if self.fix_alpha:
+            alpha_map = torch.ones_like(gamma_map)                       # α≡1 (the "A" model)
+        elif self.global_alpha:
+            a = 2.0 * torch.sigmoid(self.alpha_global)                   # one scalar ∈ (0,2)
+            alpha_map = a.view(1, 1, 1, 1).expand_as(gamma_map)          # the "B" model
+        else:
+            alpha_map = 2.0 * self.alpha_activation(p[:, 1:2])           # (0, 2) per-pixel
 
         if self.predict_amplitude:
             amp_map = self.amp_activation(p[:, 2:3])
@@ -258,3 +265,12 @@ if __name__ == "__main__":
     assert a_g.unique().numel() == 1, "global α must be a single shared value"
     assert hasattr(mg, 'alpha_global') and mg.alpha_global.requires_grad
     print("  α is a single learnable scalar: OK ✓")
+
+    # ── 1-component + global α (the "B" model: per-pixel γ + one shared α) ────
+    mb  = PISSLTauEncoder(recon_taus=taus, n_components=1, global_alpha=True)
+    ob  = mb(x)
+    print(f"\n[n_components=1, global_alpha] output {ob.shape}  "
+          f"α uniques={ob[:,1].unique().numel()} (expect 1)")
+    assert ob.shape[1] == 2 and ob[:, 1].unique().numel() == 1
+    assert hasattr(mb, 'alpha_global')
+    print("  B model (1-comp + shared α): OK ✓")

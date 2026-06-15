@@ -56,7 +56,7 @@ def compute_density(video, min_cv=0.005, device=None):
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    v = _to_t(video, device)
+    v = _to_t(video, torch.float32, device)
     mean_I = v.mean(dim=0)
     var_I  = ((v - mean_I) ** 2).mean(dim=0)
     cv2 = (var_I / (mean_I ** 2 + 1e-10))                # CV² = G(0)

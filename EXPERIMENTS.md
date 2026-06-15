@@ -709,6 +709,55 @@ U-Net for the γ/α deliverable**.
 
 ---
 
+## Projection inventory & acquisition-regime conclusion (closing)
+
+The honest-degradation framework was run on all the projections a single iSCAT video
+affords. Empirical verdicts (not assumptions):
+
+| Projection | Question | Verdict on this data |
+|---|---|---|
+| **ACF / TICS** | temporal decay (γ, α) | ✅ γ map + apparent global α ≈ 0.6 (in-place temporal decorrelation) |
+| **STICS / iMSD** | spatial transport (v, α from spread) | ❌ sub-PSF — σ²(τ) never grows above the PSF floor |
+| **χ4** | dynamic heterogeneity (cooperative τ*) | ❌ no peak; real χ4 below the time-shuffle floor → homogeneous, non-cooperative |
+
+**The two empty projections are an acquisition-regime mismatch, not a method failure.**
+The data is 5000 fps × ~1 s, ~130 nm/px (PSF ≈ a few px). With chromatin D ~ 10⁻³–10⁻²
+µm²/s, RMS displacement over the whole second is ≈ 60–200 nm ≈ **< 1 PSF** → STICS sees no
+spreading. Cooperative / structural (LLPS-type) timescales are τ* ~ tens of s – minutes
+**≫ the 1 s window** → χ4 has no peak to find. SNR is **not** the limit: averaging 10
+frames to raise SNR left the result unchanged — the limits are **window length** (1 s) and
+**spatial resolution** (PSF), which SNR does not touch.
+
+So the fast decorrelation the ACF measures (α ≈ 0.6, ⟨G⟩ decaying over ms) is **fast
+in-place fluctuation, not chromatin translation** — the slow chromatin transport and
+heterogeneity simply fall outside this (short, high-fps, diffraction-limited) window. No
+analysis or ML recovers what was never sampled.
+
+**Acquisition guidance:** to capture chromatin slow dynamics you need the *opposite*
+trade-off — long duration (tens of s – minutes) at low fps — accepting worse temporal
+resolution. The STICS-iMSD and χ4 probes (`utils/gpu_stics.py`, `utils/gpu_chi4.py`) are
+ready to apply unchanged to such data; the wall is the data regime, not the tooling.
+
+**SOFI — the one lever that could reopen the spatial axis.** The fast in-place fluctuation
+the ACF sees is exactly SOFI's substrate. SOFI is a *fourth* projection: instead of
+lag-dependence (ACF dynamics) it uses fixed-lag higher-order temporal cumulants to sharpen
+the effective PSF (≈√n for order n). Since the sub-PSF limit is what killed STICS, a
+narrower effective PSF could make the sub-pixel motion measurable — and χ4's "homogeneous,
+non-cooperative" result is mildly favourable to SOFI's independent-fluctuation assumption.
+Caveats: SOFI was built for fluorescence blinking (iSCAT interferometric fluctuation may
+violate independence → artifacts); the resolution gain is modest (~1.4–2×); high-order
+cumulants need SNR/T (the 5000 frames may suffice). Not a guaranteed win, but the only
+projection in this inventory that could loosen the PSF wall.
+
+**Bottom line.** For this video, the single-cell extractable content is the ACF (γ +
+apparent α≈0.6); ML adds no demonstrable value (classical GPU fit is faster and as
+accurate-as-verifiable, head-to-head pending); STICS and χ4 are empty due to the
+acquisition regime; SOFI is the open forward lever. This is a complete, honest closure of
+the ACF line — the contribution is the *measured boundary of what one iSCAT video yields*,
+exactly the resolution-limit-aware framework the multi-projection brief called for.
+
+---
+
 ## Key Insights Summary
 
 | # | Insight | Version |
@@ -752,6 +801,9 @@ U-Net for the γ/α deliverable**.
 | 37 | R² ≠ parameter confidence: the blob has high R² but arbitrary α. R² is whole-curve fit quality, invariant to α once f/γ explain the curve. Use Fisher curvature σ_α≈1/√(Σ(∂G/∂α)²/σ_G²) for honest per-parameter confidence. | v4.7 |
 | 38 | A per-pixel α that is both unconfounded and identifiable is not extractable from one ACF — information limit, not a modelling failure. Ship γ + heterogeneity (f,γ_fast,γ_slow) + ONE global α scalar (jointly pinned, no blob); push per-pixel α to STICS. | v4.7 |
 | 39 | GPU-batched classical fitting is seconds (≈ one ML forward pass); the "hours" was a CPU/scipy per-pixel artifact. ML acceleration of ACF is therefore a quality claim, not a speed claim — and the classical baseline measures the quality delta directly. | v4.7 |
+| 40 | STICS/iMSD and χ4 both come up empty here, but it is an acquisition-regime mismatch, not a method failure: 5000 fps × 1 s × ~130 nm means chromatin moves < 1 PSF in the window (STICS sub-PSF) and its cooperative timescale τ*≫1 s (χ4 no peak). SNR is not the limit (frame-averaging didn't change it) — window length and spatial resolution are. | χ4/STICS |
+| 41 | The ACF's fast decorrelation (α≈0.6) is fast in-place fluctuation, not chromatin translation — the slow transport/heterogeneity falls outside the short high-fps window. To see it needs the opposite acquisition (long duration, low fps); no ML recovers unsampled dynamics. | χ4/STICS |
+| 42 | The fast in-place fluctuation is SOFI's substrate. SOFI is a 4th projection (fixed-lag higher-order cumulants → ~√n sharper effective PSF) and is the one lever that could reopen the sub-PSF spatial axis that killed STICS; χ4's homogeneity is mildly favourable to its independence assumption, but iSCAT≠fluorescence blinking is the risk. | forward |
 
 ---
 

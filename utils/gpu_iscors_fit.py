@@ -45,6 +45,26 @@ def _to_t(x, dtype, device):
 
 
 
+# ───────────────────────── density channel (amplitude) ─────────────────────
+def compute_density(video, min_cv=0.005, device=None):
+    """Robust 'how much / how many' map: G(0) = CV² = Var_t(I)/⟨I⟩² per pixel.
+
+    This is the amplitude/density channel iSCORS *normalises away*. It needs no
+    curve fit, is high-SNR (a variance), and is the clean condensation-like map
+    (≈ the iSCORS MATLAB Cond_map). Complementary to the dynamics (γ,α): density
+    is "how much", γ is "how fast". Returns (density CV² map, cell_mask).
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    v = _to_t(video, device)
+    mean_I = v.mean(dim=0)
+    var_I  = ((v - mean_I) ** 2).mean(dim=0)
+    cv2 = (var_I / (mean_I ** 2 + 1e-10))                # CV² = G(0)
+    cell = (torch.sqrt(var_I.clamp(min=0)) / (mean_I.abs() + 1e-10)) >= min_cv
+    dens = cv2.cpu().numpy(); dens[~cell.cpu().numpy()] = np.nan
+    return dens, cell.cpu().numpy()
+
+
 # ───────────────────────── G_norm computation ──────────────────────────────
 def compute_g_norm_torch(video, recon_taus, norm='nor1', min_cv=0.005, device=None):
     """Vectorised C(τ)/C(0) (≡ correlation(δI,δI,'nor1')) for every pixel on GPU.

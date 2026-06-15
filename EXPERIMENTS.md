@@ -750,11 +750,17 @@ cumulants need SNR/T (the 5000 frames may suffice). Not a guaranteed win, but th
 projection in this inventory that could loosen the PSF wall.
 
 **Bottom line.** For this video, the single-cell extractable content is the ACF (γ +
-apparent α≈0.6); ML adds no demonstrable value (classical GPU fit is faster and as
-accurate-as-verifiable, head-to-head pending); STICS and χ4 are empty due to the
-acquisition regime; SOFI is the open forward lever. This is a complete, honest closure of
-the ACF line — the contribution is the *measured boundary of what one iSCAT video yields*,
-exactly the resolution-limit-aware framework the multi-projection brief called for.
+apparent α≈0.6); the U-Net is **retired for γ** — the head-to-head at matched 1-comp
+global-α spec is a clear NEGATIVE: held-out self-consistency U-Net=0.838 vs classical=0.973
+(ML value pM−p_matched = **−0.135**), and vs the independent quasi-GT U-Net=0.834 vs
+classical=0.959. So the network is not merely redundant but measurably *worse* (less
+reproducible across independent noise) than a per-pixel classical fit, which is also
+faster. STICS and χ4 are empty due to the acquisition regime; SOFI is blocked by coherent
+phase loss (no operator/weak-form/SINDy fix — it is a phase-retrieval inverse problem, not
+a differentiation problem); the amplitude/density channel (G(0)=CV², N&B) is robust but
+unexploited (classical, no ML). This is a complete, honest closure of the ACF line — the
+contribution is the *measured boundary of what one iSCAT video yields*, exactly the
+resolution-limit-aware framework the multi-projection brief called for.
 
 ---
 

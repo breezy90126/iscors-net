@@ -46,6 +46,37 @@ def _to_t(x, dtype, device):
 
 
 # ───────────────────────── condensation (V_DLS / D) ────────────────────────
+def condensation_projection(v_dls, inv_Dstar, cell_mask, slope=3.0, b=None):
+    """iSCORS condensation via the slope-3 log-log perpendicular projection.
+
+    Per pixel:  X = log10(1/D*) (slowness),  Y = log10(V_DLS) (CV² fluctuation energy).
+    Baseline (pure-density scaling):  Y = slope·X + b   with slope FIXED = 3.
+      b = total mass density — fixed-slope least-squares intercept over the cell:
+          b = mean(Y - slope·X).
+    Condensation level = position along the baseline = X_p of the perpendicular foot:
+          X_p = (X + slope·Y - slope·b) / (1 + slope²)        # = (X+3Y-3b)/10 for slope=3
+          Y_p = slope·X_p + b
+    Projecting removes the off-line (density/noise) scatter, leaving condensation.
+
+    Args:
+        v_dls     : (H,W) CV² = G(0) map (= compute_density).
+        inv_Dstar : (H,W) 1/D* map (∝ 1/γ from the ACF fit).
+        cell_mask : (H,W) bool.
+    Returns (condensation X_p map with NaN outside cell, info dict with b, Xp, Yp, X, Y).
+    """
+    eps = 1e-12
+    X = np.log10(np.clip(np.asarray(inv_Dstar, np.float64), eps, None))
+    Y = np.log10(np.clip(np.asarray(v_dls,     np.float64), eps, None))
+    m = np.asarray(cell_mask, bool) & np.isfinite(X) & np.isfinite(Y)
+    if b is None:
+        b = float(np.mean(Y[m] - slope * X[m]))             # fixed-slope intercept = density
+    denom = 1.0 + slope ** 2                                 # = 10 for slope = 3
+    Xp = (X + slope * Y - slope * b) / denom
+    Yp = slope * Xp + b
+    cond = Xp.astype(np.float32).copy(); cond[~np.asarray(cell_mask, bool)] = np.nan
+    return cond, dict(b=float(b), slope=float(slope), Xp=Xp, Yp=Yp, X=X, Y=Y)
+
+
 def condensation(density, gamma, alpha=None, blur='gamma'):
     """iSCORS condensation map = CV² / Φ(D*)  (the 'V_DLS / D' quantity).
 

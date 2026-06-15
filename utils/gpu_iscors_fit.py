@@ -97,6 +97,33 @@ def condensation(density, gamma, alpha=None, blur='gamma'):
 
 
 # ───────────────────────── density channel (amplitude) ─────────────────────
+def vdls_amplitude(video, recon_taus, gamma, alpha, device=None):
+    """Noise-free V_DLS = amplitude A of G(τ)=A/(1+γτ^α) fit to the τ≥1 ACF.
+
+    Raw V_DLS = CV² = G(0) = C(0)/⟨I⟩² includes the τ=0 white-noise spike
+    (Var = Var_signal + Var_noise). The τ≥1 autocorrelation is noise-free
+    (white noise is uncorrelated), so extrapolating the shape 1/(1+γτ^α) back to
+    τ→0 recovers the NOISE-FREE amplitude. Given (γ,α), A is linear:
+        A = Σ_τ G_raw(τ)·s(τ) / Σ_τ s(τ)² ,   s(τ)=1/(1+γτ^α)   (over the recon τ≥1)
+    Returns A map (= noise-free V_DLS), NaN where γ is NaN (non-cell).
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    v = _to_t(video, torch.float32, device)
+    T = v.shape[0]
+    mean_I = v.mean(dim=0); delta = v - mean_I
+    denom = mean_I ** 2 + 1e-10
+    taus = torch.tensor([int(t) for t in recon_taus], dtype=torch.float32, device=device)
+    g_raw = torch.stack([((delta[:T-int(t)] * delta[int(t):]).mean(dim=0)) / denom
+                         for t in recon_taus], dim=-1)            # (H,W,K) = C(τ)/⟨I⟩²
+    g = _to_t(np.nan_to_num(np.asarray(gamma), nan=0.15), torch.float32, device).clamp(min=1e-6)
+    a = _to_t(np.nan_to_num(np.asarray(alpha), nan=1.0),  torch.float32, device).clamp(0.1, 2.0)
+    s = 1.0 / (1.0 + g.unsqueeze(-1) * taus.view(1, 1, -1) ** a.unsqueeze(-1))   # (H,W,K)
+    A = ((g_raw * s).sum(-1) / ((s ** 2).sum(-1) + 1e-10)).cpu().numpy()
+    A[~np.isfinite(np.asarray(gamma))] = np.nan
+    return A.astype(np.float32)
+
+
 def compute_density(video, min_cv=0.005, device=None):
     """Robust 'how much / how many' map: G(0) = CV² = Var_t(I)/⟨I⟩² per pixel.
 

@@ -74,9 +74,16 @@ What the ACF *does* yield, computed classically on the GPU in seconds:
 - **density map (G(0) = CV²)** — the amplitude channel iSCORS normalises away. High-SNR,
   needs no fit, ≈ the clean iSCORS condensation map; "how much/how many", complementary to
   γ's "how fast". This is the cleanest single map the video affords.
+- **condensation map** — the iSCORS V_DLS/D quantity via the slope-3 log-log perpendicular
+  projection (X=log(1/D*), Y=log(V_DLS=CV²), baseline Y=3X+b, condensation = projected
+  position). **Validated against the real iSCORS .mat `Cond_map`: Pearson = 0.818** (vs raw
+  CV² 0.513, raw 1/γ 0.586, naive CV²/γ 0.251) — the projection's log-space combination of
+  fluctuation energy and slowness is the correct reproduction. (Cond_map's *rank* is mostly
+  density — Spearman(CV²,Cond)=0.83 — so the projection's gain is quantitative/linear.)
 
-`utils/gpu_iscors_fit.py` (`gpu_fit_maps`, `compute_density`) produces all of these; the
-deliverable notebook `iscors_deliverable.ipynb` wraps them with a Gradio front-end.
+`utils/gpu_iscors_fit.py` (`gpu_fit_maps`, `compute_density`, `condensation_projection`,
+`vdls_amplitude`) produces all of these; the deliverable notebook `iscors_deliverable.ipynb`
+wraps them with a Gradio front-end and validates condensation against the .mat Cond_map.
 
 ---
 

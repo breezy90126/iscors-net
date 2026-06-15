@@ -45,6 +45,26 @@ def _to_t(x, dtype, device):
 
 
 
+# ───────────────────────── condensation (V_DLS / D) ────────────────────────
+def condensation(density, gamma, alpha=None, blur='gamma'):
+    """iSCORS condensation map = CV² / Φ(D*)  (the 'V_DLS / D' quantity).
+
+    density : CV² = G(0) map (from compute_density) — illumination-corrected total
+              fluctuation energy, but suppressed by motion.
+    gamma   : per-pixel ACF decay rate (∝ D*); the motion-blur factor.
+    Φ(D*)   : blur='gamma' → Φ = γ            (γ ∝ D; the standard V_DLS/D form)
+              blur='tauD'  → Φ = γ^(1/α) = 1/τ_D  (anomalous-corrected characteristic rate)
+    Dividing un-blurs the variance → dense+slow ⇒ high, dilute+fast ⇒ low.
+    """
+    g = np.asarray(gamma, dtype=np.float64)
+    if blur == 'tauD' and alpha is not None:
+        a = np.clip(np.asarray(alpha, np.float64), 0.1, 2.0)
+        phi = np.power(np.clip(g, 1e-6, None), 1.0 / a)              # γ^(1/α) = 1/τ_D
+    else:
+        phi = np.clip(g, 1e-6, None)                                # Φ = γ ∝ D
+    return (np.asarray(density, np.float64) / (phi + 1e-10)).astype(np.float32)
+
+
 # ───────────────────────── density channel (amplitude) ─────────────────────
 def compute_density(video, min_cv=0.005, device=None):
     """Robust 'how much / how many' map: G(0) = CV² = Var_t(I)/⟨I⟩² per pixel.

@@ -4,7 +4,6 @@ torch>=2.0.0
 torchvision
 torchaudio
 scikit-image
-scikit-learn
 tqdm>=4.66.5
 pyqt5==5.15.7
 pyqt5-qt5==5.15.2

@@ -391,7 +391,7 @@ if __name__ == "__main__":
 
 # ───────────────────── streaming ACF (RAM-capped, long videos) ──────────────
 def streaming_acf(tif_path, recon_taus, n_frames=None, bin_factor=2,
-                  min_cv=0.005, chunk=200, bg_sigma=4):
+                  min_cv=0.005, chunk=200, bg_sigma=4, start=0):
     """Per-pixel G(τ)=C(τ)/C(0), CV² and mean WITHOUT holding the whole video in RAM.
 
     Reads the TIFF in time-blocks, bins, removes a per-frame smooth background
@@ -414,7 +414,7 @@ def streaming_acf(tif_path, recon_taus, n_frames=None, bin_factor=2,
         try:    total = int(tf.series[0].shape[0])
         except Exception: total = len(tf.pages)
     H0, W0 = tifffile.imread(tif_path, key=0).shape
-    n_total = min(n_frames or total, total)
+    n_total = min(n_frames or (total - start), total - start)    # stream [start, start+n_total)
     Hb, Wb = H0 // bin_factor, W0 // bin_factor; Hc, Wc = Hb * bin_factor, Wb * bin_factor
 
     def _read(s, e):
@@ -428,8 +428,8 @@ def streaming_acf(tif_path, recon_taus, n_frames=None, bin_factor=2,
     S = np.zeros((Hb, Wb), np.float64); S2 = np.zeros_like(S); n = 0
     Sx = np.zeros((Hb, Wb, K), np.float64); cnt = np.zeros(K)
     buf = None
-    for start in range(0, n_total, chunk):
-        ch = _read(start, min(start + chunk, n_total))
+    for s0 in range(0, n_total, chunk):
+        ch = _read(start + s0, start + min(s0 + chunk, n_total))
         S += ch.sum(0); S2 += (ch ** 2).sum(0); n += ch.shape[0]
         ext = ch if buf is None else np.concatenate([buf, ch], 0)
         off = 0 if buf is None else buf.shape[0]           # global-new frames start here in ext

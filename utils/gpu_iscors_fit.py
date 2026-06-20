@@ -387,3 +387,63 @@ if __name__ == "__main__":
     print(f"  γ MAE={ (gfit-gamma_true).abs().mean():.4f}   "
           f"α MAE={ (afit-alpha_true).abs().mean():.4f}   "
           f"R² mean={np.nanmean(out['r2']):.3f}")
+
+
+# ───────────────────── streaming ACF (RAM-capped, long videos) ──────────────
+def streaming_acf(tif_path, recon_taus, n_frames=None, bin_factor=2,
+                  min_cv=0.005, chunk=200, bg_sigma=4):
+    """Per-pixel G(τ)=C(τ)/C(0), CV² and mean WITHOUT holding the whole video in RAM.
+
+    Reads the TIFF in time-blocks, bins, removes a per-frame smooth background
+    (ff/gaussian — the only spatial normalisation that does NOT cancel in the ratio),
+    and accumulates ΣI, ΣI², and Σ_t I(t)I(t+τ) with a rolling buffer that bridges
+    block boundaries so every (t, t+τ) pair is counted exactly once.
+
+    Note: the per-pixel *temporal* flat-field (÷ median over t) cancels in the ratio
+    C(τ)/C(0), so g_norm matches the full-load pipeline; CV² here uses the per-pixel
+    mean of the per-frame-BG'd frames.
+
+    RAM ≈ one block (chunk × H × W) + buffer (max τ × H × W) + (H × W × K) accumulators.
+
+    Returns (g_norm (H,W,K) float32, cell_mask (H,W) bool, c0 (H,W) float32, mean (H,W) float32).
+    """
+    import numpy as np, tifffile
+    from scipy.ndimage import gaussian_filter
+    taus = [int(t) for t in recon_taus]; K = len(taus); tmax = max(taus)
+    with tifffile.TiffFile(tif_path) as tf:
+        try:    total = int(tf.series[0].shape[0])
+        except Exception: total = len(tf.pages)
+    H0, W0 = tifffile.imread(tif_path, key=0).shape
+    n_total = min(n_frames or total, total)
+    Hb, Wb = H0 // bin_factor, W0 // bin_factor; Hc, Wc = Hb * bin_factor, Wb * bin_factor
+
+    def _read(s, e):
+        ch = tifffile.imread(tif_path, key=range(s, e)).astype(np.float32)
+        ch = ch[:, :Hc, :Wc].reshape(e - s, Hb, bin_factor, Wb, bin_factor).mean((2, 4))
+        out = np.empty_like(ch)
+        for i in range(ch.shape[0]):                       # per-frame BG removal (streamable)
+            out[i] = ch[i] / (gaussian_filter(ch[i], bg_sigma) + 1e-10)
+        return out
+
+    S = np.zeros((Hb, Wb), np.float64); S2 = np.zeros_like(S); n = 0
+    Sx = np.zeros((Hb, Wb, K), np.float64); cnt = np.zeros(K)
+    buf = None
+    for start in range(0, n_total, chunk):
+        ch = _read(start, min(start + chunk, n_total))
+        S += ch.sum(0); S2 += (ch ** 2).sum(0); n += ch.shape[0]
+        ext = ch if buf is None else np.concatenate([buf, ch], 0)
+        off = 0 if buf is None else buf.shape[0]           # global-new frames start here in ext
+        L = ext.shape[0]
+        for ki, t in enumerate(taus):
+            j0 = max(off, t)                                # later index of each new pair
+            if j0 < L:
+                later = ext[j0:L]; earlier = ext[j0 - t:L - t]
+                Sx[:, :, ki] += (earlier * later).sum(0); cnt[ki] += later.shape[0]
+        buf = ext[-tmax:] if L >= tmax else ext
+    mean = (S / n).astype(np.float32); c0 = (S2 / n - (S / n) ** 2).astype(np.float32)
+    cell = (np.sqrt(np.clip(c0, 0, None)) / (np.abs(mean) + 1e-10)) >= min_cv
+    g = np.zeros((Hb, Wb, K), np.float32)
+    for ki in range(K):
+        g[:, :, ki] = (Sx[:, :, ki] / cnt[ki] - (S / n) ** 2) / (c0 + 1e-10)
+    g[~cell] = 0.0
+    return g, cell, c0, mean

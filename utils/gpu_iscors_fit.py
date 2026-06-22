@@ -416,14 +416,15 @@ def streaming_acf(tif_path, recon_taus, n_frames=None, bin_factor=2,
     H0, W0 = tifffile.imread(tif_path, key=0).shape
     n_total = min(n_frames or (total - start), total - start)    # stream [start, start+n_total)
     Hb, Wb = H0 // bin_factor, W0 // bin_factor; Hc, Wc = Hb * bin_factor, Wb * bin_factor
+    chunk = max(8, min(chunk, 48_000_000 // (H0 * W0)))         # cap per-chunk RAM (~independent of frame size)
 
     def _read(s, e):
-        ch = tifffile.imread(tif_path, key=range(s, e)).astype(np.float32)
-        ch = ch[:, :Hc, :Wc].reshape(e - s, Hb, bin_factor, Wb, bin_factor).mean((2, 4))
-        out = np.empty_like(ch)
-        for i in range(ch.shape[0]):                       # per-frame BG removal (streamable)
-            out[i] = ch[i] / (gaussian_filter(ch[i], bg_sigma) + 1e-10)
-        return out
+        ch = tifffile.imread(tif_path, key=range(s, e))         # native dtype (e.g. uint16) — half the RAM
+        if ch.ndim == 2: ch = ch[None]                         # single-frame slice safety
+        ch = ch[:, :Hc, :Wc].reshape(ch.shape[0], Hb, bin_factor, Wb, bin_factor).mean((2, 4)).astype(np.float32)
+        for i in range(ch.shape[0]):                            # per-frame BG removal, in place
+            ch[i] /= (gaussian_filter(ch[i], bg_sigma) + 1e-10)
+        return ch
 
     S = np.zeros((Hb, Wb), np.float64); S2 = np.zeros_like(S); n = 0
     Sx = np.zeros((Hb, Wb, K), np.float64); cnt = np.zeros(K)

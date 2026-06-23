@@ -410,16 +410,22 @@ def streaming_acf(tif_path, recon_taus, n_frames=None, bin_factor=2,
     import numpy as np, tifffile
     from scipy.ndimage import gaussian_filter
     taus = [int(t) for t in recon_taus]; K = len(taus); tmax = max(taus)
-    with tifffile.TiffFile(tif_path) as tf:
-        try:    total = int(tf.series[0].shape[0])
-        except Exception: total = len(tf.pages)
-    H0, W0 = tifffile.imread(tif_path, key=0).shape
+    mm_arr = None
+    try:
+        mm_arr = tifffile.memmap(tif_path)                     # lazy (T,H,W); slicing loads ONLY what we index
+        if mm_arr.ndim == 2: mm_arr = mm_arr[None]
+        total = mm_arr.shape[0]
+    except Exception:                                          # compressed TIFF → fall back to keyed reads
+        with tifffile.TiffFile(tif_path) as tf:
+            try:    total = int(tf.series[0].shape[0])
+            except Exception: total = len(tf.pages)
+    H0, W0 = (mm_arr.shape[1], mm_arr.shape[2]) if mm_arr is not None else tifffile.imread(tif_path, key=0).shape
     n_total = min(n_frames or (total - start), total - start)    # stream [start, start+n_total)
     Hb, Wb = H0 // bin_factor, W0 // bin_factor; Hc, Wc = Hb * bin_factor, Wb * bin_factor
     chunk = max(8, min(chunk, 48_000_000 // (H0 * W0)))         # cap per-chunk RAM (~independent of frame size)
 
     def _read(s, e):
-        ch = tifffile.imread(tif_path, key=range(s, e))         # native dtype (e.g. uint16) — half the RAM
+        ch = np.asarray(mm_arr[s:e]) if mm_arr is not None else tifffile.imread(tif_path, key=range(s, e))
         if ch.ndim == 2: ch = ch[None]                         # single-frame slice safety
         ch = ch[:, :Hc, :Wc].reshape(ch.shape[0], Hb, bin_factor, Wb, bin_factor).mean((2, 4)).astype(np.float32)
         for i in range(ch.shape[0]):                            # per-frame BG removal, in place

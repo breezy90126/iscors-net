@@ -64,11 +64,23 @@ def _parabolic_peak(win):
     return dy, dx, conf
 
 
+def _hann2d(patch, device):
+    w1 = torch.hann_window(patch, periodic=False, device=device)
+    win = torch.outer(w1, w1)
+    win = win / win.mean().clamp(min=1e-8)          # keep patch energy roughly unchanged
+    return win
+
+
 def compute_patch_transport(video, tau, patch=24, stride=None, mask=None,
-                             max_shift=None, min_valid_frac=0.6, device=None):
+                             max_shift=None, min_valid_frac=0.6, window=True, device=None):
     """Per-patch displacement vector at lag tau via FFT phase correlation.
 
     video : (T,H,W) array/tensor.
+    window: apply a 2D Hann taper to each patch before the FFT. FFT assumes periodic
+            boundaries, so an un-windowed patch leaks the edge discontinuity (strong at
+            e.g. a cell-boundary illumination halo) into the cross-power spectrum's
+            phase and can bias or swamp the true peak. Default True; set False only to
+            reproduce/diagnose the un-windowed behaviour.
     Returns dict(dy, dx, mag, conf, valid) — each an (R,C) numpy grid (NaN where
     the patch was skipped: not enough cell-mask coverage, or fewer than 8 usable t).
     """
@@ -96,6 +108,7 @@ def compute_patch_transport(video, tau, patch=24, stride=None, mask=None,
         return dict(dy=dy, dx=dx, mag=mag, conf=conf, valid=valid,
                     ys=np.array(ys), xs=np.array(xs))
     cy = cx = patch // 2
+    win2d = _hann2d(patch, device) if window else None
 
     for i, y0 in enumerate(ys):
         for j, x0 in enumerate(xs):
@@ -104,6 +117,8 @@ def compute_patch_transport(video, tau, patch=24, stride=None, mask=None,
                 if frac < min_valid_frac:
                     continue
             stack = dI[:, y0:y0 + patch, x0:x0 + patch]
+            if win2d is not None:
+                stack = stack * win2d.unsqueeze(0)
             F = torch.fft.fft2(stack)
             cross = (F[:n] * torch.conj(F[tau:])).mean(dim=0)
             phase = cross / cross.abs().clamp(min=1e-8)
@@ -200,7 +215,7 @@ def _local_coherence(dy, dx, valid, rng, n_shuffle=200):
 def ot_probe(video, taus, patch=24, stride=None, mask=None,
              density_map=None, gamma_map=None, n_shuffle=200,
              r_reproducible=0.4, r_independent=0.3, z_coherent=3.0,
-             device=None, seed=0, verbose=True):
+             window=True, device=None, seed=0, verbose=True):
     """Cheap directional-transport feasibility gate (see module docstring).
 
     video       : (T,H,W).
@@ -209,6 +224,8 @@ def ot_probe(video, taus, patch=24, stride=None, mask=None,
     mask        : optional (H,W) bool cell mask (restrict patches to the cell).
     density_map, gamma_map : optional (H,W) CV² / gamma maps (e.g. from
                   utils.gpu_iscors_fit) for the independence check. Skipped if None.
+    window      : Hann-taper each patch before the FFT (see compute_patch_transport).
+                  Set False only to diagnose/reproduce the un-windowed behaviour.
 
     Returns a dict with the full/half-split fields plus:
       r_half        : half-split reproducibility of transport magnitude.
@@ -224,13 +241,16 @@ def ot_probe(video, taus, patch=24, stride=None, mask=None,
     rng = np.random.default_rng(seed)
 
     if verbose:
-        print(f"[OT probe] {T} frames, patch={patch}, taus={taus} ...")
-    full_fields = [compute_patch_transport(v, t, patch, stride, mask, device=device) for t in taus]
+        print(f"[OT probe] {T} frames, patch={patch}, taus={taus}, window={window} ...")
+    full_fields = [compute_patch_transport(v, t, patch, stride, mask, window=window, device=device)
+                   for t in taus]
     full = _combine_taus(full_fields)
 
     h = T // 2
-    h1_fields = [compute_patch_transport(v[:h], t, patch, stride, mask, device=device) for t in taus]
-    h2_fields = [compute_patch_transport(v[h:2 * h], t, patch, stride, mask, device=device) for t in taus]
+    h1_fields = [compute_patch_transport(v[:h], t, patch, stride, mask, window=window, device=device)
+                 for t in taus]
+    h2_fields = [compute_patch_transport(v[h:2 * h], t, patch, stride, mask, window=window, device=device)
+                 for t in taus]
     half1 = _combine_taus(h1_fields)
     half2 = _combine_taus(h2_fields)
 
@@ -276,6 +296,32 @@ def ot_probe(video, taus, patch=24, stride=None, mask=None,
                 coherent=coherent, resolved=resolved)
 
 
+def inject_coherent_drift(video, vy=0.1, vx=0.05, amp=0.5, device=None):
+    """Positive control: blend a progressively-shifted copy of the SAME video into
+    itself, i.e. out[t] = video[t] + amp*(shift(video[t], t*vy, t*vx) - video[t]).
+
+    This embeds a known, coherent, sub-pixel-per-frame drift directly into the real
+    noise/texture statistics of the footage. Run ot_probe on the output: if it does
+    NOT flip to reproducible+coherent, the pipeline (windowing, patch/tau scale, SNR)
+    — not the absence of real transport — is why the un-injected video was NO-GO.
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    v = _to_t(video, device)
+    T, H, W = v.shape
+    yy, xx = torch.meshgrid(torch.linspace(-1, 1, H, device=device),
+                            torch.linspace(-1, 1, W, device=device), indexing='ij')
+    out = v.clone()
+    for t in range(T):
+        dy, dx = t * vy, t * vx
+        grid = torch.stack([xx - 2 * dx / max(W - 1, 1), yy - 2 * dy / max(H - 1, 1)], dim=-1).unsqueeze(0)
+        shifted = torch.nn.functional.grid_sample(
+            v[t].view(1, 1, H, W), grid, mode='bilinear', padding_mode='reflection', align_corners=True
+        ).view(H, W)
+        out[t] = v[t] + amp * (shifted - v[t])
+    return out.cpu().numpy()
+
+
 if __name__ == "__main__":
     # ── Self-test 1: coherent sub-patch drift (all patches share one global drift
     # direction) + noise -> expect reproducible ∧ coherent. Independence is trivially
@@ -299,4 +345,34 @@ if __name__ == "__main__":
     vid2 = 50.0 + 3.0 * rng.standard_normal((T, H, W)).astype(np.float32)
     out2 = ot_probe(vid2, taus=(4, 8, 16), patch=24, verbose=True)
     assert not out2['resolved'], "pure-noise synthetic must NOT pass the gate"
-    print("pure-noise synthetic: correctly NOT resolved -> OK")
+    print("pure-noise synthetic: correctly NOT resolved -> OK\n")
+
+    # ── Self-test 3: same coherent drift, but each patch has a strong edge
+    # discontinuity (a bright halo ring, like a cell-boundary illumination artifact)
+    # that an un-windowed FFT leaks into the phase. Demonstrates window=True recovers
+    # the real drift that window=False can miss/attenuate -- the positive-control
+    # logic behind inject_coherent_drift, used the same way on real footage.
+    yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
+    r = np.sqrt((yy - H / 2) ** 2 + (xx - W / 2) ** 2)
+    halo = 40.0 * np.exp(-((r - 30) ** 2) / (2 * 3.0 ** 2))          # sharp bright ring
+    vid3 = np.empty((T, H, W), np.float32)
+    for t in range(T):
+        vid3[t] = nd_shift(base, (vy * t, vx * t), mode='wrap') + 0.3 * rng.standard_normal((H, W))
+        vid3[t] += 50.0 + halo
+    out_w  = ot_probe(vid3, taus=(4, 8, 16), patch=24, window=True,  verbose=False)
+    out_nw = ot_probe(vid3, taus=(4, 8, 16), patch=24, window=False, verbose=False)
+    print(f"halo+drift synthetic: window=True  -> reproducible={out_w['reproducible']}  "
+          f"coherent={out_w['coherent']} (z={out_w['coherence']['z']:.2f})")
+    print(f"halo+drift synthetic: window=False -> reproducible={out_nw['reproducible']}  "
+          f"coherent={out_nw['coherent']} (z={out_nw['coherence']['z']:.2f})")
+    assert out_w['resolved'], "windowed probe should still recover the real drift despite the edge halo"
+
+    # ── Self-test 4: inject_coherent_drift positive control on a NO-signal video --
+    # after injection the probe must flip to resolved=True, proving the pipeline
+    # itself can detect a known transport when one is actually present.
+    quiet = 50.0 + 1.0 * rng.standard_normal((T, H, W)).astype(np.float32)
+    injected = inject_coherent_drift(quiet, vy=0.12, vx=0.08, amp=0.8)
+    out_inj = ot_probe(injected, taus=(4, 8, 16), patch=24, verbose=False)
+    assert out_inj['resolved'], "pipeline must recover a known injected drift (positive control)"
+    print(f"positive-control injection: resolved={out_inj['resolved']}  "
+          f"r_half={out_inj['r_half']:.2f}  coherence_z={out_inj['coherence']['z']:.2f}  -> OK")

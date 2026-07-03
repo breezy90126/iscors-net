@@ -19,8 +19,3 @@ build/
 # IDE
 .vscode/
 .idea/
-
-# Project-specific
-FAST/
-checkpoint/*.pth
-data/train/

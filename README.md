@@ -37,5 +37,5 @@ over it. This branch keeps only what `iscors_deliverable.ipynb` actually runs.
 pip install -r requirements.txt
 ```
 
-Then open `iscors_deliverable.ipynb`, set the paths in the config cell (video zip/tif,
+Then open `iscors_deliverable.ipynb`, set the paths in the config cell (video zip/tif/npz,
 mask), and run top to bottom.

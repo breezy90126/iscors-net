@@ -29,14 +29,14 @@ RECON_TAUS = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)
 GAMMA_SCALE = 2.0
 CONDENSATION_SLOPE = 3.0
 
-# group label -> (left cmap, right cmap). ICA comp 2 uses a reversed scale
-# to match how it renders in iscors_deliverable.ipynb.
+# group label -> (left cmap, right cmap). Same colormap pair for every
+# group; ICA comp 2's *values* (not the colormap) get negated below.
 GROUP_CMAPS = {
     '1/D* + CV²':                    ('coolwarm', 'viridis'),
     'slope=3 condensation':          ('coolwarm', 'viridis'),
     'reliability-max axis（最大重複軸）': ('coolwarm', 'viridis'),
     'GEVD':                          ('coolwarm', 'viridis'),
-    'ICA（de-nuisance）':             ('coolwarm', 'viridis_r'),
+    'ICA（de-nuisance）':             ('coolwarm', 'viridis'),
 }
 GROUP_NAMES = list(GROUP_CMAPS)
 
@@ -201,7 +201,9 @@ def compute_axis_pairs(video_path, mask_path, n_frames, bin_factor, start_frame,
     if other[nucleoli].mean()      > other[~nucleoli].mean():      other      = -other
 
     pairs['GEVD'] = [('G(tau) GEVD axis 1', full(pj[:, 0])), ('G(tau) GEVD axis 2', full(pj[:, 1]))]
-    pairs['ICA（de-nuisance）'] = [('ICA comp 1', full(other)), ('ICA comp 2 (condensate)', full(condensate))]
+    # comp 2's sign is flipped for display (nucleoli-blue forced it negative
+    # above; the notebook view of this axis reads better nucleoli-positive)
+    pairs['ICA（de-nuisance）'] = [('ICA comp 1', full(other)), ('ICA comp 2 (condensate)', full(-condensate))]
 
     del F1, F2, Ff, W, S, Dr; gc.collect()
     return pairs, nuc

@@ -249,8 +249,20 @@ def on_run(video_path, mask_path, n_frames, bin_factor, start_frame, group_name,
 with gr.Blocks(title='iSCORS axes viewer') as demo:
     gr.Markdown(
         '# iSCORS 軸檢視器\n'
-        '上傳一支 iSCAT 影片，套用 `iscors_deliverable.ipynb` 的三段分析'
-        '（論文復刻 / 單細胞最重複軸 / GEVD-ICA 去雜訊），挑一組軸看它的左右兩張圖。'
+        '重現並延伸 Hsiao *et al.*, '
+        '[*Probing chromatin condensation dynamics in live cells using '
+        'interferometric scattering correlation spectroscopy*]'
+        '(https://doi.org/10.1038/s42003-024-06457-2), '
+        '**Communications Biology** 7:763 (2024)。\n\n'
+        '**論文原本的呈現方式**（對應下面「1/D\\* + CV²」「slope=3 condensation」兩組）：'
+        '把每個像素的動態光散射訊號變異量 V_DLS（本 app 稱 **CV²**）與表觀擴散係數倒數 '
+        '**1/D\\***，畫成 log-log 散佈圖，資料點落在**斜率為 3** 的直線上'
+        '（V_DLS ∝ (1/D\\*)³），並把資料點**投影到這條線上的位置**當作染色質凝聚程度指標——'
+        '論文用它偵測轉錄抑制、ATP 耗竭等處理造成的凝聚態改變，並用奈米粒子膠體資料驗證同一個模型。\n\n'
+        '**論文之外的延伸**（`reliability-max axis`、`GEVD`、`ICA（de-nuisance）`三組）：'
+        '這個 repo 用 cross-half 可複現性檢驗（廣義特徵分解）額外找候選軸，'
+        '結論是穩健、可複現的生物軸大約只有這一條（核仁/密度），細節見 `RETROSPECTIVE_session.md`。\n\n'
+        '上傳一支 iSCAT 影片，挑一組軸看它的左右兩張圖。'
     )
     with gr.Row():
         with gr.Column(scale=1):

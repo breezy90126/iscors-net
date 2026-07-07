@@ -19,7 +19,13 @@ G(τ) = A / (1 + γ · τ^α)
 - `utils/traditional_iscors.py` — reference CPU/`scipy.optimize.curve_fit` implementation
   of the same fit, used for cross-checks.
 - `data/condensation_mask.tif` — nucleus/condensation mask used by the deliverable.
-- `papers/PMC11196589.pdf` — background reference paper.
+- `papers/PMC11196589.pdf` — Hsiao *et al.*, "Probing chromatin condensation dynamics in
+  live cells using interferometric scattering correlation spectroscopy," *Communications
+  Biology* 7:763 (2024), doi:10.1038/s42003-024-06457-2. Section 1 of the notebook
+  replicates its V_DLS–1/D* slope-3 condensation projection; Sections 2-3 are extensions
+  beyond the paper (see `RETROSPECTIVE_session.md`).
+- `app.py` — Gradio front-end for the same pipeline (upload a video, pick one of the
+  five axis-pair groups), meant for deployment as a Hugging Face Space.
 
 ## History note
 

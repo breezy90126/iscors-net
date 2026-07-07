@@ -274,9 +274,9 @@ with gr.Blocks(title='iSCORS axes viewer') as demo:
                 start_in   = gr.Number(value=0,    precision=0, label='起始 frame')
                 nframes_in = gr.Number(value=5000, precision=0, label='幀數')
                 bin_in     = gr.Number(value=2,    precision=0, label='bin factor')
-            group_dd = gr.Dropdown(GROUP_NAMES, value=GROUP_NAMES[0], label='要看的軸')
             run_btn  = gr.Button('載入並計算', variant='primary')
         with gr.Column(scale=2):
+            group_dd = gr.Dropdown(GROUP_NAMES, value=GROUP_NAMES[0], label='要看的軸')
             with gr.Row():
                 plot1 = gr.Plot(label='左')
                 plot2 = gr.Plot(label='右')

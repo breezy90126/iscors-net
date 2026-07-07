@@ -40,6 +40,24 @@ GROUP_CMAPS = {
 }
 GROUP_NAMES = list(GROUP_CMAPS)
 
+# group label -> short note shown under the dropdown: which groups replicate
+# the paper's cross-nucleus slope=3 statistic vs. this repo's own within-
+# nucleus, per-pixel extension (same tool family as PCA, different
+# statistical population -- not a correction of the paper).
+GROUP_NOTES = {
+    '1/D* + CV²':
+        '[論文原本] 跨核（population）統計：每顆核是一個資料點。',
+    'slope=3 condensation':
+        '[論文原本] 跨核（population）統計：每顆核平均成一點，slope=3 投影。',
+    'reliability-max axis（最大重複軸）':
+        '[本 repo 延伸] 單核內、逐像素統計：同一顆核裡每個像素是一個資料點，'
+        '跟論文的跨核 slope=3 不是同一個統計母體，不衝突。',
+    'GEVD':
+        '[本 repo 延伸] 單核內、逐像素統計（同上，跟 PCA 同一類工具，不同統計母體）。',
+    'ICA（de-nuisance）':
+        '[本 repo 延伸] 單核內、逐像素統計（同上）。',
+}
+
 
 # ───────────────────────── loaders (same logic as the notebook) ─────────────
 def load_video(path, fname=None, n_frames=2000, bin_factor=2, start_frame=0):
@@ -227,11 +245,12 @@ def _plot(name, data, cmap):
 
 
 def render_group(group_name):
+    note = GROUP_NOTES.get(group_name, '')
     if not group_name or group_name not in _STATE['pairs']:
-        return None, None
+        return None, None, note
     (n1, d1), (n2, d2) = _STATE['pairs'][group_name]
     c1, c2 = GROUP_CMAPS.get(group_name, ('coolwarm', 'viridis'))
-    return _plot(n1, d1, c1), _plot(n2, d2, c2)
+    return _plot(n1, d1, c1), _plot(n2, d2, c2), note
 
 
 def on_run(video_path, mask_path, n_frames, bin_factor, start_frame, group_name,
@@ -283,12 +302,14 @@ with gr.Blocks(title='iSCORS axes viewer') as demo:
             run_btn  = gr.Button('載入並計算', variant='primary')
         with gr.Column(scale=2):
             group_dd = gr.Dropdown(GROUP_NAMES, value=GROUP_NAMES[0], label='要看的軸')
+            group_note = gr.Markdown(GROUP_NOTES[GROUP_NAMES[0]])
             with gr.Row():
                 plot1 = gr.Plot(label='左')
                 plot2 = gr.Plot(label='右')
 
-    run_btn.click(on_run, [video_in, mask_in, nframes_in, bin_in, start_in, group_dd], [plot1, plot2])
-    group_dd.change(render_group, group_dd, [plot1, plot2])
+    run_btn.click(on_run, [video_in, mask_in, nframes_in, bin_in, start_in, group_dd],
+                  [plot1, plot2, group_note])
+    group_dd.change(render_group, group_dd, [plot1, plot2, group_note])
 
 if __name__ == '__main__':
     demo.launch()

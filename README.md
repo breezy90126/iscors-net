@@ -4,6 +4,9 @@ Classical (no-ML) GPU-batched iSCORS analysis of iSCAT video: per-pixel autocorr
 G(τ) fitting to recover γ (diffusion) and derived condensation/reliability maps, plus a
 Colab deliverable notebook that runs the full pipeline end to end.
 
+**Live demo:** [huggingface.co/spaces/breezy90126/iscors-viewer](https://huggingface.co/spaces/breezy90126/iscors-viewer)
+— upload a video, pick one of five axis-pair groups, get the left/right map pair.
+
 ```
 G(τ) = A / (1 + γ · τ^α)
 ```
@@ -25,7 +28,8 @@ G(τ) = A / (1 + γ · τ^α)
   replicates its V_DLS–1/D* slope-3 condensation projection; Sections 2-3 are extensions
   beyond the paper (see `RETROSPECTIVE_session.md`).
 - `app.py` — Gradio front-end for the same pipeline (upload a video, pick one of the
-  five axis-pair groups), meant for deployment as a Hugging Face Space.
+  five axis-pair groups), deployed as a Hugging Face Space:
+  [breezy90126/iscors-viewer](https://huggingface.co/spaces/breezy90126/iscors-viewer).
 
 ## History note
 

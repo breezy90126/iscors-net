@@ -206,29 +206,47 @@ def exp3_alpha_is_width(noise_rms):
 
 
 # ───────────── EXP 4 — two populations vs one (gamma, alpha) ────────────────
-def fit_gamma_alpha(g):
-    """Least-squares fit of the pipeline's 1-component model (grid then refine)."""
-    best = (1e9, GAMMA0, ALPHA0)
-    for gi in range(-40, 21):
-        gam = 10 ** (gi / 10.0)
-        for ai in range(4, 41):
-            al = ai / 20.0
-            r = sum((g[k] - model(TAUS[k], gam, al)) ** 2 for k in range(K))
+def narrow_search(objective, box, n=13, rounds=9):
+    """Minimise `objective` over a box by successive grid narrowing.
+
+    Coordinate descent stalls badly here (it overestimated the residual by up to
+    7x on near-single-component mixtures, which would make a mixture look far
+    more detectable than it is). Narrowing converges geometrically and is
+    cheap enough at this size: rounds * n^d evaluations.
+    """
+    lo = [b[0] for b in box]
+    hi = [b[1] for b in box]
+    best = (float("inf"), None)
+    for _ in range(rounds):
+        steps = [(hi[d] - lo[d]) / (n - 1) for d in range(len(box))]
+        idx = [0] * len(box)
+        while True:
+            pt = [lo[d] + idx[d] * steps[d] for d in range(len(box))]
+            r = objective(pt)
             if r < best[0]:
-                best = (r, gam, al)
-    _, gam, al = best
-    for scale in (0.3, 0.1, 0.03, 0.01):
-        for _ in range(60):
-            improved = False
-            for dg, da in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                gg = gam * (1 + scale * dg)
-                aa = max(0.05, min(2.0, al + scale * da * 0.5))
-                r = sum((g[k] - model(TAUS[k], gg, aa)) ** 2 for k in range(K))
-                if r < best[0]:
-                    best, gam, al, improved = (r, gg, aa), gg, aa, True
-            if not improved:
+                best = (r, pt[:])
+            d = 0
+            while d < len(box):
+                idx[d] += 1
+                if idx[d] < n:
+                    break
+                idx[d] = 0
+                d += 1
+            if d == len(box):
                 break
-    return math.sqrt(best[0] / K), best[1], best[2]
+        for d in range(len(box)):                       # shrink around the winner
+            half = 1.5 * steps[d]
+            lo[d], hi[d] = best[1][d] - half, best[1][d] + half
+    return best
+
+
+def fit_gamma_alpha(g):
+    """Least-squares fit of the pipeline's 1-component model. Returns (rms, gamma, alpha)."""
+    def obj(p):
+        gam, al = 10 ** p[0], min(2.0, max(0.05, p[1]))
+        return sum((g[k] - model(TAUS[k], gam, al)) ** 2 for k in range(K))
+    sse, p = narrow_search(obj, [(-4.0, 2.0), (0.05, 2.0)])
+    return math.sqrt(sse / K), 10 ** p[0], min(2.0, max(0.05, p[1]))
 
 
 def exp4_two_populations(noise_rms):
@@ -264,20 +282,15 @@ def exp4b_pixel_averaging(resid, noise_rms=0.0413):
 def exp5_alpha_vs_mixture(noise_rms):
     print("\n=== EXP 5 — is 'anomalous alpha' distinguishable from 'a mixture'? ===")
     g = [model(t, GAMMA0, 0.6) for t in TAUS]
-    best = (1e9, 0.0, 0.0, 0.0)
-    for i in range(-35, 16):
-        gs = 10 ** (i / 10.0)
-        for j in range(i + 1, 26):
-            gf = 10 ** (j / 10.0)
-            for fi in range(1, 20):
-                f = fi / 20.0
-                r = sum((g[k] - (f * model(TAUS[k], gf, 1.0)
-                                 + (1 - f) * model(TAUS[k], gs, 1.0))) ** 2 for k in range(K))
-                if r < best[0]:
-                    best = (r, gs, gf, f)
-    r = math.sqrt(best[0] / K)
+
+    def obj(p):
+        gs, gf, f = 10 ** p[0], 10 ** p[1], min(1.0, max(0.0, p[2]))
+        return sum((g[k] - (f * model(TAUS[k], gf, 1.0)
+                            + (1 - f) * model(TAUS[k], gs, 1.0))) ** 2 for k in range(K))
+    sse, p = narrow_search(obj, [(-4.0, 1.0), (-4.0, 1.0), (0.0, 1.0)], n=11, rounds=9)
+    r = math.sqrt(sse / K)
     print(f"    alpha=0.6 curve, best 2-exponential (alpha=1) mixture:")
-    print(f"      gamma_slow={best[1]:.4f}  gamma_fast={best[2]:.4f}  f={best[3]:.2f}")
+    print(f"      gamma_slow={10 ** p[0]:.4f}  gamma_fast={10 ** p[1]:.4f}  f={p[2]:.2f}")
     print(f"      residual {r:.5f}  vs per-pixel noise {noise_rms:.4f}  ->  "
           f"{'INDISTINGUISHABLE' if r < noise_rms else 'distinguishable'}")
 

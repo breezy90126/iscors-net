@@ -24,6 +24,11 @@ Numpy only (no torch) — these are K-vectors, not videos.
 
 import numpy as np
 
+# Measured by scripts/finite_t_bias.py at T=2500 (uncorrected sample-mean ACF):
+# the RMS bias on G(tau), and the 1-component residual it produces on its own.
+FINITE_T_BIAS_RMS = 0.0257
+FINITE_T_RESID_UNCORRECTED = 0.0068
+
 
 # ───────────────────────────── rate grid / kernel ───────────────────────────
 def rate_grid(taus, n=80, pad=3.0):
@@ -209,6 +214,22 @@ def roi_spectrum(G, mask, taus, G1=None, G2=None, smooth=0.3, n_iter=4000):
     out["verdict"] = ("single population / no evidence for split: " + "; ".join(reasons)
                       if reasons else
                       f"{out['n_peaks']} reproducible peak(s) beyond the 1-component fit")
+
+    # The systematic that half-splitting cannot see. Averaging pixels drops the
+    # statistical noise as 1/sqrt(N) but leaves the finite-T bias untouched, so on
+    # a large ROI the bias — not the noise — is what a residual has to beat.
+    # scripts/finite_t_bias.py measures RMS 0.0257 at T=2500 uncorrected, which by
+    # itself drives a 1-component residual of 0.0068: bigger than the signature of
+    # ANY mixture in the detectable range. Left uncorrected it depresses the slow
+    # tail, masking a real slow population and faking one if over-corrected.
+    out["bias_rms_uncorrected"] = FINITE_T_BIAS_RMS
+    out["bias_limited"] = bool(resid_1comp < FINITE_T_RESID_UNCORRECTED)
+    if out["bias_limited"]:
+        out["verdict"] += (f"  [WARNING: residual {resid_1comp:.4f} is below the "
+                           f"{FINITE_T_RESID_UNCORRECTED:.4f} that the uncorrected finite-T "
+                           f"bias alone produces at T=2500 — correct the bias before "
+                           f"reading anything into the slow end (see "
+                           f"docs/laplace_projection_alpha.md section 6.4)]")
     return out
 
 

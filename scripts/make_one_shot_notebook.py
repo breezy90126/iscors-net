@@ -1444,6 +1444,132 @@ def _d10():
     RESULT['D10'] = dict(verdict='ok', n_tiles=n_t, tile_px=tp, split=split, r_fast_share_halves=r_fs,
                          **{k + '_median': float(np.nanmedian(maps[k])) for k in ('slow_D', 'fast_D', 'fast_share')})""")
 
+# ─────────────────────────────── cell 9g : D11 ─────────────────────────────
+code(r"""# ══ D11 — fast / slow decomposition MOVIE + sliding-window fast-share movie ══
+# Splits every pixel's time trace into two bands, using the two D6 populations:
+#   tau_fast = 1/(D_fast q^2), tau_slow = 1/(D_slow q^2)   (frames; q = iPSF effective q)
+#   split at  W_SPLIT = sqrt(tau_fast * tau_slow)
+#   fast band = x - box(x, W_SPLIT)                 (flicker faster than the split)
+#   slow band = box(x, W_SPLIT) - box(x, HP_W)      (slow motion, drift > HP_W frames removed)
+# Outputs (in OUT_DIR, picked up by the zip cell):
+#   d11_band_maps.png      RMS of each band + fast-power share, and a half-split check of the share
+#   d11_slow_band.mp4      the slow band as a movie (every VID_SUB-th frame): you SEE the slow parts move
+#   d11_fast_share.mp4     fast-power share in a sliding window (VID_WIN frames, step VID_STEP)
+# Note: the band split is a picture of the two timescales, not a CONTIN fit: each band also
+# leaks a bit of the other population. The share map is reliable only where the half-split r is.
+VID_N    = 5000           # frames to load (from frame 0)
+VID_SUB  = 10             # slow-band movie: show every VID_SUB-th frame
+VID_WIN  = 500            # sliding window for the share movie (frames)
+VID_STEP = 50             # share movie step (frames)
+VID_FPS  = 20
+
+@guard('D11')
+def _d11():
+    import matplotlib.animation as animation
+    K_full, K_half, D_um = _d6_kernel()
+    q2, S, D_grid, dt = CACHE['d6_q2S']
+    q2e = ik.effective_q2(q2, S)
+    d6 = (RESULT.get('D6') or {}).get('filtered nucleus') or {}
+    run = min(d6['runs'], key=lambda r: r['resid'])
+    pk = sorted(p for _, p in sorted(zip(run['peak_mass'], run['peaks']), reverse=True)[:2])
+    Ds, Df = pk[0], pk[1]
+    d9 = RESULT.get('D9') or {}
+    if 'filtered nucleus' in d9 and np.isfinite(d9['filtered nucleus'].get('slow_pos_hp', np.nan)):
+        Ds = d9['filtered nucleus']['slow_pos_hp']          # drift-free slow D
+    tf_, ts_ = 1 / (Df * 1e-12 * q2e * dt), 1 / (Ds * 1e-12 * q2e * dt)
+    w_split = int(2 * round(np.sqrt(tf_ * ts_) / 2) + 1)
+    w_drift = int(HP_W) if HP_W else 1501
+    print(f'D_fast {Df:.3g}, D_slow {Ds:.3g} um^2/s -> tau_fast {tf_:.0f}, tau_slow {ts_:.0f} frames; '
+          f'split at {w_split} frames, drift cut {w_drift} frames')
+
+    raw = load_video(ZIP_PATH, VIDEO_FNAME, VID_N, BIN_FACTOR)
+    v = preprocess(raw); del raw; gc.collect()
+    T, H, W = v.shape
+    nuc = CACHE['nuc']
+    m_ = w_drift // 2
+    t_ok = np.arange(m_, T - m_)                       # frames with a full drift window
+    nb = len(t_ok) // VID_STEP                         # power in blocks of VID_STEP frames
+    t_blk = t_ok[:nb * VID_STEP]
+    slow_frames = np.zeros((len(t_ok[::VID_SUB]), H, W), np.float32)
+    Pf = np.zeros((nb, H, W), np.float32); Ps = np.zeros((nb, H, W), np.float32)
+    h = len(t_ok) // 2
+    P_half = {k: np.zeros((H, W)) for k in ('f1', 's1', 'f2', 's2')}
+    t = np.arange(T)
+    def _box(cs, w):
+        mm = w // 2; lo = np.clip(t - mm, 0, T); hi = np.clip(t + mm + 1, 0, T)
+        return (cs[hi] - cs[lo]) / (hi - lo)[:, None, None]
+    for r in range(0, H, 16):
+        blk = v[:, r:r + 16].astype(np.float64)
+        blk -= blk.mean(0, keepdims=True)
+        cs = np.concatenate([np.zeros((1,) + blk.shape[1:]), np.cumsum(blk, 0)], 0)
+        bs = _box(cs, w_split); bd = _box(cs, w_drift)
+        fast = (blk - bs)[t_ok]; slow = (bs - bd)[t_ok]
+        slow_frames[:, r:r + 16] = slow[::VID_SUB]
+        Pf[:, r:r + 16] = (fast[:nb * VID_STEP] ** 2).reshape(nb, VID_STEP, *fast.shape[1:]).mean(1)
+        Ps[:, r:r + 16] = (slow[:nb * VID_STEP] ** 2).reshape(nb, VID_STEP, *slow.shape[1:]).mean(1)
+        for k, sl in (('1', slice(0, h)), ('2', slice(h, None))):
+            P_half['f' + k][r:r + 16] = (fast[sl] ** 2).mean(0); P_half['s' + k][r:r + 16] = (slow[sl] ** 2).mean(0)
+    del v, blk, cs, bs, bd, fast, slow; gc.collect()
+
+    sm = lambda a: gaussian_filter(np.where(nuc, a, 0.0), 2) / np.maximum(gaussian_filter(nuc.astype(float), 2), 1e-6)
+    share = lambda pf, ps: np.where(nuc, sm(pf) / np.maximum(sm(pf) + sm(ps), 1e-30), np.nan)
+    Pf_all, Ps_all = Pf.mean(0), Ps.mean(0)
+    sh = share(Pf_all, Ps_all)
+    sh1, sh2 = share(P_half['f1'], P_half['s1']), share(P_half['f2'], P_half['s2'])
+    ok = np.isfinite(sh1) & np.isfinite(sh2)
+    r_half = float(np.corrcoef(sh1[ok], sh2[ok])[0, 1])
+    print(f'fast-power share map: median {np.nanmedian(sh):.2f}; half1 vs half2 r = {r_half:.2f}  '
+          f'(>0.5 = the spatial pattern is real)')
+
+    fig, ax = plt.subplots(1, 4, figsize=(18, 4.3))
+    for a, d, cm, tl in ((ax[0], np.where(nuc, np.sqrt(sm(Pf_all)), np.nan), 'magma', f'fast band RMS (< {w_split} fr)'),
+                         (ax[1], np.where(nuc, np.sqrt(sm(Ps_all)), np.nan), 'magma', f'slow band RMS ({w_split}-{w_drift} fr)'),
+                         (ax[2], sh, 'coolwarm', 'fast-power share'),
+                         (ax[3], sh1 - sh2, 'PiYG', f'share half1 - half2 (r = {r_half:.2f})')):
+        im = a.imshow(d, cmap=cm); plt.colorbar(im, ax=a, fraction=0.046); a.set_title(tl, fontsize=9); a.axis('off')
+    plt.tight_layout()
+    try: fig.savefig(os.path.join(_out_dir(), 'd11_band_maps.png'), dpi=120)
+    except Exception: pass
+    plt.show()
+
+    # movie 1: slow band (spatially smoothed), with the fast share contour for orientation
+    vmax = float(np.nanpercentile(np.abs(slow_frames[:, nuc]), 99))
+    fig, ax = plt.subplots(figsize=(5.5, 5.5))
+    sm1 = lambda a: np.where(nuc, gaussian_filter(a, 1), np.nan)
+    im = ax.imshow(sm1(slow_frames[0]), cmap='RdBu_r', vmin=-vmax, vmax=vmax); ax.axis('off')
+    ttl = ax.set_title('', fontsize=9)
+    def _upd(i):
+        im.set_data(sm1(slow_frames[i]))
+        ttl.set_text(f'slow band  t = {(t_ok[0] + i * VID_SUB) * dt:.2f} s  (every {VID_SUB} frames)')
+        return im, ttl
+    ani = animation.FuncAnimation(fig, _upd, frames=len(slow_frames), interval=1000 / VID_FPS, blit=False)
+    p1 = os.path.join(_out_dir(), 'd11_slow_band.mp4')
+    ani.save(p1, writer=animation.FFMpegWriter(fps=VID_FPS, bitrate=2400)); plt.close(fig)
+
+    # movie 2: sliding-window fast share
+    nw = VID_WIN // VID_STEP
+    frames2 = [share(Pf[i:i + nw].mean(0), Ps[i:i + nw].mean(0)) for i in range(0, nb - nw + 1)]
+    fig, ax = plt.subplots(figsize=(5.5, 5.5))
+    lo_, hi_ = np.nanpercentile(sh, 2), np.nanpercentile(sh, 98)
+    im2 = ax.imshow(frames2[0], cmap='coolwarm', vmin=lo_, vmax=hi_); ax.axis('off')
+    plt.colorbar(im2, ax=ax, fraction=0.046, label='fast-power share')
+    ttl2 = ax.set_title('', fontsize=9)
+    def _upd2(i):
+        im2.set_data(frames2[i])
+        t0s = t_blk[i * VID_STEP] * dt
+        ttl2.set_text(f'fast share, window {t0s:.2f}-{t0s + VID_WIN * dt:.2f} s')
+        return im2, ttl2
+    ani2 = animation.FuncAnimation(fig, _upd2, frames=len(frames2), interval=1000 / VID_FPS, blit=False)
+    p2 = os.path.join(_out_dir(), 'd11_fast_share.mp4')
+    ani2.save(p2, writer=animation.FFMpegWriter(fps=max(5, VID_FPS // 2), bitrate=2400)); plt.close(fig)
+    print('saved', p1, 'and', p2)
+    try:
+        from IPython.display import Video, display
+        display(Video(p1, embed=True, width=420)); display(Video(p2, embed=True, width=420))
+    except Exception: pass
+    RESULT['D11'] = dict(verdict='ok', D_fast=Df, D_slow=Ds, w_split=w_split, w_drift=w_drift,
+                         share_median=float(np.nanmedian(sh)), r_half=r_half)""")
+
 # ─────────────────────────────── cell 10 ───────────────────────────────────
 code(r"""# ══ scorecard: measured outcome vs the predictions registered in cell 0 ══
 def _fmt(ok):

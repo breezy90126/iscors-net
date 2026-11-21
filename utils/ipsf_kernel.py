@@ -205,7 +205,46 @@ def d_grid(taus, dt, q2_eff, n=80, pad=3.0):
     return np.logspace(np.log10(lo), np.log10(hi), n)
 
 
-def ipsf_kernel(taus, dt, q2, S, D=None, T=None, n_D=80, pad=3.0):
+def highpass_acf(c, W):
+    """Autocovariance after y_t = x_t - mean(x_{t-m..t+m}), W = 2m+1 (centred boxcar high-pass).
+
+    c : autocovariance of x at lags 0..L-1 (L should exceed the lags you need + W).
+    Cov_y = C - 2 (b*C) + (b*b*C), b the normalised boxcar (symmetric). Edges ignored.
+    Returns the filtered autocovariance at lags 0..L-W-1.
+    """
+    c = np.asarray(c, float)
+    m = int(W) // 2
+    W = 2 * m + 1
+    L = len(c)
+    full = np.r_[c[:0:-1], c]                           # lags -(L-1)..(L-1)
+    b = np.full(W, 1.0 / W)
+    bb = np.convolve(b, b)                              # triangle, length 2W-1
+    n = len(full) + len(bb) - 1
+    nfft = 1 << (n - 1).bit_length()
+    F = np.fft.rfft(full, nfft)
+    bc = np.fft.irfft(F * np.fft.rfft(b, nfft), nfft)[:len(full) + W - 1][m:m + len(full)]
+    bbc = np.fft.irfft(F * np.fft.rfft(bb, nfft), nfft)[:len(full) + 2 * W - 2][W - 1:W - 1 + len(full)]
+    y = full - 2 * bc + bbc
+    out = y[L - 1:]                                     # lags 0..L-1
+    return out[:L - W]
+
+
+def highpass_video_(v, W, chunk_rows=16):
+    """In-place centred boxcar high-pass along time of a (T, H, W) float array (edges: shrinking window)."""
+    m = int(W) // 2
+    T = v.shape[0]
+    t = np.arange(T)
+    lo = np.clip(t - m, 0, T); hi = np.clip(t + m + 1, 0, T)
+    cnt = (hi - lo).astype(np.float64)
+    for r in range(0, v.shape[1], chunk_rows):
+        blk = v[:, r:r + chunk_rows].astype(np.float64)
+        cs = np.concatenate([np.zeros((1,) + blk.shape[1:]), np.cumsum(blk, 0)], 0)
+        mean = (cs[hi] - cs[lo]) / cnt[:, None, None]
+        v[:, r:r + chunk_rows] = (blk - mean).astype(v.dtype)
+    return v
+
+
+def ipsf_kernel(taus, dt, q2, S, D=None, T=None, n_D=80, pad=3.0, highpass_W=None):
     """K[k, j] = expected normalised G(tau_k) for a population with diffusion D_j.
 
     Args:
@@ -215,6 +254,8 @@ def ipsf_kernel(taus, dt, q2, S, D=None, T=None, n_D=80, pad=3.0):
         D    : (M,) grid in m^2/s, or None for d_grid(...).
         T    : record length in frames. None = ideal ACF; an int = the finite-T
                expectation of the pipeline's estimator (recommended; docs section 6).
+        highpass_W : if set, the data were high-passed with a centred W-frame boxcar
+               (highpass_video_) before the estimator; the kernel applies the same filter.
     Returns (K, D) with K shape (len(taus), M).
     """
     taus = np.asarray(taus, int)
@@ -225,6 +266,9 @@ def ipsf_kernel(taus, dt, q2, S, D=None, T=None, n_D=80, pad=3.0):
     for j, Dj in enumerate(D):
         if T is None:
             K[:, j] = acf_ideal(taus, Dj, q2, S, dt)
+        elif highpass_W:
+            c = acf_ideal(np.arange(T + int(highpass_W) + 2), Dj, q2, S, dt)
+            K[:, j] = finite_t_expected(highpass_acf(c, highpass_W)[:T], taus, T)
         else:
             K[:, j] = finite_t_expected(acf_ideal(np.arange(T), Dj, q2, S, dt), taus, T)
     return K, D

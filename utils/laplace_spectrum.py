@@ -152,7 +152,8 @@ def fit_gamma_alpha(g, taus, gamma_scale=2.0):
 
 
 # ───────────────────────── the ROI test worth running ───────────────────────
-def roi_spectrum(G, mask, taus, G1=None, G2=None, smooth=0.3, n_iter=4000):
+def roi_spectrum(G, mask, taus, G1=None, G2=None, smooth=0.3, n_iter=4000,
+                 bias_corrected=False):
     """ROI-averaged Laplace spectrum + the half-split check that it is real.
 
     Feed this the notebook's CACHE: G/G1/G2 are the (H,W,K) g_norm stacks for the
@@ -223,7 +224,8 @@ def roi_spectrum(G, mask, taus, G1=None, G2=None, smooth=0.3, n_iter=4000):
     # ANY mixture in the detectable range. Left uncorrected it depresses the slow
     # tail, masking a real slow population and faking one if over-corrected.
     out["bias_rms_uncorrected"] = FINITE_T_BIAS_RMS
-    out["bias_limited"] = bool(resid_1comp < FINITE_T_RESID_UNCORRECTED)
+    # bias_corrected=True: the curves already had the finite-T bias removed (utils/finite_t.py)
+    out["bias_limited"] = bool(resid_1comp < FINITE_T_RESID_UNCORRECTED) and not bias_corrected
     if out["bias_limited"]:
         out["verdict"] += (f"  [WARNING: residual {resid_1comp:.4f} is below the "
                            f"{FINITE_T_RESID_UNCORRECTED:.4f} that the uncorrected finite-T "

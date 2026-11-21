@@ -155,6 +155,9 @@ D6_LAMBDAS    = (1e-4, 1e-3, 1e-2)   # CONTIN regularisation scan: only peaks th
 D6_REL_MIN    = 0.30      # GEVD axes kept if their cross-half reproducible fraction >= this
 D6_DROP_FRAC  = 0.30      # drop this share of nucleus pixels with the worst half1-vs-half2 agreement
 D6_N_CLUSTERS = 3         # k-means groups in the reproducible-axis space (P(D) per group)
+D6_FEATURES = 'G+CV2'     # noise-filter features: 'G+CV2' (Section 3), 'XY' (tau map + CV2, Section 2), 'G'
+HP_W = 1501               # D9 slow-peak test: temporal high-pass (boxcar, frames); 0 = skip
+TILE_PX = 12              # D10 tile CONTIN map: tile size in binned px
 
 # ── outputs: every figure (png), the printed log and results.json land here ──
 OUT_DIR = '/content/drive/MyDrive/iscors_test/one_shot_outputs/' + time.strftime('%Y%m%d_%H%M')
@@ -343,12 +346,27 @@ gamma, dens, G, a_full, C0 = maps_of(vp)
 g1g, g1d, G1, a_h1, C0_1 = maps_of(vp[:h])
 g2g, g2d, G2, a_h2, C0_2 = maps_of(vp[h:])
 
-# noise-free amplitude A = G(0+) extrapolated from tau>=1: 1-A is the white-noise share
-try:
-    CACHE['A_amp'] = vdls_amplitude(vp, RECON_TAUS, gamma,
-                                    np.full_like(gamma, a_full))
-except Exception as e:
-    CACHE['A_amp'] = None; print('vdls_amplitude skipped:', e)
+# D9 input: the same movie high-passed in time (centred HP_W-frame boxcar, in place) and
+# trimmed by HP_W//2 at both ends so every frame had a full window. Removes per-pixel drift
+# slower than ~HP_W frames; the D9 kernel applies the identical filter, so a stationary slow
+# population should come back unchanged and only non-stationary drift should disappear.
+if HP_W:
+    try:
+        vp = np.asarray(vp, np.float32)
+        ik.highpass_video_(vp, HP_W)
+        _m = HP_W // 2; vh = vp[_m:T - _m]; Th = vh.shape[0]; hh = Th // 2
+        def _gn(seg):
+            g_, _c, c0_ = compute_g_norm_torch(seg, RECON_TAUS, norm='nor1', min_cv=0.0)
+            try: g_, c0_ = g_.cpu().numpy(), c0_.cpu().numpy()
+            except Exception: g_, c0_ = np.asarray(g_), np.asarray(c0_)
+            return g_.astype(np.float32), c0_.astype(np.float32)
+        G_hp, C0_hp = _gn(vh); G1_hp, C0_1_hp = _gn(vh[:hh]); G2_hp, C0_2_hp = _gn(vh[hh:])
+        CACHE.update(G_hp=G_hp, G1_hp=G1_hp, G2_hp=G2_hp, C0_hp=C0_hp, C0_1_hp=C0_1_hp,
+                     C0_2_hp=C0_2_hp, T_hp=Th)
+        del vh
+        print(f'[D9] high-passed G done (W={HP_W}, T_eff={Th})  ({time.time()-t0:.0f}s)')
+    except Exception as e:
+        print('[D9] high-pass skipped:', e)
 
 del vp; gc.collect()
 try:
@@ -460,20 +478,23 @@ mid-band power law S ~ f^b, b               : {s['slope_mid']:+.2f}
           f'white noise is {wf:.0f}% of the per-pixel variance; this is the measured '
           f'replacement for the 4.1% RMS assumed in docs/laplace_projection_alpha.md')
 
-    # independent cross-check: the tau>=1 ACF is noise-free, so extrapolating its shape
-    # back to tau->0 gives the noise-free amplitude A. vdls_amplitude fits C(tau)/<I>^2,
-    # i.e. A is in CV^2 units -- the white share is 1 - A/CV^2, not 1 - A.
+    # independent cross-check: the tau>=1 ACF is noise-free, so a FREE-amplitude fit
+    # A/(1+gamma tau^alpha) (finite-T aware, utils/finite_t.py) on the nor1 curves gives the
+    # white share as 1 - A. (The old cross-check extrapolated with the pipeline's gamma, which
+    # was fitted WITHOUT an amplitude, so it absorbed the white-noise drop and read ~1%.)
     wf_acf = float('nan')
-    Amp = CACHE.get('A_amp')
-    if Amp is not None:
-        nucm = CACHE['nuc']
-        ratio = (np.asarray(Amp, float) / np.maximum(CACHE['dens'], 1e-30))[nucm]
-        ratio = ratio[np.isfinite(ratio)]
-        if ratio.size:
-            wf_acf = float(1.0 - np.median(np.clip(ratio, 0.0, 1.0)))
-            print(f'                     cross-check from the ACF extrapolation: '
-                  f'{wf_acf*100:.0f}%  (independent of the PSD -- the two should agree; '
-                  f'a big gap means one of the two estimators is being fooled)')
+    try:
+        nucm = CACHE['nuc'] & np.isfinite(CACHE['G']).all(-1)
+        Gs = CACHE['G'][nucm].astype(np.float64)
+        rs_ = np.random.RandomState(0)
+        Gs = Gs[rs_.choice(len(Gs), size=min(5000, len(Gs)), replace=False)]
+        fx = ft.debias(Gs, np.asarray(RECON_TAUS), CACHE['T'])
+        wf_acf = float(1.0 - np.median(fx['A']))
+        print(f'                     cross-check from a free-amplitude ACF fit (5000 px): '
+              f'{wf_acf*100:.0f}%  (independent of the PSD -- the two should agree; '
+              f'a big gap means one of the two estimators is being fooled)')
+    except Exception as e:
+        print('ACF cross-check skipped:', e)
     RESULT['D1'] = dict(verdict='ok', aliasing=aliasing, white_frac=s['white_frac'],
                         white_frac_acf=wf_acf, n_inst_lines=len(inst),
                         alpha_psd=s['alpha_psd'], slope_top=s['slope_top'], summary=summary)""")
@@ -804,7 +825,8 @@ def _d5():
         if int(m.sum()) < 50:
             print(f'{tag}: only {int(m.sum())} px, skipped'); continue
         mm = m & np.isfinite(CACHE[kG]).all(-1)
-        r = lsp.roi_spectrum(CACHE[kG], mm, RECON_TAUS, G1=CACHE[k1], G2=CACHE[k2])
+        r = lsp.roi_spectrum(CACHE[kG], mm, RECON_TAUS, G1=CACHE[k1], G2=CACHE[k2],
+                             bias_corrected=kG.endswith('_ft'))
         print(f'\n--- {tag} ({r["n_px"]} px) ---')
         print(f'  peaks={r["n_peaks"]}  centroid={r["centroid"]:.2f}  width={r["width"]:.2f} dec'
               f'  half1/half2 peaks={r.get("n_peaks_half1")}/{r.get("n_peaks_half2")}')
@@ -869,20 +891,22 @@ def _d6_kernel():
     D_um = D_grid * 1e12
     print(f'resolvable window: D ~ {D_um[3]:.3g} .. {D_um[-4]:.3g} um^2/s')
     CACHE['d6_kern'] = (K_full, K_half, D_um)
+    CACHE['d6_q2S'] = (q2, S, D_grid, dt)
     return CACHE['d6_kern']
 
 
-def _pd_groups(groups, title):
+def _pd_groups(groups, title, keys=('G', 'G1', 'G2', 'C0', 'C0_1', 'C0_2'), kern=None):
     ~~~CONTIN P(D) for each (tag, mask) ROI; prints verdicts, plots one panel per ROI.~~~
-    K_full, K_half, D_um = _d6_kernel()
-    G, G1, G2 = CACHE['G'], CACHE['G1'], CACHE['G2']
+    K_full, K_half, D_um = kern or _d6_kernel()
+    G, G1, G2 = (CACHE[k] for k in keys[:3])
+    C0k, C01k, C02k = keys[3:]
     out = {}
     fig, axs = plt.subplots(1, len(groups), figsize=(4.2 * len(groups), 3.4), sharey=True)
     axs = np.atleast_1d(axs)
     for (tag, m), axp in zip(groups, axs):
-        g, n_px = ik.roi_curve(G, CACHE['C0'], m)
-        g1, _ = ik.roi_curve(G1, CACHE['C0_1'], m)
-        g2, _ = ik.roi_curve(G2, CACHE['C0_2'], m)
+        g, n_px = ik.roi_curve(G, CACHE[C0k], m)
+        g1, _ = ik.roi_curve(G1, CACHE[C01k], m)
+        g2, _ = ik.roi_curve(G2, CACHE[C02k], m)
         if n_px < 50:
             print(f'{tag}: only {n_px} px, skipped'); axp.set_title(f'{tag}: {n_px} px, skipped', fontsize=9)
             continue
@@ -942,21 +966,51 @@ def _d6():
     _d6_kernel()
 
     # ── 1) GEVD noise filter + clustering ──
+    # Features (D6_FEATURES), all cross-half:
+    #   'G+CV2' : full G(tau) curve + log CV2           (deliverable Section 3; default)
+    #   'XY'    : tau map X = log10(1/gamma) + log CV2   (deliverable Section 2 reliability-max:
+    #             two channels together cancel their shared noise)
+    #   'G'     : G(tau) only                            (previous D6)
+    # All three are scored and printed; D6_FEATURES picks the one used for the groups.
     G, G1, G2 = CACHE['G'], CACHE['G1'], CACHE['G2']
-    nuc = CACHE['nuc'] & np.isfinite(G).all(-1) & np.isfinite(G1).all(-1) & np.isfinite(G2).all(-1)
-    F1, F2, Ff = G1[nuc].astype(float), G2[nuc].astype(float), G[nuc].astype(float)
-    mu = (F1.mean(0) + F2.mean(0)) / 2; sd = (F1.std(0) + F2.std(0)) / 2 + 1e-9
-    a1, a2, af = (F1 - mu) / sd, (F2 - mu) / sd, (Ff - mu) / sd
-    Cg = (a1.T @ a2) / len(a1); Cg = (Cg + Cg.T) / 2
-    Ct = np.cov(np.vstack([a1, a2]).T)
-    ev, U = np.linalg.eigh(Ct); Wh = U / np.sqrt(np.clip(ev, 1e-12, None))     # whiten Ct
-    lam_g, V = np.linalg.eigh(Wh.T @ Cg @ Wh); o = np.argsort(lam_g)[::-1]
-    lam_g, Wg = lam_g[o], (Wh @ V)[:, o]
-    keep = np.where(lam_g >= D6_REL_MIN)[0]
-    if len(keep) == 0: keep = np.array([0])
-    print('\nGEVD reproducible fraction per axis:', np.round(lam_g, 2), f'-> keep {len(keep)} axis(es)')
-    P1, P2, Pf = a1 @ Wg[:, keep], a2 @ Wg[:, keep], af @ Wg[:, keep]
-    disagree = ((P1 - P2) ** 2).sum(1) / (((P1 ** 2).sum(1) + (P2 ** 2).sum(1)) + 1e-12)
+    _lg = lambda a: np.log10(np.clip(a, 1e-12, None))
+    Y, Y1, Y2 = _lg(CACHE['dens']), _lg(CACHE.get('g1d', CACHE['dens'])), _lg(CACHE.get('g2d', CACHE['dens']))
+    X, X1, X2 = (_lg(1.0 / np.clip(CACHE[k], 1e-6, None)) for k in ('gamma', 'g1g', 'g2g'))
+    nuc = (CACHE['nuc'] & np.isfinite(G).all(-1) & np.isfinite(G1).all(-1) & np.isfinite(G2).all(-1)
+           & np.isfinite(Y) & np.isfinite(Y1) & np.isfinite(Y2) & np.isfinite(X) & np.isfinite(X1) & np.isfinite(X2))
+    if 'g1d' not in CACHE:
+        print('note: half-record CV2 maps not cached -> CV2 halves = full record (CV2 looks more reproducible than it is)')
+    feats = {
+        'G':     (G1[nuc], G2[nuc], G[nuc]),
+        'G+CV2': tuple(np.concatenate([g[nuc], y[nuc][:, None]], 1) for g, y in ((G1, Y1), (G2, Y2), (G, Y))),
+        'XY':    tuple(np.stack([x[nuc], y[nuc]], 1) for x, y in ((X1, Y1), (X2, Y2), (X, Y))),
+    }
+    def _gevd_filter(F1, F2, Ff):
+        F1, F2, Ff = (np.asarray(a, float) for a in (F1, F2, Ff))
+        mu = (F1.mean(0) + F2.mean(0)) / 2; sd = (F1.std(0) + F2.std(0)) / 2 + 1e-9
+        a1, a2, af = (F1 - mu) / sd, (F2 - mu) / sd, (Ff - mu) / sd
+        Cg = (a1.T @ a2) / len(a1); Cg = (Cg + Cg.T) / 2
+        Ct = np.cov(np.vstack([a1, a2]).T)
+        ev, U = np.linalg.eigh(Ct); Wh = U / np.sqrt(np.clip(ev, 1e-12, None))     # whiten Ct
+        lam_g, V = np.linalg.eigh(Wh.T @ Cg @ Wh); o = np.argsort(lam_g)[::-1]
+        lam_g, Wg = lam_g[o], (Wh @ V)[:, o]
+        keep = np.where(lam_g >= D6_REL_MIN)[0]
+        if len(keep) == 0: keep = np.array([0])
+        P1, P2, Pf = a1 @ Wg[:, keep], a2 @ Wg[:, keep], af @ Wg[:, keep]
+        dis = ((P1 - P2) ** 2).sum(1) / (((P1 ** 2).sum(1) + (P2 ** 2).sum(1)) + 1e-12)
+        return lam_g, keep, Pf, dis
+    filt = {k: _gevd_filter(*v) for k, v in feats.items()}
+    goods = {k: f[3] <= np.quantile(f[3], 1 - D6_DROP_FRAC) for k, f in filt.items()}
+    for k, f in filt.items():
+        print(f'GEVD [{k:5s}] reproducible fraction per axis: {np.round(f[0][:6], 2)} -> keep {len(f[1])}')
+    ks = list(goods)
+    print('kept-pixel overlap (Jaccard): ' + ', '.join(
+        f'{a}/{b} {np.mean(goods[a] & goods[b]) / max(np.mean(goods[a] | goods[b]), 1e-12):.2f}'
+        for i, a in enumerate(ks) for b in ks[i + 1:]))
+    lam_g, keep, Pf, disagree = filt[D6_FEATURES]
+    print(f'using D6_FEATURES = {D6_FEATURES!r}')
+    if D6_FEATURES == 'XY' and Pf.shape[1] < 2:
+        Pf = np.concatenate([Pf, filt['G'][2][:, :1]], 1)   # 1 kept XY axis: add G axis 1 for clustering
     good = disagree <= np.quantile(disagree, 1 - D6_DROP_FRAC)
     print(f'pixels: {len(good)} in nucleus -> {int(good.sum())} kept after dropping the '
           f'{D6_DROP_FRAC:.0%} least reproducible')
@@ -986,6 +1040,15 @@ def _d6():
     groups = [('filtered nucleus', good_map)] + [(f'group {k+1}', lab_map == k) for k in range(D6_N_CLUSTERS)]
     out = {'gevd_rel': lam_g.tolist(), 'n_axes_kept': int(len(keep)), 'n_px_kept': int(good.sum())}
     out.update(_pd_groups(groups, 'P(D), iPSF kernel. grey = grid edges (not populations); dotted = paper D* 0.92'))
+    # same filtered-nucleus P(D) under the other two filters, to see if the choice matters
+    Hh_, Ww_ = nuc.shape; idx_ = np.flatnonzero(nuc); alt = []
+    for k in ks:
+        if k == D6_FEATURES: continue
+        gm = np.zeros((Hh_, Ww_), bool); gm.flat[idx_[goods[k]]] = True
+        alt.append((f'filtered nucleus [{k}]', gm))
+    print('\n--- filter comparison: same CONTIN on the pixels kept by the other feature sets ---')
+    out['filter_compare'] = _pd_groups(alt, 'P(D) of the filtered nucleus under the other noise filters')
+    out['features'] = D6_FEATURES
     CACHE['d6_good_map'] = good_map
     out['verdict'] = 'ok'
     RESULT['D6'] = out""")
@@ -1230,6 +1293,147 @@ def _d8():
     out['verdict'] = 'ok'
     RESULT['D8'] = out""")
 
+# ─────────────────────────────── cell 9e : D9 ──────────────────────────────
+code(r"""# ══ D9 — is the slow P(D) peak real dynamics or drift? (temporal high-pass test) ══
+# Same ROIs, same CONTIN, but on the HIGH-PASSED movie (cell 4) with a kernel that applies the
+# identical filter (ik.ipsf_kernel(..., highpass_W=HP_W)). Data and kernel are filtered the same
+# way, so for STATIONARY dynamics P(D) must come back unchanged (the filter only costs SNR).
+# Slow drift / bleaching / cell motion is non-stationary: the kernel cannot model it, so if the
+# slow peak was drift it shrinks or vanishes here.
+@guard('D9')
+def _d9():
+    assert 'G_hp' in CACHE, 'no high-passed G (HP_W = 0 or the high-pass failed in cell 4)'
+    _d6_kernel()
+    q2, S, D_grid, dt = CACHE['d6_q2S']
+    Th = CACHE['T_hp']
+    K_hf, _ = ik.ipsf_kernel(RECON_TAUS, dt, q2, S, D=D_grid, T=Th, highpass_W=HP_W)
+    K_hh, _ = ik.ipsf_kernel(RECON_TAUS, dt, q2, S, D=D_grid, T=Th // 2, highpass_W=HP_W)
+    D_um = D_grid * 1e12
+    # split slow / fast at the geometric mean of the D6 peaks (fallback 1 um^2/s)
+    d6 = (RESULT.get('D6') or {}).get('filtered nucleus') or {}
+    split = 1.0
+    if d6:
+        run = min(d6['runs'], key=lambda r: r['resid'])
+        pk = sorted(p for _, p in sorted(zip(run['peak_mass'], run['peaks']), reverse=True)[:2])
+        if len(pk) == 2: split = float(np.sqrt(pk[0] * pk[1]))
+    rois = []
+    if 'd6_good_map' in CACHE: rois.append(('filtered nucleus', CACHE['d6_good_map']))
+    for t, r in (CACHE.get('d7_rois') or []):
+        if t in ('nucleoli', 'background'): rois.append((t, r))
+    if not rois: rois = [('nucleus', CACHE['nuc'])]
+    print(f'slow/fast split at D = {split:.3g} um^2/s;  high-pass W = {HP_W} frames, T_eff = {Th}')
+    orig = _pd_groups(rois, 'D9 reference: original movie')
+    hp = _pd_groups(rois, f'D9: high-passed movie (W={HP_W}) with the matching kernel',
+                    keys=('G_hp', 'G1_hp', 'G2_hp', 'C0_hp', 'C0_1_hp', 'C0_2_hp'),
+                    kern=(K_hf, K_hh, D_um))
+
+    def _slow(o):
+        p = np.asarray(o['p_best']); p = p / max(p.sum(), 1e-30)
+        sl = p[D_um < split]; m_s = float(sl.sum())
+        pos = float(np.exp((np.log(D_um[D_um < split]) * sl).sum() / max(m_s, 1e-30))) if m_s > 0 else float('nan')
+        fa = p[D_um >= split]
+        pos_f = float(np.exp((np.log(D_um[D_um >= split]) * fa).sum() / max(fa.sum(), 1e-30))) if fa.sum() > 0 else float('nan')
+        return m_s, pos, pos_f
+    out = {'split': split, 'HP_W': HP_W}
+    print(f'\n{"ROI":18s} {"slow mass":>18s} {"slow centroid":>22s} {"fast centroid":>22s}   (original -> high-passed)')
+    verdicts = []
+    for t, _ in rois:
+        if t not in orig or t not in hp: continue
+        mo, po, fo = _slow(orig[t]); mh, ph, fh = _slow(hp[t])
+        print(f'{t:18s} {mo:8.2f} -> {mh:5.2f}   {po:9.3g} -> {ph:8.3g}   {fo:9.3g} -> {fh:8.3g}')
+        # calibrated on simulation (two populations + random-walk drift): with NO drift the
+        # high-pass alone costs ~30% of the slow mass at the same position; drift adds slow mass
+        # and drags the original centroid to lower D, while the high-passed result stays put.
+        keep = (mh >= 0.5 * mo) and np.isfinite(ph) and abs(np.log10(ph / po)) < 0.2
+        if keep and np.log10(ph / po) > 0.1:
+            print(f'{"":18s} (original slow centroid is pulled low by drift; use the high-passed value {ph:.3g})')
+        verdicts.append(keep)
+        out[t] = dict(slow_mass_orig=mo, slow_mass_hp=mh, slow_pos_orig=po, slow_pos_hp=ph,
+                      fast_pos_orig=fo, fast_pos_hp=fh, survives=bool(keep))
+    if verdicts and all(verdicts):
+        v = ('SLOW PEAK IS REAL — it survives the high-pass at the same position, so it is stationary '
+             'dynamics, not drift. Quote the high-passed slow centroid (drift-free).')
+    elif verdicts and not any(verdicts):
+        v = ('SLOW PEAK IS (MOSTLY) DRIFT — it loses mass or moves once slow drift is filtered out; '
+             'treat the slow population as an artefact of non-stationarity.')
+    else:
+        v = 'MIXED — the slow peak survives in some ROIs and not others; see the table.'
+    print('\nVERDICT D9:', v)
+    out['verdict'] = 'ok'; out['summary'] = v
+    RESULT['D9'] = out""")
+
+# ─────────────────────────────── cell 9f : D10 ─────────────────────────────
+code(r"""# ══ D10 — tile CONTIN map: where are the slow / fast peaks, and how much fast mass? ══
+# Per-pixel CONTIN is impossible (~4% noise per pixel; two peaks need ~0.1-0.3%). Tiles of
+# TILE_PX x TILE_PX pixels (c0-weighted, ratio of means) bring the noise to ~0.3-0.5%, enough for
+# a coarse map of the two peak positions and the fast mass share. Each tile is also inverted on
+# both halves; the half1-vs-half2 correlation of each map (printed) says how much of it is real.
+@guard('D10')
+def _d10():
+    K_full, K_half, D_um = _d6_kernel()
+    lam = 1e-3
+    nuc = CACHE['nuc'] & np.isfinite(CACHE['G']).all(-1)
+    H, W = nuc.shape; tp = TILE_PX
+    d6 = (RESULT.get('D6') or {}).get('filtered nucleus') or {}
+    split = (RESULT.get('D9') or {}).get('split', 1.0)
+    if split == 1.0 and d6:
+        run = min(d6['runs'], key=lambda r: r['resid'])
+        pk = sorted(p for _, p in sorted(zip(run['peak_mass'], run['peaks']), reverse=True)[:2])
+        if len(pk) == 2: split = float(np.sqrt(pk[0] * pk[1]))
+    lo, hi = D_um < split, D_um >= split
+    ny, nx = H // tp, W // tp
+    maps = {k: np.full((ny, nx), np.nan) for k in ('slow_D', 'fast_D', 'fast_share', 'fs_h1', 'fs_h2', 'white')}
+
+    def _feat(p):
+        p = p / max(p.sum(), 1e-30)
+        ms, mf = p[lo].sum(), p[hi].sum()
+        sD = np.exp((np.log(D_um[lo]) * p[lo]).sum() / ms) if ms > 1e-3 else np.nan
+        fD = np.exp((np.log(D_um[hi]) * p[hi]).sum() / mf) if mf > 1e-3 else np.nan
+        return sD, fD, mf / max(ms + mf, 1e-30)
+    t0_ = time.time(); n_t = 0
+    for iy in range(ny):
+        for ix in range(nx):
+            m = np.zeros_like(nuc); m[iy*tp:(iy+1)*tp, ix*tp:(ix+1)*tp] = True; m &= nuc
+            if m.sum() < 0.5 * tp * tp: continue
+            g, _ = ik.roi_curve(CACHE['G'], CACHE['C0'], m)
+            g1, _ = ik.roi_curve(CACHE['G1'], CACHE['C0_1'], m)
+            g2, _ = ik.roi_curve(CACHE['G2'], CACHE['C0_2'], m)
+            p, nug = ik.invert_kernel(g, K_full, lam=lam, return_nugget=True, n_iter=5000)
+            sD, fD, fs = _feat(p)
+            maps['slow_D'][iy, ix], maps['fast_D'][iy, ix], maps['fast_share'][iy, ix] = sD, fD, fs
+            maps['white'][iy, ix] = nug
+            maps['fs_h1'][iy, ix] = _feat(ik.invert_kernel(g1, K_half, lam=lam, n_iter=5000))[2]
+            maps['fs_h2'][iy, ix] = _feat(ik.invert_kernel(g2, K_half, lam=lam, n_iter=5000))[2]
+            n_t += 1
+    print(f'{n_t} tiles of {tp}x{tp} px inverted ({time.time()-t0_:.0f}s); slow/fast split at {split:.3g} um^2/s')
+
+    def _rel(a, b):
+        ok = np.isfinite(a) & np.isfinite(b)
+        return float(np.corrcoef(a[ok], b[ok])[0, 1]) if ok.sum() > 5 else float('nan')
+    r_fs = _rel(maps['fs_h1'], maps['fs_h2'])
+    print(f'fast-share map, half1 vs half2 correlation r = {r_fs:.2f}  '
+          f'(~0 = the map is noise; >0.5 = the spatial pattern is reproducible)')
+
+    ext = (0, nx * tp, ny * tp, 0)
+    fig, ax = plt.subplots(1, 4, figsize=(18, 4.3))
+    for a, k, cm, lab in ((ax[0], 'slow_D', 'viridis', 'slow peak D [um^2/s] (log)'),
+                          (ax[1], 'fast_D', 'viridis', 'fast peak D [um^2/s] (log)'),
+                          (ax[2], 'fast_share', 'coolwarm', 'fast mass share'),
+                          (ax[3], 'white', 'magma', 'white-noise weight')):
+        d = np.log10(maps[k]) if k.endswith('_D') else maps[k]
+        im = a.imshow(d, cmap=cm, extent=ext, interpolation='nearest')
+        a.contour(np.arange(W) + 0.5, np.arange(H) + 0.5, nuc, levels=[0.5], colors='k', linewidths=0.5)
+        plt.colorbar(im, ax=a, fraction=0.046); a.set_title(lab, fontsize=9); a.axis('off')
+    plt.suptitle(f'D10 tile CONTIN ({tp}x{tp} px, lam {lam:g}); fast-share half-split r = {r_fs:.2f}', fontsize=10)
+    plt.tight_layout(); plt.show()
+    for k in ('slow_D', 'fast_D', 'fast_share'):
+        v = maps[k][np.isfinite(maps[k])]
+        if v.size: print(f'  {k:10s}: median {np.median(v):.3g}, IQR {np.percentile(v,25):.3g}-{np.percentile(v,75):.3g}')
+    try: np.savez(os.path.join(_out_dir(), 'd10_tile_maps.npz'), **maps, tile_px=tp, split=split)
+    except Exception as e: print('could not save tile maps:', e)
+    RESULT['D10'] = dict(verdict='ok', n_tiles=n_t, tile_px=tp, split=split, r_fast_share_halves=r_fs,
+                         **{k + '_median': float(np.nanmedian(maps[k])) for k in ('slow_D', 'fast_D', 'fast_share')})""")
+
 # ─────────────────────────────── cell 10 ───────────────────────────────────
 code(r"""# ══ scorecard: measured outcome vs the predictions registered in cell 0 ══
 def _fmt(ok):
@@ -1277,6 +1481,10 @@ print('=' * 96)
 hit = sum(1 for _, ok, _ in rows if ok)
 print(f'  {hit}/{len(rows)} predictions held.')
 print('  Surprises are the useful rows — they are where the model of the experiment was wrong.')
+if (RESULT.get('D9') or {}).get('summary'):
+    print('  D9:', RESULT['D9']['summary'])
+if (RESULT.get('D10') or {}).get('verdict') == 'ok':
+    print(f"  D10: fast-share tile map half-split r = {RESULT['D10']['r_fast_share_halves']:.2f}")
 for dk in ('D6', 'D7'):
     for tag, v in (RESULT.get(dk) or {}).items():
         if isinstance(v, dict) and 'verdict' in v:

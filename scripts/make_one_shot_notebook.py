@@ -85,6 +85,7 @@ from utils.gpu_iscors_fit import (compute_density, compute_g_norm_torch, gpu_fit
                                   vdls_amplitude)
 import utils.laplace_spectrum as lsp
 import utils.ipsf_kernel as ik
+import utils.finite_t as ft
 
 RESULT = {}          # every diagnostic writes its verdict here; last cell tabulates
 def guard(name):
@@ -386,7 +387,11 @@ def _d1():
         top = ff > ff[-1] / 2.0
         floor = float(np.median(P[top]))
         f_nyq = ff[-1]
-        white_frac = float(np.clip(floor * f_nyq / max(b['var_loc'], 1e-30), 0, 1))
+        # PSD is normalised per cycles/frame (sum P df = var, df = 1/T), so the white
+        # variance is floor x Nyquist IN CYCLES/FRAME (0.5), not in Hz. Using f in Hz here
+        # inflated the share by FRAME_RATE_HZ and clipped it to 100% (fixed).
+        f_nyq_cpf = float(b['f'][m][-1])
+        white_frac = float(np.clip(floor * f_nyq_cpf / max(b['var_loc'], 1e-30), 0, 1))
         # slope over the top half-decade: ~0 = floor reached, clearly <0 = still falling
         sl_top = float(np.polyfit(np.log10(ff[top]), np.log10(np.maximum(P[top], 1e-30)), 1)[0])
         # mid-band power law -> an INDEPENDENT estimate of alpha (S ~ f^-(1+alpha))
@@ -616,6 +621,109 @@ code(r"""# ══ D4 — finite-T bias, measured directly instead of simulated �
 #   (b) the gamma difference should DEPEND on gamma -- negative at the slow end and
 #       crossing over at the fast end -- rather than being a constant offset.
 # A constant offset would be harmless (every downstream projection absorbs it).
+# ── D4b — finite-T correction (docs/laplace_projection_alpha.md 6.4 item 3, exact form) ──
+# Fit the EXPECTED pipeline estimator (sample-mean subtraction over T frames, / C_hat(0))
+# instead of the ideal ACF: utils/finite_t.py, same formula as the D6 kernel. The full record
+# is fitted with T, each half with T/2. If finite-T is what D4 saw, the corrected full and
+# half gammas agree (no gamma-dependent trend) and the shared alpha agrees.
+# Two levels:
+#   per pixel  : noisy; the fit itself is biased at this noise, so expect only partial agreement
+#   gamma bins : 8 c0-weighted ROI curves (pixels binned by gamma_full) -- near noise-free,
+#                this is the decisive test, and it is the level D5/D6 work at.
+# The corrected curves (g - bias) replace G/G1/G2 in D5 as a second, 'corrected' run.
+def _d4_correct(ok, gf):
+    T = CACHE['T']; taus = np.asarray(RECON_TAUS)
+    G, G1, G2 = (CACHE[k][ok].astype(np.float64) for k in ('G', 'G1', 'G2'))
+    good = np.isfinite(G).all(1) & np.isfinite(G1).all(1) & np.isfinite(G2).all(1)
+    t0 = time.time()
+    rf = ft.debias(G[good], taus, T)
+    r1 = ft.debias(G1[good], taus, T // 2)
+    r2 = ft.debias(G2[good], taus, T // 2)
+    print(f'\n[D4b] finite-T corrected per-pixel fits done ({time.time()-t0:.0f}s, '
+          f'{int(good.sum())} px)')
+
+    def _summ(key_g, key_a, tag):
+        gh_ = np.sqrt(r1[key_g] * r2[key_g])
+        x = np.log10(rf[key_g]); d = x - np.log10(gh_)
+        qs = np.percentile(x, np.linspace(0, 100, 9))
+        cy = [np.median(d[(x >= qs[i]) & (x < qs[i + 1])]) for i in range(8)]
+        tr = float(np.polyfit(x, d, 1)[0])
+        da = 0.5 * (r1[key_a][0] + r2[key_a][0]) - rf[key_a][0]
+        print(f'  per pixel, {tag:9s}: alpha full={rf[key_a][0]:.2f} halves={r1[key_a][0]:.2f},'
+              f'{r2[key_a][0]:.2f} (d={da:+.2f})  trend={tr:+.3f}  '
+              f'binned span={max(cy)-min(cy):.3f} dec')
+        return tr, float(max(cy) - min(cy)), float(da)
+    tr_n, sp_n, da_n = _summ('gamma_raw', 'alpha_raw', 'naive')
+    tr_c, sp_c, da_c = _summ('gamma', 'alpha', 'corrected')
+
+    # gamma-binned ROI curves (ratio of means, c0-weighted) -- the decisive level
+    C0s = [CACHE[k][ok][good].astype(np.float64) for k in ('C0', 'C0_1', 'C0_2')]
+    xb = np.log10(rf['gamma_raw'])
+    qs = np.percentile(xb, np.linspace(0, 100, 9))
+    lab = np.clip(np.digitize(xb, qs[1:-1]), 0, 7)
+    def _bins(Gs, c0):
+        return np.array([(Gs[lab == i] * c0[lab == i, None]).sum(0) /
+                         max(c0[lab == i].sum(), 1e-30) for i in range(8)])
+    Bf = _bins(G[good], C0s[0]); B1 = _bins(G1[good], C0s[1]); B2 = _bins(G2[good], C0s[2])
+    bf = ft.debias(Bf, taus, T); b1 = ft.debias(B1, taus, T // 2); b2 = ft.debias(B2, taus, T // 2)
+    res = {}
+    for tag, kg, ka in (('naive', 'gamma_raw', 'alpha_raw'), ('corrected', 'gamma', 'alpha')):
+        d = np.log10(bf[kg]) - 0.5 * (np.log10(b1[kg]) + np.log10(b2[kg]))
+        da = 0.5 * (b1[ka][0] + b2[ka][0]) - bf[ka][0]
+        res[tag] = dict(d=d, span=float(d.max() - d.min()), d_alpha=float(da),
+                        span_inner=float(d[1:].max() - d[1:].min()),
+                        alpha=float(bf[ka][0]))
+        print(f'  gamma bins, {tag:9s}: alpha full={bf[ka][0]:.2f} halves={b1[ka][0]:.2f},'
+              f'{b2[ka][0]:.2f} (d={da:+.2f})  dlog10 gamma per bin = {np.round(d, 3)}')
+    A_bins = bf['A']
+    print(f'  corrected white-noise share per gamma bin (1-A): {np.round(1 - A_bins, 2)}  '
+          f'<- second cross-check for D1')
+
+    fig, ax = plt.subplots(1, 2, figsize=(12.5, 4.2))
+    xc = [np.median(xb[lab == i]) for i in range(8)]
+    for tag, mk in (('naive', 'o-'), ('corrected', 's-')):
+        ax[0].plot(xc, res[tag]['d'], mk, label=f"{tag}  (alpha {res[tag]['alpha']:.2f}, "
+                                                 f"d_alpha {res[tag]['d_alpha']:+.2f})")
+    ax[0].axhline(0, color='k', ls='--', lw=1)
+    ax[0].set_xlabel('log10 gamma bin (naive, full record)')
+    ax[0].set_ylabel('log10 gamma_full - log10 gamma_halves')
+    ax[0].set_title('gamma-binned ROI curves: finite-T correction', fontsize=10)
+    ax[0].legend(fontsize=8)
+    for i in (0, 3, 7):
+        ax[1].semilogx(taus, Bf[i], 'o', ms=3, color=f'C{i}')
+        ax[1].semilogx(taus, bf['g_corr'][i], '-', color=f'C{i}', label=f'bin {i}: corrected')
+    ax[1].set_xlabel('tau [frames]'); ax[1].set_ylabel('G (nor1)')
+    ax[1].set_title('measured (dots) vs finite-T corrected (lines)', fontsize=10)
+    ax[1].legend(fontsize=7)
+    plt.tight_layout(); plt.show()
+
+    n, c = res['naive'], res['corrected']
+    fixed = (c['span_inner'] < 0.5 * n['span_inner']) and (abs(c['d_alpha']) < max(0.02, 0.5 * abs(n['d_alpha'])))
+    if fixed:
+        v = ('FINITE-T EXPLAINS IT — after correction the full and half records agree '
+             f"(span {n['span_inner']:.3f} -> {c['span_inner']:.3f} dec, excluding the slowest bin; "
+             f"d_alpha {n['d_alpha']:+.3f} -> {c['d_alpha']:+.3f}). D5 is re-run on the corrected curves; "
+             'D6 already has the bias inside its kernel.')
+    else:
+        v = ('FINITE-T DOES NOT EXPLAIN ALL OF IT — the correction leaves a gamma-dependent '
+             f"difference (span {n['span_inner']:.3f} -> {c['span_inner']:.3f} dec; d_alpha "
+             f"{n['d_alpha']:+.3f} -> {c['d_alpha']:+.3f}). The rest is something the stationary "
+             'model lacks (slow drift / non-stationarity / bleaching): the slow end, and the '
+             'slow D6 peak, stay unconfirmed.')
+    print('\nVERDICT D4b:', v)
+
+    for key, r in (('G_ft', rf), ('G1_ft', r1), ('G2_ft', r2)):
+        arr = np.full(CACHE['G'].shape, np.nan, np.float32)
+        idx = np.flatnonzero(ok)[good]
+        arr.reshape(-1, arr.shape[-1])[idx] = r['g_corr'].astype(np.float32)
+        CACHE[key] = arr
+    RESULT['D4b'] = dict(verdict='ok', fixed=bool(fixed),
+                         span_naive=n['span_inner'], span_corr=c['span_inner'],
+                         d_alpha_naive=n['d_alpha'], d_alpha_corr=c['d_alpha'],
+                         alpha_corr=c['alpha'], white_share_bins=(1 - A_bins).tolist(),
+                         pix_trend_naive=tr_n, pix_trend_corr=tr_c)
+
+
 @guard('D4')
 def _d4():
     nuc = CACHE['nuc']
@@ -667,7 +775,9 @@ def _d4():
              'halves, so no reliability test in the pipeline can catch it. Correct it before '
              'trusting any slow-end conclusion (see section 6.4).')
     print('\nVERDICT D4:', v)
-    RESULT['D4'] = dict(verdict='ok', trend=trend, spread=spread, d_alpha=d_alpha)""")
+    RESULT['D4'] = dict(verdict='ok', trend=trend, spread=spread, d_alpha=d_alpha)
+    _d4_correct(ok, gf)
+""")
 
 # ─────────────────────────────── cell 9 : D5 ───────────────────────────────
 code(r"""# ══ D5 — bulk rate spectrum (only meaningful if D1-D4 came back clean) ══
@@ -681,10 +791,16 @@ def _d5():
     nucleoli = nuc & (Y < np.nanpercentile(Y[nuc], 12))
     nucleoplasm = nuc & ~nucleoli
 
-    for tag, m in (('whole nucleus', nuc), ('nucleoli', nucleoli), ('nucleoplasm', nucleoplasm)):
+    variants = [('', 'G', 'G1', 'G2')]
+    if 'G_ft' in CACHE:
+        variants.append((' [finite-T corrected]', 'G_ft', 'G1_ft', 'G2_ft'))
+    for suffix, kG, k1, k2 in variants:
+      for tag0, m in (('whole nucleus', nuc), ('nucleoli', nucleoli), ('nucleoplasm', nucleoplasm)):
+        tag = tag0 + suffix
         if int(m.sum()) < 50:
             print(f'{tag}: only {int(m.sum())} px, skipped'); continue
-        r = lsp.roi_spectrum(CACHE['G'], m, RECON_TAUS, G1=CACHE['G1'], G2=CACHE['G2'])
+        mm = m & np.isfinite(CACHE[kG]).all(-1)
+        r = lsp.roi_spectrum(CACHE[kG], mm, RECON_TAUS, G1=CACHE[k1], G2=CACHE[k2])
         print(f'\n--- {tag} ({r["n_px"]} px) ---')
         print(f'  peaks={r["n_peaks"]}  centroid={r["centroid"]:.2f}  width={r["width"]:.2f} dec'
               f'  half1/half2 peaks={r.get("n_peaks_half1")}/{r.get("n_peaks_half2")}')
@@ -877,6 +993,11 @@ if d4.get('verdict') == 'ok':
     rows.append(('finite-T bias smaller than simulated (~65%)', small,
                  f"trend {d4['trend']:+.3f}, span {d4['spread']:.3f} dec, "
                  f"d_alpha {d4['d_alpha']:+.3f}"))
+d4b = RESULT.get('D4b') or {}
+if d4b.get('verdict') == 'ok':
+    rows.append(('finite-T correction removes the D4 trend', d4b['fixed'],
+                 f"bin span {d4b['span_naive']:.3f} -> {d4b['span_corr']:.3f} dec, "
+                 f"d_alpha {d4b['d_alpha_naive']:+.3f} -> {d4b['d_alpha_corr']:+.3f}"))
 wn = d5.get('whole nucleus')
 if wn:
     rows.append(('bulk spectrum single-peaked (~75%)', wn['n_peaks'] <= 1,
@@ -908,15 +1029,36 @@ elif d3.get('winner') == 'stretched':
     print('  * D3 says single-q axial physics. Switch the fitter to the stretched form,')
     print('    read alpha off the slope, and report D_z in um^2/s^alpha. This also gives a')
     print('    real cross-cell comparison, which is what the slope-3 question needs.')
-elif d4.get('trend') is not None and abs(d4.get('trend', 0)) >= 0.02:
-    print('  * D4 says the finite-T bias is real and gamma-dependent. Correct it')
-    print('    (docs/laplace_projection_alpha.md section 6.4) before anything else.')
+elif d4.get('trend') is not None and abs(d4.get('trend', 0)) >= 0.02 and \
+        not (RESULT.get('D4b') or {}).get('fixed'):
+    print('  * D4 says the finite-T bias is real and gamma-dependent, and D4b shows the')
+    print('    exact finite-T correction does NOT remove all of it: look for slow drift /')
+    print('    non-stationarity before trusting the slow end or the slow D6 peak.')
+elif (RESULT.get('D4b') or {}).get('fixed'):
+    print('  * D4b: the gamma-dependent bias is finite-T and is now corrected (D5 corrected')
+    print('    rows; D6 has it in the kernel). Next: set IPSF_NPZ to the 3DGS COBRI iPSF')
+    print('    (ipsf_cobri_xsec.ipynb) to put the D6 peaks on an absolute D scale.')
 else:
     print('  * Nothing invalidating found. The measurement is what it was assumed to be,')
     print('    and the ~1-robust-axis conclusion stands. New axes need new acquisition')
     print('    (q-resolved DDM/STICS, or an orthogonal modality).')
 save_results()
 print('all outputs in', _out_dir())""")
+
+# ─────────────────────────────── cell 11 : zip + download ──────────────────
+code(r"""# ── zip every saved output (figures, log.txt, results.json) and download it ──
+import shutil
+from google.colab import files
+
+# Get the active output directory
+output_dir = _out_dir()
+zip_output_path = '/content/iscors_diagnostic_outputs'
+
+print(f'Compressing outputs from: {output_dir}')
+shutil.make_archive(zip_output_path, 'zip', output_dir)
+
+print('Zip file created successfully. Starting download...')
+files.download(f'{zip_output_path}.zip')""")
 
 nb = {
     "cells": [

@@ -231,7 +231,8 @@ def ipsf_kernel(taus, dt, q2, S, D=None, T=None, n_D=80, pad=3.0):
 
 
 # ───────────────────────────── inversion on a general kernel ────────────────
-def invert_kernel(g, K, lam=1e-4, weights=None, g0_anchor=1.0, n_iter=20000, tol=1e-10):
+def invert_kernel(g, K, lam=1e-4, weights=None, g0_anchor=1.0, nugget=True,
+                  n_iter=20000, tol=1e-10, return_nugget=False):
     """CONTIN-style  min ||W(K p - g)||^2 + lam ||L p||^2,  p >= 0  (FISTA).
 
     L is the second-difference operator on the (log-spaced) grid — CONTIN's default
@@ -241,33 +242,40 @@ def invert_kernel(g, K, lam=1e-4, weights=None, g0_anchor=1.0, n_iter=20000, tol
     Args:
         g       : (k,) measured normalised G at the kernel's taus.
         K       : (k, M) kernel.
-        lam     : regularisation strength (relative to ||K||^2). Pick it from the
-                  noise: the residual RMS should land near the half-split noise.
+        lam     : regularisation strength (relative to ||K||^2). Scan it: a peak that
+                  moves or vanishes as lam changes by 10x is the regulariser, not data.
         weights : (k,) 1/sigma per tau, or None.
-        g0_anchor : the 'nor1' estimator is exactly 1 at tau=0 and every kernel column
-                  is 1 there too, so a tau=0 row (sum p = 1) is free information. It
-                  stops the solver parking mass in D's that decay within one frame
-                  (an edge peak that otherwise mimics a constant offset). None = off.
-                  If a real sub-frame population exists, that is where it shows up:
-                  as mass at the fast edge of the D grid.
-    Returns p (M,); with the anchor, sum(p) ~ 1 and p is the population fraction.
+        g0_anchor : the 'nor1' estimator is exactly 1 at tau=0, so a tau=0 row is free
+                  information (sum of all weights = 1). None = off.
+        nugget  : with the anchor, add a separate non-negative weight that is 1 at
+                  tau=0 and 0 at every tau>=1: the white-noise share of the variance
+                  (shot/read noise, anything decorrelating within one frame). Without
+                  it the 1-G(1) drop is forced into the fastest D column and shows up
+                  as a fake peak at the top edge of the grid.
+        return_nugget : also return the nugget weight.
+    Returns p (M,) (and the nugget if asked); with the anchor sum(p)+nugget ~ 1.
     """
     g = np.asarray(g, float)
     K = np.asarray(K, float)
+    M = K.shape[1]
     W = np.ones(len(g)) if weights is None else np.asarray(weights, float)
+    use_nug = nugget and g0_anchor is not None
     if g0_anchor is not None:
         g = np.r_[g0_anchor, g]
-        K = np.vstack([np.ones(K.shape[1]), K])
+        K = np.vstack([np.ones(M), K])
         W = np.r_[W.max() * 10.0, W]
+    if use_nug:
+        col = np.zeros((K.shape[0], 1)); col[0, 0] = 1.0
+        K = np.hstack([K, col])
     A, b = K * W[:, None], g * W
-    M = K.shape[1]
-    L = np.diff(np.eye(M), 2, axis=0)
+    N = K.shape[1]
+    L = np.zeros((M - 2, N)); L[:, :M] = np.diff(np.eye(M), 2, axis=0)   # nugget not smoothed
     data_rows = A[1:] if g0_anchor is not None else A
     scale = np.linalg.norm(data_rows, 2) ** 2           # lam relative to the data, not the anchor
     H = A.T @ A + lam * scale * (L.T @ L)
     f = A.T @ b
     step = 1.0 / np.linalg.norm(H, 2)
-    p = y = np.full(M, max(g[0], 1e-3) / M)
+    p = y = np.full(N, max(g[0], 1e-3) / N)
     tk = 1.0
     for _ in range(n_iter):
         p_new = np.maximum(y - step * (H @ y - f), 0.0)
@@ -277,18 +285,35 @@ def invert_kernel(g, K, lam=1e-4, weights=None, g0_anchor=1.0, n_iter=20000, tol
             p = p_new
             break
         p, tk = p_new, t_new
-    return p
+    nug = float(p[M]) if use_nug else 0.0
+    p = p[:M]
+    return (p, nug) if return_nugget else p
 
 
-def spectrum_summary(p, D, rel=0.05):
-    """Centroid / width (decades of log10 D) and local-maxima list of P(D)."""
+def spectrum_summary(p, D, rel=0.05, edge=4):
+    """Centroid / width (decades of log10 D) and peaks of P(D), with the grid edges
+    reported separately.
+
+    Mass in the `edge` bins at either end is NOT a population at that D: at the slow
+    end it means "slower than the tau window can resolve" (still correlated at
+    tau_max — a lower bound bucket), at the fast end "decays within ~one frame".
+    Peaks are only counted in the interior; centroid/width are of the interior mass.
+    """
     p = np.asarray(p, float)
+    tot = p.sum()
     lg = np.log10(D)
-    w = p / p.sum() if p.sum() > 0 else p
+    inner_m = np.zeros(len(p), bool); inner_m[edge:len(p) - edge] = True
+    pin = np.where(inner_m, p, 0.0)
+    w = pin / pin.sum() if pin.sum() > 0 else pin
     mean = float((w * lg).sum())
     width = float(np.sqrt((w * (lg - mean) ** 2).sum()))
-    pp = np.r_[0.0, p, 0.0]
-    inner = pp[1:-1]
-    peaks = np.where((inner > pp[:-2]) & (inner >= pp[2:]) & (inner > rel * p.max()))[0]
-    return {"centroid_log10D": mean, "width_dec": width, "peak_D": D[peaks],
-            "peak_mass": [float(p[max(0, i - 3):i + 4].sum() / p.sum()) for i in peaks]}
+    pp = np.r_[0.0, pin, 0.0]
+    mid = pp[1:-1]
+    peaks = np.where((mid > pp[:-2]) & (mid >= pp[2:]) & (mid > rel * max(pin.max(), 1e-30))
+                     & inner_m)[0]
+    frac = (lambda x: float(x / tot)) if tot > 0 else (lambda x: float("nan"))
+    return {"centroid_log10D": mean, "centroid_D": float(10 ** mean), "width_dec": width,
+            "peak_D": D[peaks],
+            "peak_mass": [frac(pin[max(edge, i - 3):i + 4].sum()) for i in peaks],
+            "slow_edge_frac": frac(p[:edge].sum()), "fast_edge_frac": frac(p[-edge:].sum()),
+            "interior_frac": frac(pin.sum())}

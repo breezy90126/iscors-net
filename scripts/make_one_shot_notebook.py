@@ -90,12 +90,41 @@ RESULT = {}          # every diagnostic writes its verdict here; last cell tabul
 def guard(name):
     ~~~Decorator: a failing diagnostic must not abort the one-shot run.~~~
     def deco(fn):
+        _CUR[0] = name
         try:
             fn()
         except Exception:
             RESULT[name] = {'verdict': 'ERROR', 'detail': traceback.format_exc(limit=3)}
             print(f'!! {name} failed (run continues):'); traceback.print_exc(limit=3)
     return deco
+
+# ── save every figure + all printed text to Drive (OUT_DIR is set in the config cell) ──
+import builtins, json as _json, datetime as _dt
+_FIG_N = [0]; _CUR = ['setup']
+def _out_dir():
+    d = globals().get('OUT_DIR') or '/content/drive/MyDrive/iscors_test/one_shot_outputs'
+    os.makedirs(d, exist_ok=True); return d
+_show = plt.show
+def _save_show(*a, **kw):
+    fig = plt.gcf()
+    if fig.get_axes():
+        _FIG_N[0] += 1
+        fn = os.path.join(_out_dir(), f'fig{_FIG_N[0]:02d}_{_CUR[0]}.png')
+        fig.savefig(fn, dpi=150, bbox_inches='tight'); builtins.print(f'  [saved] {fn}')
+    return _show(*a, **kw)
+plt.show = _save_show
+_print = builtins.print
+def print(*a, **kw):                     # tee: screen + OUT_DIR/log.txt
+    _print(*a, **kw)
+    if kw.get('file') is None:
+        with open(os.path.join(_out_dir(), 'log.txt'), 'a') as f:
+            _print(*a, **{k: v for k, v in kw.items() if k != 'file'}, file=f)
+def save_results():
+    ~~~RESULT (all verdicts / numbers) -> OUT_DIR/results.json~~~
+    fn = os.path.join(_out_dir(), 'results.json')
+    with open(fn, 'w') as f:
+        _json.dump(RESULT, f, indent=1, default=lambda o: o.tolist() if hasattr(o, 'tolist') else str(o))
+    _print('[saved]', fn)
 print('imports ok')""")
 
 # ─────────────────────────────── cell 2 ────────────────────────────────────
@@ -121,7 +150,13 @@ OBJ_NA        = 1.49
 GEOMETRY      = 'transmission'
 IPSF_NPZ      = None      # path from scripts/export_ipsf_stack.py; None -> scalar pupil model
 IPSF_Z_NM     = (-300, -150, 0, 150, 300)   # static height spread averaged into the kernel
-D6_LAMBDA     = 1e-4      # CONTIN regularisation (raise it if the halves disagree)
+D6_LAMBDAS    = (1e-4, 1e-3, 1e-2)   # CONTIN regularisation scan: only peaks that survive all are real
+D6_REL_MIN    = 0.30      # GEVD axes kept if their cross-half reproducible fraction >= this
+D6_DROP_FRAC  = 0.30      # drop this share of nucleus pixels with the worst half1-vs-half2 agreement
+D6_N_CLUSTERS = 3         # k-means groups in the reproducible-axis space (P(D) per group)
+
+# ── outputs: every figure (png), the printed log and results.json land here ──
+OUT_DIR = '/content/drive/MyDrive/iscors_test/one_shot_outputs/' + time.strftime('%Y%m%d_%H%M')
 
 # ── diagnostic knobs ──
 N_PSD_PX   = 2000         # pixels sampled for the local power spectrum
@@ -674,23 +709,27 @@ def _d5():
     RESULT.setdefault('D5', {})['verdict'] = 'ok'""")
 
 # ─────────────────────────────── cell 9b : D6 ──────────────────────────────
-code(r"""# ══ D6 — P(D) with the iPSF kernel (docs/ipsf_kernel.md) ══
-# D5 inverts with the DLS kernel exp(-Gamma tau): a single D comes back as a broad,
-# even two-peaked, rate spectrum because one pixel integrates over every q the iPSF
-# passes. Here the kernel column for each D is the pixel's ACF computed from the iPSF
-# power spectrum (pixel binning, a static height spread and the finite-T bias of this
-# very estimator included), so the inversion returns P(D) in um^2/s directly.
-# ROI curves are c0-weighted (sum G*c0 / sum c0), the average the kernel describes.
+code(r"""# ══ D6 — P(D) with the iPSF kernel, on GEVD-filtered pixels (docs/ipsf_kernel.md) ══
+# 1) noise filter, same idea as the deliverable's Section 3 (pca-separation line):
+#    cross-half GEVD on the per-pixel G(tau) curves. An axis's eigenvalue is the share of its
+#    variance that REPEATS between the two halves; axes below D6_REL_MIN are noise. Each pixel
+#    is scored by how well its half1 and half2 projections on the kept axes agree; the worst
+#    D6_DROP_FRAC are dropped. The survivors are k-means clustered on the kept axes.
+# 2) per group: c0-weighted ROI curve -> iPSF kernel (finite-T bias for full / half length)
+#    -> CONTIN with a separate white-noise weight, scanned over D6_LAMBDAS.
+# Reading rules (printed as VERDICT):
+#    * mass at the grid edges is NOT a population: slow edge = still correlated at tau_max
+#      (slower than this window resolves), fast edge = decays within ~1 frame.
+#    * a multi-peak claim needs (a) residual within ~2x the half-split noise and (b) the same
+#      interior peaks at every lambda. Half-split agreement alone is not enough: a systematic
+#      (finite-T bias, drift - see D4) is identical in both halves.
 @guard('D6')
 def _d6():
     assert FRAME_RATE_HZ, 'D6 needs FRAME_RATE_HZ to put D in physical units'
     dt = 1.0 / FRAME_RATE_HZ
     px = CAM_PIXEL_NM * 1e-9
     if IPSF_NPZ:
-        stack, zs, px_npz = ik.load_ipsf_npz(IPSF_NPZ)
-        if abs(px_npz - px) > 1e-12:
-            print(f'  note: iPSF pixel {px_npz*1e9:.1f} nm overrides CAM_PIXEL_NM'); px = px_npz
-        src = f'generator stack {IPSF_NPZ}'
+        stack, zs, px = ik.load_ipsf_npz(IPSF_NPZ); src = f'generator stack {IPSF_NPZ}'
     else:
         stack = ik.scalar_ipsf_stack([z * 1e-9 for z in IPSF_Z_NM], n_pix=256, pixel_size=px,
                                      wavelength=WAVELENGTH_NM * 1e-9, NA=OBJ_NA,
@@ -699,57 +738,114 @@ def _d6():
     q2, S = ik.ipsf_spectrum(stack, px, bin_factor=BIN_FACTOR, n_q2_bins=512)
     q2e = ik.effective_q2(q2, S)
     print(f'iPSF source: {src}')
-    print(f'effective q = {np.sqrt(q2e)*1e-6:.2f} rad/um  (1/q = {1e9/np.sqrt(q2e):.0f} nm)')
+    print(f'effective q = {np.sqrt(q2e)*1e-6:.2f} rad/um  (1/q = {1e9/np.sqrt(q2e):.0f} nm)'
+          '  <- the absolute D scale goes as 1/q^2: a 2x error in q is 4x in D')
 
     T, h = CACHE['T'], CACHE['T'] // 2
-    D_grid = ik.d_grid(RECON_TAUS, dt, q2e, n=80)
+    D_grid = ik.d_grid(RECON_TAUS, dt, q2e, n=80, pad=10.0)
     K_full, _ = ik.ipsf_kernel(RECON_TAUS, dt, q2, S, D=D_grid, T=T)
     K_half, _ = ik.ipsf_kernel(RECON_TAUS, dt, q2, S, D=D_grid, T=h)
     D_um = D_grid * 1e12
+    print(f'resolvable window: D ~ {D_um[3]:.3g} .. {D_um[-4]:.3g} um^2/s')
 
-    nuc = CACHE['nuc']
-    Y = np.log10(np.clip(CACHE['dens'], 1e-12, None))
-    nucleoli = nuc & (Y < np.nanpercentile(Y[nuc], 12))
-    out = {}
-    for tag, m in (('whole nucleus', nuc), ('nucleoli', nucleoli), ('nucleoplasm', nuc & ~nucleoli)):
-        g, n_px = ik.roi_curve(CACHE['G'], CACHE['C0'], m)
-        g1, _ = ik.roi_curve(CACHE['G1'], CACHE['C0_1'], m)
-        g2, _ = ik.roi_curve(CACHE['G2'], CACHE['C0_2'], m)
+    # ── 1) GEVD noise filter + clustering ──
+    G, G1, G2 = CACHE['G'], CACHE['G1'], CACHE['G2']
+    nuc = CACHE['nuc'] & np.isfinite(G).all(-1) & np.isfinite(G1).all(-1) & np.isfinite(G2).all(-1)
+    F1, F2, Ff = G1[nuc].astype(float), G2[nuc].astype(float), G[nuc].astype(float)
+    mu = (F1.mean(0) + F2.mean(0)) / 2; sd = (F1.std(0) + F2.std(0)) / 2 + 1e-9
+    a1, a2, af = (F1 - mu) / sd, (F2 - mu) / sd, (Ff - mu) / sd
+    Cg = (a1.T @ a2) / len(a1); Cg = (Cg + Cg.T) / 2
+    Ct = np.cov(np.vstack([a1, a2]).T)
+    ev, U = np.linalg.eigh(Ct); Wh = U / np.sqrt(np.clip(ev, 1e-12, None))     # whiten Ct
+    lam_g, V = np.linalg.eigh(Wh.T @ Cg @ Wh); o = np.argsort(lam_g)[::-1]
+    lam_g, Wg = lam_g[o], (Wh @ V)[:, o]
+    keep = np.where(lam_g >= D6_REL_MIN)[0]
+    if len(keep) == 0: keep = np.array([0])
+    print('\nGEVD reproducible fraction per axis:', np.round(lam_g, 2), f'-> keep {len(keep)} axis(es)')
+    P1, P2, Pf = a1 @ Wg[:, keep], a2 @ Wg[:, keep], af @ Wg[:, keep]
+    disagree = ((P1 - P2) ** 2).sum(1) / (((P1 ** 2).sum(1) + (P2 ** 2).sum(1)) + 1e-12)
+    good = disagree <= np.quantile(disagree, 1 - D6_DROP_FRAC)
+    print(f'pixels: {len(good)} in nucleus -> {int(good.sum())} kept after dropping the '
+          f'{D6_DROP_FRAC:.0%} least reproducible')
+    # k-means (numpy) on the kept axes, kept pixels only
+    rng = np.random.default_rng(0); Z = Pf[good]
+    C = Z[rng.choice(len(Z), D6_N_CLUSTERS, replace=False)]
+    for _ in range(100):
+        lab = np.argmin(((Z[:, None, :] - C[None]) ** 2).sum(-1), 1)
+        C_new = np.array([Z[lab == k].mean(0) if np.any(lab == k) else C[k] for k in range(D6_N_CLUSTERS)])
+        if np.allclose(C_new, C): break
+        C = C_new
+    order = np.argsort(C[:, 0]); lab = np.argsort(order)[lab]       # sort groups along axis 1
+    Hh, Ww = nuc.shape
+    lab_map = np.full((Hh, Ww), np.nan); good_map = np.zeros((Hh, Ww), bool)
+    idx = np.flatnonzero(nuc); good_map.flat[idx[good]] = True; lab_map.flat[idx[good]] = lab
+    fig, ax = plt.subplots(1, 3, figsize=(13, 3.8))
+    ax[0].bar(np.arange(len(lam_g)) + 1, lam_g); ax[0].axhline(D6_REL_MIN, color='r', ls='--', lw=0.8)
+    ax[0].set_xlabel('GEVD axis'); ax[0].set_ylabel('reproducible fraction'); ax[0].set_title('noise axes below the line')
+    dm = np.full((Hh, Ww), np.nan); dm.flat[idx] = disagree
+    im = ax[1].imshow(dm, cmap='magma'); plt.colorbar(im, ax=ax[1]); ax[1].set_title('half1 vs half2 disagreement')
+    im = ax[2].imshow(lab_map, cmap='tab10', vmin=0, vmax=9, interpolation='nearest')
+    ax[2].set_title(f'{D6_N_CLUSTERS} groups (kept pixels)')
+    for a in ax[1:]: a.axis('off')
+    plt.tight_layout(); plt.show()
+
+    # ── 2) P(D) per group ──
+    groups = [('filtered nucleus', good_map)] + [(f'group {k+1}', lab_map == k) for k in range(D6_N_CLUSTERS)]
+    out = {'gevd_rel': lam_g.tolist(), 'n_axes_kept': int(len(keep)), 'n_px_kept': int(good.sum())}
+    fig, axs = plt.subplots(1, len(groups), figsize=(4.2 * len(groups), 3.4), sharey=True)
+    for (tag, m), axp in zip(groups, axs):
+        g, n_px = ik.roi_curve(G, CACHE['C0'], m)
+        g1, _ = ik.roi_curve(G1, CACHE['C0_1'], m)
+        g2, _ = ik.roi_curve(G2, CACHE['C0_2'], m)
         if n_px < 50:
             print(f'{tag}: only {n_px} px, skipped'); continue
         noise = float(np.sqrt(((g1 - g2) ** 2).mean()) / 2.0)
-        p = ik.invert_kernel(g, K_full, lam=D6_LAMBDA)
-        p1 = ik.invert_kernel(g1, K_half, lam=D6_LAMBDA)
-        p2 = ik.invert_kernel(g2, K_half, lam=D6_LAMBDA)
-        s, s1, s2 = (ik.spectrum_summary(x, D_um) for x in (p, p1, p2))
         D1, r1 = ik.best_single_d(g, K_full, D_um)
-        resid = float(np.sqrt(((K_full @ p - g) ** 2).mean()))
-        same = len(s1['peak_D']) == len(s2['peak_D']) == len(s['peak_D'])
-        print(f'\n--- {tag} ({n_px} px) ---')
-        print(f'  single-D reference: D = {D1:.3g} um^2/s   residual {r1:.5f}  vs noise {noise:.5f}')
-        print(f'  P(D) peaks [um^2/s]: {np.array2string(s["peak_D"], precision=3)}'
-              f'  mass {np.round(s["peak_mass"], 2)}  width {s["width_dec"]:.2f} dec'
-              f'  residual {resid:.5f}')
-        print(f'  halves: {np.array2string(s1["peak_D"], precision=3)} / '
-              f'{np.array2string(s2["peak_D"], precision=3)}')
-        if r1 < 2 * noise:
-            verdict = 'one D explains the curve within noise -> report the single D'
-        elif same and len(s['peak_D']) > 1:
-            verdict = f'{len(s["peak_D"])} populations, reproduced in both halves'
+        print(f'\n--- {tag} ({n_px} px) ---   G(1)={g[0]:.3f}  G(tau_max)={g[-1]:.3f}  noise {noise:.5f}')
+        print(f'  single-D reference: D = {D1:.3g} um^2/s, residual {r1:.5f}')
+        runs = []
+        for lam in D6_LAMBDAS:
+            p, nug = ik.invert_kernel(g, K_full, lam=lam, return_nugget=True)
+            p1 = ik.invert_kernel(g1, K_half, lam=lam); p2 = ik.invert_kernel(g2, K_half, lam=lam)
+            sm, s1, s2 = (ik.spectrum_summary(x, D_um) for x in (p, p1, p2))
+            resid = float(np.sqrt(((K_full @ p - g) ** 2).mean()))
+            runs.append(dict(lam=lam, p=p, nug=nug, s=sm, resid=resid,
+                             halves_same=len(s1['peak_D']) == len(s2['peak_D']) == len(sm['peak_D'])))
+            print(f'  lam={lam:.0e}: white-noise {nug:.2f} | slow-edge {sm["slow_edge_frac"]:.2f} | '
+                  f'fast-edge {sm["fast_edge_frac"]:.2f} | interior peaks {np.array2string(sm["peak_D"], precision=3)} '
+                  f'(mass {np.round(sm["peak_mass"], 2)}), centroid {sm["centroid_D"]:.3g} | resid {resid:.5f}')
+        n_pk = [len(r['s']['peak_D']) for r in runs]
+        stable = len(set(n_pk)) == 1 and all(
+            np.allclose(np.log10(r['s']['peak_D']), np.log10(runs[0]['s']['peak_D']), atol=0.15)
+            for r in runs) if n_pk[0] else False
+        best = min(runs, key=lambda r: r['resid'])
+        fits = best['resid'] <= 2 * noise
+        if not fits:
+            verdict = (f'NO model in this family fits to the noise (best resid {best["resid"]:.4f} vs '
+                       f'2x noise {2*noise:.4f}): systematics dominate -> trust only the interior '
+                       f'centroid ({best["s"]["centroid_D"]:.3g} um^2/s) as an order of magnitude')
+        elif n_pk[0] > 1 and stable and best['halves_same']:
+            verdict = f'{n_pk[0]} interior populations, stable across lambda and both halves'
+        elif n_pk[0] >= 1:
+            verdict = ('ONE broad interior distribution (peak splitting is regulariser-dependent)'
+                       if not stable else f'{n_pk[0]} interior peak(s), stable')
         else:
-            verdict = 'structure beyond one D, but the halves disagree -> raise D6_LAMBDA / more px'
+            verdict = 'no interior mass: dynamics outside the resolvable D window'
         print(f'  VERDICT: {verdict}')
-        out[tag] = dict(n_px=n_px, D_single=D1, resid_single=r1, noise=noise,
-                        peaks=s['peak_D'].tolist(), reproduced=same)
-        if tag == 'whole nucleus':
-            plt.figure(figsize=(6, 3.6))
-            for x, ls, lab in ((p, '-', 'full'), (p1, '--', 'half 1'), (p2, '--', 'half 2')):
-                plt.semilogx(D_um, x / max(x.max(), 1e-30), ls, lw=1.2 if lab == 'full' else 0.9,
-                             label=lab)
-            plt.axvline(0.92, color='gray', lw=0.8, ls=':', label='paper D* 0.92')
-            plt.xlabel('D [um^2/s]'); plt.ylabel('P(D) (normalised)')
-            plt.title('P(D) from the iPSF kernel', fontsize=10)
-            plt.legend(fontsize=8); plt.tight_layout(); plt.show()
+        out[tag] = dict(n_px=n_px, noise=noise, D_single=D1, resid_single=r1,
+                        runs=[dict(lam=r['lam'], white=r['nug'], slow_edge=r['s']['slow_edge_frac'],
+                                   fast_edge=r['s']['fast_edge_frac'], peaks=r['s']['peak_D'].tolist(),
+                                   peak_mass=r['s']['peak_mass'], centroid=r['s']['centroid_D'],
+                                   resid=r['resid']) for r in runs],
+                        verdict=verdict)
+        for r, ls in zip(runs, ('-', '--', ':')):
+            axp.semilogx(D_um, r['p'] / max(r['p'].max(), 1e-30), ls, label=f'lam {r["lam"]:.0e}')
+        axp.axvspan(D_um[0], D_um[2], color='0.85'); axp.axvspan(D_um[-3], D_um[-1], color='0.85')
+        axp.axvline(0.92, color='gray', lw=0.8, ls=':')
+        axp.set_title(f'{tag} ({n_px} px)', fontsize=9); axp.set_xlabel('D [um^2/s]')
+    axs[0].set_ylabel('P(D) (norm.)'); axs[0].legend(fontsize=7)
+    plt.suptitle('P(D), iPSF kernel. grey = grid edges (not populations); dotted = paper D* 0.92', fontsize=10)
+    plt.tight_layout(); plt.show()
     out['verdict'] = 'ok'
     RESULT['D6'] = out""")
 
@@ -795,6 +891,10 @@ print('=' * 96)
 hit = sum(1 for _, ok, _ in rows if ok)
 print(f'  {hit}/{len(rows)} predictions held.')
 print('  Surprises are the useful rows — they are where the model of the experiment was wrong.')
+d6 = RESULT.get('D6') or {}
+for tag, v in d6.items():
+    if isinstance(v, dict) and 'verdict' in v:
+        print(f'  D6 {tag:18s}: {v["verdict"]}')
 
 # what to do next, driven by what actually came back
 print('\nNEXT STEP:')
@@ -814,7 +914,9 @@ elif d4.get('trend') is not None and abs(d4.get('trend', 0)) >= 0.02:
 else:
     print('  * Nothing invalidating found. The measurement is what it was assumed to be,')
     print('    and the ~1-robust-axis conclusion stands. New axes need new acquisition')
-    print('    (q-resolved DDM/STICS, or an orthogonal modality).')""")
+    print('    (q-resolved DDM/STICS, or an orthogonal modality).')
+save_results()
+print('all outputs in', _out_dir())""")
 
 nb = {
     "cells": [

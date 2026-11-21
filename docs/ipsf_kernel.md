@@ -107,8 +107,15 @@ CONTIN 式：`min ||W(Kp − g)||² + λ||L p||²，p ≥ 0`，L 是二階差分
 
 1. **z 方向運動**沒有進 kernel（只有靜態 z 分佈）。z 改變干涉相位，對快的軸向運動要用
    模擬器做完整 3D 模擬來檢查 kernel。
-2. 需要真實的 **Δt（幀時間）、BIN_FACTOR、N_FRAMES** 和實驗的光學參數，才能把 D 換成 m²/s。
-3. 還沒接進 notebook。建議的接法：
-   `roi_spectrum` 的 ROI 平均改成 c0 加權 → 用 `ipsf_kernel(RECON_TAUS, dt, q2, S, T=N_FRAMES)`
-   → `invert_kernel` → half-split 檢查峰是否可重現。
-4. per-pixel 仍然不可行（雜訊 4.1% 下沒有可分辨的第二群），這仍是 ROI 級的分析。
+2. 已接進 `iscors_one_shot_diagnostics.ipynb` 的 **D6**（由 `scripts/make_one_shot_notebook.py` 產生）：
+   c0 加權 ROI 曲線 → `ipsf_kernel(..., T)`（全段與半段各一個 kernel）→ `invert_kernel`
+   → half-split 檢查峰是否重現，P(D) 以 µm²/s 畫出，並標上論文的 D* = 0.92 µm²/s。
+   實驗參數取自論文 Methods（Hsiao et al., Commun. Biol. 7:763, 2024）：
+   **COBRI（穿透式 iSCAT）、660 nm、OBJ2 NA 1.49、42 nm/px（640×640）、5000 fps**。
+   注意舊設定裡的 520/532 nm、65 nm/px 跟論文不符，已在 notebook config 改正波長與幀率。
+3. 論文本身用的是單一 k 的 DLS 式 `ACF = exp(−D*k²τ)`，k 用奈米粒子校正。
+   D6 的 iPSF kernel 是另一個假設（橫向 q 積分）；兩者給的 D 可以互相對照，
+   但 k 的校正值只有在 SI 裡，D6 的絕對值目前取決於 iPSF 模型（純量模型只是近似）。
+4. 染色質不是稀薄粒子：連續介質的情況下權重還要乘上未知的靜態結構因子 S_ρ(q)，
+   目前假設它在通帶內是平的。
+5. per-pixel 仍然不可行（雜訊 4.1% 下沒有可分辨的第二群），這仍是 ROI 級的分析。

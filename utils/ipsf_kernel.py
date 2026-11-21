@@ -44,13 +44,16 @@ import numpy as np
 
 # ───────────────────────────── iPSF sources ─────────────────────────────────
 def scalar_ipsf(n_pix=128, pixel_size=72e-9, wavelength=532e-9, NA=1.4, n_medium=1.33,
-                z=70e-9, ref_phase=0.0, scat_amp=0.05):
+                z=70e-9, ref_phase=0.0, scat_amp=0.05, geometry="reflection"):
     """Scalar-pupil iPSF contrast image (fallback when the torch generator is absent).
 
     E_s(x, y) = IFT[ pupil(k) * exp(i k_z z) ], pupil = disk |k| <= k0*min(NA, n_medium);
     iPSF = 2 s Re(E_s e^{-i ref_phase}) + s^2 |E_s|^2, normalised so max|E_s| = 1.
     Captures the ring structure and the z-dependent contrast flip; ignores
     polarisation, supercritical angles and aberrations (the generator has those).
+
+    geometry: "reflection" (iSCAT; the scattered wave picks up exp(2 i k_z z)) or
+              "transmission" (COBRI, the setup of the iSCORS paper; exp(i k_z z)).
     """
     k0 = 2 * np.pi / wavelength
     k_max = k0 * min(NA, n_medium)
@@ -59,10 +62,40 @@ def scalar_ipsf(n_pix=128, pixel_size=72e-9, wavelength=532e-9, NA=1.4, n_medium
     K2 = KX ** 2 + KY ** 2
     pupil = (K2 <= k_max ** 2).astype(complex)
     kz = np.sqrt(np.clip((k0 * n_medium) ** 2 - K2, 0, None))
-    E = np.fft.fftshift(np.fft.ifft2(pupil * np.exp(1j * 2 * kz * z)))  # round trip 2z
+    n_pass = 2 if geometry == "reflection" else 1
+    E = np.fft.fftshift(np.fft.ifft2(pupil * np.exp(1j * n_pass * kz * z)))
     E = E / np.abs(E).max()
     return (2 * scat_amp * np.real(E * np.exp(-1j * ref_phase))
             + scat_amp ** 2 * np.abs(E) ** 2)
+
+
+def scalar_ipsf_stack(z_list, **kw):
+    """(nz, H, W) stack of scalar_ipsf over heights z_list (m)."""
+    return np.stack([scalar_ipsf(z=z, **kw) for z in z_list])
+
+
+def roi_curve(G, c0, mask):
+    """ROI-averaged normalised ACF that matches the kernel: sum(G*c0)/sum(c0).
+
+    G : (H, W, K) per-pixel nor1 curves; c0 : (H, W) per-pixel C_hat(0).
+    Averaging per-pixel ratios instead adds a Jensen bias whenever C_hat(0)
+    fluctuates (see scripts/validate_ipsf_kernel.py PART 1).
+    """
+    G = np.asarray(G, float)
+    c0 = np.asarray(c0, float)
+    m = np.asarray(mask, bool) & np.isfinite(c0) & np.isfinite(G).all(axis=-1) & (c0 > 0)
+    w = c0[m]
+    return (G[m] * w[:, None]).sum(axis=0) / w.sum(), int(m.sum())
+
+
+def best_single_d(g, K, D):
+    """Single-population reference: the kernel column closest to g (least squares,
+    free amplitude). Returns (D_best, rms_residual)."""
+    g = np.asarray(g, float)
+    amp = (K * g[:, None]).sum(axis=0) / np.maximum((K * K).sum(axis=0), 1e-30)
+    res = np.sqrt(((K * amp[None, :] - g[:, None]) ** 2).mean(axis=0))
+    j = int(np.argmin(res))
+    return float(D[j]), float(res[j])
 
 
 def load_ipsf_npz(path):

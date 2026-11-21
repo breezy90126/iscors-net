@@ -37,6 +37,7 @@ md(r"""# iSCORS 一次性診斷 —— 你在取樣動力學，還是在取樣�
 | **D3** | 模型形式：代數 vs stretched exponential | 若 stretched 勝出，α 可直接讀、D_z 有物理單位 |
 | **D4** | finite-T 偏差直接量測 | 把先前的模擬推論降級成量測 |
 | **D5** | bulk 速率譜 | 前四項的前提沒問題才有意義 |
+| **D6** | 用模擬 iPSF kernel 反演 P(D)（µm²/s） | 修正 D5 的 kernel mismatch；見 `docs/ipsf_kernel.md` |
 
 ## 事前登記的預測（跑之前先寫下來）
 
@@ -63,7 +64,7 @@ md(r"""# iSCORS 一次性診斷 —— 你在取樣動力學，還是在取樣�
 code(r"""# ── setup: clone/update repo from GitHub, mount Drive, install deps ──
 import os, sys, subprocess
 REPO = 'https://github.com/breezy90126/iscors-net.git'
-BRANCH = 'claude/laplace-projection-alpha-ocpbfu'
+BRANCH = 'claude/project-thread-kkiy52'
 REPO_DIR = '/content/iscors-net'
 try:
     from google.colab import drive; drive.mount('/content/drive', force_remount=False)
@@ -83,6 +84,7 @@ from scipy.ndimage import zoom, gaussian_filter, median_filter
 from utils.gpu_iscors_fit import (compute_density, compute_g_norm_torch, gpu_fit_maps,
                                   vdls_amplitude)
 import utils.laplace_spectrum as lsp
+import utils.ipsf_kernel as ik
 
 RESULT = {}          # every diagnostic writes its verdict here; last cell tabulates
 def guard(name):
@@ -98,6 +100,9 @@ print('imports ok')""")
 
 # ─────────────────────────────── cell 2 ────────────────────────────────────
 code(r"""# ── config (EDIT paths + the acquisition block) ──
+# Data: the representative-nucleus iSCORS movie + Output_iSCORS_map.mat from the paper's
+# Zenodo record (Hsiao et al., Commun. Biol. 7:763, 2024): https://zenodo.org/records/11182995
+# Download it to Drive and point ZIP_PATH at the zip (or straight at the .tif).
 ZIP_PATH    = '/content/drive/MyDrive/iscors_test/large_file.zip'   # .zip or a .tif
 VIDEO_FNAME = 'COBRI_rarw_video.tif'
 EXTRACT_DIR = '/content/real_data'
@@ -106,9 +111,18 @@ N_FRAMES = 5000; BIN_FACTOR = 2; RECON_TAUS = (1, 2, 4, 8, 16, 32, 48, 64, 96, 1
 GAMMA_SCALE = 2.0
 
 # ── acquisition / optics (EDIT — D1 and D3 read these) ──
-FRAME_RATE_HZ = None      # None -> frequencies reported in cycles/frame (all verdicts still valid)
-WAVELENGTH_NM = 520.0     # illumination wavelength
+FRAME_RATE_HZ = 5000.0    # paper: 5000 fps unless stated (1000 fps for long time-lapses). None -> cycles/frame
+WAVELENGTH_NM = 660.0     # paper Methods: 660 nm laser (Laser Quantum opus 660)
 N_MEDIUM      = 1.38      # refractive index of the nucleoplasm
+
+# ── D6: iPSF kernel (paper Methods: COBRI = iSCAT in transmission, OBJ2 NA 1.49,
+#        640x640 camera at 42 nm/px). The kernel needs the RAW pixel; BIN_FACTOR is applied on top.
+CAM_PIXEL_NM  = 42.0
+OBJ_NA        = 1.49
+GEOMETRY      = 'transmission'
+IPSF_NPZ      = None      # path from scripts/export_ipsf_stack.py; None -> scalar pupil model
+IPSF_Z_NM     = (-300, -150, 0, 150, 300)   # static height spread averaged into the kernel
+D6_LAMBDA     = 1e-4      # CONTIN regularisation (raise it if the halves disagree)
 
 # ── diagnostic knobs ──
 N_PSD_PX   = 2000         # pixels sampled for the local power spectrum
@@ -119,6 +133,57 @@ Q_Z = 4 * np.pi * N_MEDIUM / (WAVELENGTH_NM * 1e-3)     # rad/um, axial interfer
 print(f'config ready.  q_z = {Q_Z:.1f} rad/um  ->  one fringe every '
       f'{2 * np.pi / Q_Z * 1000:.0f} nm of axial motion')
 print('frame rate:', FRAME_RATE_HZ or '(unset -> cycles/frame)')""")
+
+# ─────────────────────────────── cell 2b : data download ───────────────────
+code(r"""# ── data download (skip if ZIP_PATH already exists on Drive) ──
+# Reads the paper's Zenodo record page (the "SI" link), downloads straight into Colab
+# (fast), then copies to Drive so later runs skip this cell. Only files whose names
+# match DOWNLOAD_PATTERN are fetched; the list of everything in the record is printed.
+import json, re, shutil, urllib.request
+ZENODO_RECORD    = '11182995'                      # https://zenodo.org/records/11182995
+DOWNLOAD_PATTERN = r'\.(zip|tif|tiff|mat)$'        # what to fetch
+DRIVE_DATA_DIR   = os.path.dirname(ZIP_PATH)       # where the copy lands on Drive
+LOCAL_DL_DIR     = '/content/zenodo_dl'
+
+def _zenodo_files(rec):
+    ~~~[(name, url, size)] from the REST API, falling back to scraping the HTML page.~~~
+    try:
+        with urllib.request.urlopen(f'https://zenodo.org/api/records/{rec}', timeout=60) as r:
+            d = json.load(r)
+        return [(f['key'], f['links'].get('content') or f['links']['self'], f.get('size', 0))
+                for f in d.get('files', [])]
+    except Exception as e:
+        print('API failed, scraping the record page instead:', e)
+        with urllib.request.urlopen(f'https://zenodo.org/records/{rec}', timeout=60) as r:
+            html = r.read().decode('utf-8', 'ignore')
+        links = sorted(set(re.findall(rf'/records/{rec}/files/([^"?]+)', html)))
+        return [(urllib.request.unquote(n), f'https://zenodo.org/records/{rec}/files/{n}?download=1', 0)
+                for n in links]
+
+if os.path.exists(ZIP_PATH):
+    print(f'{ZIP_PATH} already on Drive - nothing to download')
+else:
+    files = _zenodo_files(ZENODO_RECORD)
+    print('record files:'); [print(f'  {n}  ({sz/1e9:.2f} GB)') for n, _, sz in files]
+    os.makedirs(LOCAL_DL_DIR, exist_ok=True); os.makedirs(DRIVE_DATA_DIR, exist_ok=True)
+    got = []
+    for name, url, sz in files:
+        if not re.search(DOWNLOAD_PATTERN, name, re.I):
+            continue
+        local = os.path.join(LOCAL_DL_DIR, os.path.basename(name))
+        print(f'downloading {name} ...')
+        subprocess.run(['wget', '-q', '--show-progress', '-O', local, url], check=True)
+        shutil.copy(local, os.path.join(DRIVE_DATA_DIR, os.path.basename(name)))
+        got.append(local)
+    # point the loader at what came down: a zip if there is one, else the video tif
+    zips = [g for g in got if g.lower().endswith('.zip')]
+    tifs = [g for g in got if g.lower().endswith(('.tif', '.tiff'))]
+    if zips:
+        ZIP_PATH = zips[0]
+    elif tifs:
+        ZIP_PATH = next((t for t in tifs if os.path.basename(t) == VIDEO_FNAME), tifs[0])
+    print('ZIP_PATH ->', ZIP_PATH, '  (copies saved in', DRIVE_DATA_DIR, ')')
+    print('If the video inside has a different name, set VIDEO_FNAME before the load cell.')""")
 
 # ─────────────────────────────── cell 3 ────────────────────────────────────
 code(r"""# ── loaders (same full-load convention as iscors_deliverable.ipynb) + diagnostic helpers ──
@@ -213,13 +278,13 @@ def temporal_kurtosis(arr, chunk=200):
 # ── shared: per-segment maps (same settings as the deliverable) ──
 def maps_of(seg):
     d, _ = compute_density(seg, min_cv=0.005)
-    g, _c, _z = compute_g_norm_torch(seg, RECON_TAUS, norm='nor1', min_cv=0.005)
+    g, _c, c0 = compute_g_norm_torch(seg, RECON_TAUS, norm='nor1', min_cv=0.005)
     f = gpu_fit_maps(seg, recon_taus=RECON_TAUS, n_components=1, global_alpha=True,
                      gamma_scale=GAMMA_SCALE, min_cv=0.005, n_steps=400, verbose=False)
-    try:    g = g.cpu().numpy()
-    except Exception: g = np.asarray(g)
+    try:    g, c0 = g.cpu().numpy(), c0.cpu().numpy()
+    except Exception: g, c0 = np.asarray(g), np.asarray(c0)
     return (f['gamma'].astype(np.float32), d.astype(np.float32),
-            g.astype(np.float32), float(np.nanmedian(f['alpha'])))
+            g.astype(np.float32), float(np.nanmedian(f['alpha'])), c0.astype(np.float32))
 print('loaders + diagnostic helpers defined')""")
 
 # ─────────────────────────────── cell 4 ────────────────────────────────────
@@ -252,9 +317,9 @@ print(f'[D2] kurtosis done  ({time.time()-t0:.0f}s)')
 
 # maps for the full record and both halves (same as the deliverable)
 h = T // 2
-gamma, dens, G, a_full = maps_of(vp)
-g1g, g1d, G1, a_h1 = maps_of(vp[:h])
-g2g, g2d, G2, a_h2 = maps_of(vp[h:])
+gamma, dens, G, a_full, C0 = maps_of(vp)
+g1g, g1d, G1, a_h1, C0_1 = maps_of(vp[:h])
+g2g, g2d, G2, a_h2, C0_2 = maps_of(vp[h:])
 
 # noise-free amplitude A = G(0+) extrapolated from tau>=1: 1-A is the white-noise share
 try:
@@ -269,6 +334,7 @@ try:
 except Exception: pass
 
 nuc = nuc0 & np.isfinite(gamma)
+CACHE.update(C0=C0, C0_1=C0_1, C0_2=C0_2)
 CACHE.update(gamma=gamma, dens=dens, G=G, alpha_full=a_full,
              g1g=g1g, g2g=g2g, G1=G1, G2=G2, alpha_h1=a_h1, alpha_h2=a_h2,
              nuc=nuc)
@@ -621,6 +687,86 @@ def _d5():
             plt.legend(fontsize=8); plt.tight_layout(); plt.show()
     RESULT.setdefault('D5', {})['verdict'] = 'ok'""")
 
+# ─────────────────────────────── cell 9b : D6 ──────────────────────────────
+code(r"""# ══ D6 — P(D) with the iPSF kernel (docs/ipsf_kernel.md) ══
+# D5 inverts with the DLS kernel exp(-Gamma tau): a single D comes back as a broad,
+# even two-peaked, rate spectrum because one pixel integrates over every q the iPSF
+# passes. Here the kernel column for each D is the pixel's ACF computed from the iPSF
+# power spectrum (pixel binning, a static height spread and the finite-T bias of this
+# very estimator included), so the inversion returns P(D) in um^2/s directly.
+# ROI curves are c0-weighted (sum G*c0 / sum c0), the average the kernel describes.
+@guard('D6')
+def _d6():
+    assert FRAME_RATE_HZ, 'D6 needs FRAME_RATE_HZ to put D in physical units'
+    dt = 1.0 / FRAME_RATE_HZ
+    px = CAM_PIXEL_NM * 1e-9
+    if IPSF_NPZ:
+        stack, zs, px_npz = ik.load_ipsf_npz(IPSF_NPZ)
+        if abs(px_npz - px) > 1e-12:
+            print(f'  note: iPSF pixel {px_npz*1e9:.1f} nm overrides CAM_PIXEL_NM'); px = px_npz
+        src = f'generator stack {IPSF_NPZ}'
+    else:
+        stack = ik.scalar_ipsf_stack([z * 1e-9 for z in IPSF_Z_NM], n_pix=256, pixel_size=px,
+                                     wavelength=WAVELENGTH_NM * 1e-9, NA=OBJ_NA,
+                                     n_medium=N_MEDIUM, geometry=GEOMETRY)
+        src = 'scalar pupil model (set IPSF_NPZ for the vector generator)'
+    q2, S = ik.ipsf_spectrum(stack, px, bin_factor=BIN_FACTOR, n_q2_bins=512)
+    q2e = ik.effective_q2(q2, S)
+    print(f'iPSF source: {src}')
+    print(f'effective q = {np.sqrt(q2e)*1e-6:.2f} rad/um  (1/q = {1e9/np.sqrt(q2e):.0f} nm)')
+
+    T, h = CACHE['T'], CACHE['T'] // 2
+    D_grid = ik.d_grid(RECON_TAUS, dt, q2e, n=80)
+    K_full, _ = ik.ipsf_kernel(RECON_TAUS, dt, q2, S, D=D_grid, T=T)
+    K_half, _ = ik.ipsf_kernel(RECON_TAUS, dt, q2, S, D=D_grid, T=h)
+    D_um = D_grid * 1e12
+
+    nuc = CACHE['nuc']
+    Y = np.log10(np.clip(CACHE['dens'], 1e-12, None))
+    nucleoli = nuc & (Y < np.nanpercentile(Y[nuc], 12))
+    out = {}
+    for tag, m in (('whole nucleus', nuc), ('nucleoli', nucleoli), ('nucleoplasm', nuc & ~nucleoli)):
+        g, n_px = ik.roi_curve(CACHE['G'], CACHE['C0'], m)
+        g1, _ = ik.roi_curve(CACHE['G1'], CACHE['C0_1'], m)
+        g2, _ = ik.roi_curve(CACHE['G2'], CACHE['C0_2'], m)
+        if n_px < 50:
+            print(f'{tag}: only {n_px} px, skipped'); continue
+        noise = float(np.sqrt(((g1 - g2) ** 2).mean()) / 2.0)
+        p = ik.invert_kernel(g, K_full, lam=D6_LAMBDA)
+        p1 = ik.invert_kernel(g1, K_half, lam=D6_LAMBDA)
+        p2 = ik.invert_kernel(g2, K_half, lam=D6_LAMBDA)
+        s, s1, s2 = (ik.spectrum_summary(x, D_um) for x in (p, p1, p2))
+        D1, r1 = ik.best_single_d(g, K_full, D_um)
+        resid = float(np.sqrt(((K_full @ p - g) ** 2).mean()))
+        same = len(s1['peak_D']) == len(s2['peak_D']) == len(s['peak_D'])
+        print(f'\n--- {tag} ({n_px} px) ---')
+        print(f'  single-D reference: D = {D1:.3g} um^2/s   residual {r1:.5f}  vs noise {noise:.5f}')
+        print(f'  P(D) peaks [um^2/s]: {np.array2string(s["peak_D"], precision=3)}'
+              f'  mass {np.round(s["peak_mass"], 2)}  width {s["width_dec"]:.2f} dec'
+              f'  residual {resid:.5f}')
+        print(f'  halves: {np.array2string(s1["peak_D"], precision=3)} / '
+              f'{np.array2string(s2["peak_D"], precision=3)}')
+        if r1 < 2 * noise:
+            verdict = 'one D explains the curve within noise -> report the single D'
+        elif same and len(s['peak_D']) > 1:
+            verdict = f'{len(s["peak_D"])} populations, reproduced in both halves'
+        else:
+            verdict = 'structure beyond one D, but the halves disagree -> raise D6_LAMBDA / more px'
+        print(f'  VERDICT: {verdict}')
+        out[tag] = dict(n_px=n_px, D_single=D1, resid_single=r1, noise=noise,
+                        peaks=s['peak_D'].tolist(), reproduced=same)
+        if tag == 'whole nucleus':
+            plt.figure(figsize=(6, 3.6))
+            for x, ls, lab in ((p, '-', 'full'), (p1, '--', 'half 1'), (p2, '--', 'half 2')):
+                plt.semilogx(D_um, x / max(x.max(), 1e-30), ls, lw=1.2 if lab == 'full' else 0.9,
+                             label=lab)
+            plt.axvline(0.92, color='gray', lw=0.8, ls=':', label='paper D* 0.92')
+            plt.xlabel('D [um^2/s]'); plt.ylabel('P(D) (normalised)')
+            plt.title('P(D) from the iPSF kernel', fontsize=10)
+            plt.legend(fontsize=8); plt.tight_layout(); plt.show()
+    out['verdict'] = 'ok'
+    RESULT['D6'] = out""")
+
 # ─────────────────────────────── cell 10 ───────────────────────────────────
 code(r"""# ══ scorecard: measured outcome vs the predictions registered in cell 0 ══
 def _fmt(ok):
@@ -699,7 +845,8 @@ nb = {
     "nbformat_minor": 5,
 }
 
-out = "/home/user/iscors-net/iscors_one_shot_diagnostics.ipynb"
+import os
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "iscors_one_shot_diagnostics.ipynb")
 with open(out, "w") as f:
     json.dump(nb, f, indent=1, ensure_ascii=False)
 print("wrote", out, "cells:", len(CELLS))

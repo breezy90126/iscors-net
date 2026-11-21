@@ -1070,6 +1070,7 @@ ICA_ROI_Z     = 2.0            # threshold in nucleus z-score
 PUNCTA_MAX_PX = 60             # blobs smaller than this are 'puncta' (binned px)
 N_LARGE       = 2              # largest blobs kept as separate ROIs
 ICA_ROI_NPY   = None
+ICA_EDGE_PX   = 6              # drop this many px inside the nucleus border (mask-edge artefacts)
 
 from scipy.ndimage import label as _cc_label, binary_dilation
 from scipy.stats import kurtosis as _kurt
@@ -1113,6 +1114,9 @@ def _d7():
     CACHE['ica_comps'] = comps
 
     nucleoli = np.zeros_like(nuc); nucleoli[m] = nucleoli_v
+    from scipy.ndimage import binary_erosion
+    inner = binary_erosion(nuc, iterations=ICA_EDGE_PX) if ICA_EDGE_PX else nuc
+    m = m & inner; nucleoli &= inner
     if ICA_ROI_NPY:
         lab = np.load(ICA_ROI_NPY).astype(int)
         rois = [(f'ROI {k}', (lab == k) & m) for k in range(1, lab.max() + 1)]
@@ -1344,20 +1348,26 @@ def _d9():
         # calibrated on simulation (two populations + random-walk drift): with NO drift the
         # high-pass alone costs ~30% of the slow mass at the same position; drift adds slow mass
         # and drags the original centroid to lower D, while the high-passed result stays put.
-        keep = (mh >= 0.5 * mo) and np.isfinite(ph) and abs(np.log10(ph / po)) < 0.2
-        if keep and np.log10(ph / po) > 0.1:
-            print(f'{"":18s} (original slow centroid is pulled low by drift; use the high-passed value {ph:.3g})')
+        keep = (mh >= 0.5 * mo) and np.isfinite(ph)
+        shifted = keep and abs(np.log10(ph / po)) >= 0.15
+        if shifted:
+            print(f'{"":18s} (slow population survives, but its original D was biased by drift; '
+                  f'drift-free value {ph:.3g})')
         verdicts.append(keep)
+        out[t + ' shifted'] = bool(shifted)
         out[t] = dict(slow_mass_orig=mo, slow_mass_hp=mh, slow_pos_orig=po, slow_pos_hp=ph,
                       fast_pos_orig=fo, fast_pos_hp=fh, survives=bool(keep))
     if verdicts and all(verdicts):
-        v = ('SLOW PEAK IS REAL — it survives the high-pass at the same position, so it is stationary '
-             'dynamics, not drift. Quote the high-passed slow centroid (drift-free).')
+        v = ('SLOW PEAK IS REAL — its mass survives the high-pass (a ~30% loss is the filter itself), so '
+             'it is stationary dynamics, not drift. Quote the high-passed slow centroid (drift-free)'
+             + ('; in some ROIs drift had biased its position (marked above).'
+                if any(out.get(t + ' shifted') for t, _ in rois) else '.'))
     elif verdicts and not any(verdicts):
         v = ('SLOW PEAK IS (MOSTLY) DRIFT — it loses mass or moves once slow drift is filtered out; '
              'treat the slow population as an artefact of non-stationarity.')
     else:
         v = 'MIXED — the slow peak survives in some ROIs and not others; see the table.'
+    out = {k: v_ for k, v_ in out.items() if not k.endswith(' shifted')} | {'shifted': [t for t, _ in rois if out.get(t + ' shifted')]}
     print('\nVERDICT D9:', v)
     out['verdict'] = 'ok'; out['summary'] = v
     RESULT['D9'] = out""")

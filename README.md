@@ -21,6 +21,18 @@ G(τ) = A / (1 + γ · τ^α)
 - `data/condensation_mask.tif` — nucleus/condensation mask used by the deliverable.
 - `papers/PMC11196589.pdf` — background reference paper.
 
+## iPSF kernel → P(D) (work in progress)
+
+- `utils/ipsf_kernel.py` — builds the CONTIN kernel K[τ, D] from a simulated iPSF
+  (power spectrum of iPSF ⊗ pixel box, finite-T bias forward-modelled) and inverts an
+  ROI-averaged G(τ) into a diffusion-coefficient distribution P(D). Numpy only.
+- `scripts/validate_ipsf_kernel.py` — checks the kernel against brute-force Brownian
+  simulation and runs single-D / two-population recovery tests.
+- `scripts/export_ipsf_stack.py` + `datasets/xyt_dataset_generator.py` — the vector iPSF
+  simulator (restored from `legacy/deep-learning-stics`) and an exporter for the kernel.
+  Needs torch.
+- Write-up (Chinese): `docs/ipsf_kernel.md`.
+
 ## History note
 
 This branch was split off from the project's earlier deep-learning line (a

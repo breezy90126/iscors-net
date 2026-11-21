@@ -357,6 +357,7 @@ except Exception: pass
 
 nuc = nuc0 & np.isfinite(gamma)
 CACHE.update(C0=C0, C0_1=C0_1, C0_2=C0_2)
+CACHE.update(g1d=g1d, g2d=g2d)
 CACHE.update(gamma=gamma, dens=dens, G=G, alpha_full=a_full,
              g1g=g1g, g2g=g2g, G1=G1, G2=G2, alpha_h1=a_h1, alpha_h2=a_h2,
              nuc=nuc)
@@ -839,8 +840,10 @@ code(r"""# ══ D6 — P(D) with the iPSF kernel, on GEVD-filtered pixels (doc
 #    * a multi-peak claim needs (a) residual within ~2x the half-split noise and (b) the same
 #      interior peaks at every lambda. Half-split agreement alone is not enough: a systematic
 #      (finite-T bias, drift - see D4) is identical in both halves.
-@guard('D6')
-def _d6():
+def _d6_kernel():
+    ~~~iPSF spectrum + finite-T kernels for full and half records (cached).~~~
+    if 'd6_kern' in CACHE:
+        return CACHE['d6_kern']
     assert FRAME_RATE_HZ, 'D6 needs FRAME_RATE_HZ to put D in physical units'
     dt = 1.0 / FRAME_RATE_HZ
     px = CAM_PIXEL_NM * 1e-9
@@ -856,13 +859,84 @@ def _d6():
     print(f'iPSF source: {src}')
     print(f'effective q = {np.sqrt(q2e)*1e-6:.2f} rad/um  (1/q = {1e9/np.sqrt(q2e):.0f} nm)'
           '  <- the absolute D scale goes as 1/q^2: a 2x error in q is 4x in D')
-
     T, h = CACHE['T'], CACHE['T'] // 2
     D_grid = ik.d_grid(RECON_TAUS, dt, q2e, n=80, pad=10.0)
     K_full, _ = ik.ipsf_kernel(RECON_TAUS, dt, q2, S, D=D_grid, T=T)
     K_half, _ = ik.ipsf_kernel(RECON_TAUS, dt, q2, S, D=D_grid, T=h)
     D_um = D_grid * 1e12
     print(f'resolvable window: D ~ {D_um[3]:.3g} .. {D_um[-4]:.3g} um^2/s')
+    CACHE['d6_kern'] = (K_full, K_half, D_um)
+    return CACHE['d6_kern']
+
+
+def _pd_groups(groups, title):
+    ~~~CONTIN P(D) for each (tag, mask) ROI; prints verdicts, plots one panel per ROI.~~~
+    K_full, K_half, D_um = _d6_kernel()
+    G, G1, G2 = CACHE['G'], CACHE['G1'], CACHE['G2']
+    out = {}
+    fig, axs = plt.subplots(1, len(groups), figsize=(4.2 * len(groups), 3.4), sharey=True)
+    axs = np.atleast_1d(axs)
+    for (tag, m), axp in zip(groups, axs):
+        g, n_px = ik.roi_curve(G, CACHE['C0'], m)
+        g1, _ = ik.roi_curve(G1, CACHE['C0_1'], m)
+        g2, _ = ik.roi_curve(G2, CACHE['C0_2'], m)
+        if n_px < 50:
+            print(f'{tag}: only {n_px} px, skipped'); axp.set_title(f'{tag}: {n_px} px, skipped', fontsize=9)
+            continue
+        noise = float(np.sqrt(((g1 - g2) ** 2).mean()) / 2.0)
+        D1, r1 = ik.best_single_d(g, K_full, D_um)
+        print(f'\n--- {tag} ({n_px} px) ---   G(1)={g[0]:.3f}  G(tau_max)={g[-1]:.3f}  noise {noise:.5f}')
+        print(f'  single-D reference: D = {D1:.3g} um^2/s, residual {r1:.5f}')
+        runs = []
+        for lam in D6_LAMBDAS:
+            p, nug = ik.invert_kernel(g, K_full, lam=lam, return_nugget=True)
+            p1 = ik.invert_kernel(g1, K_half, lam=lam); p2 = ik.invert_kernel(g2, K_half, lam=lam)
+            sm, s1, s2 = (ik.spectrum_summary(x, D_um) for x in (p, p1, p2))
+            resid = float(np.sqrt(((K_full @ p - g) ** 2).mean()))
+            runs.append(dict(lam=lam, p=p, nug=nug, s=sm, resid=resid,
+                             halves_same=len(s1['peak_D']) == len(s2['peak_D']) == len(sm['peak_D'])))
+            print(f'  lam={lam:.0e}: white-noise {nug:.2f} | slow-edge {sm["slow_edge_frac"]:.2f} | '
+                  f'fast-edge {sm["fast_edge_frac"]:.2f} | interior peaks {np.array2string(sm["peak_D"], precision=3)} '
+                  f'(mass {np.round(sm["peak_mass"], 2)}), centroid {sm["centroid_D"]:.3g} | resid {resid:.5f}')
+        n_pk = [len(r['s']['peak_D']) for r in runs]
+        stable = len(set(n_pk)) == 1 and all(
+            np.allclose(np.log10(r['s']['peak_D']), np.log10(runs[0]['s']['peak_D']), atol=0.15)
+            for r in runs) if n_pk[0] else False
+        best = min(runs, key=lambda r: r['resid'])
+        fits = best['resid'] <= 2 * noise
+        if not fits:
+            verdict = (f'NO model in this family fits to the noise (best resid {best["resid"]:.4f} vs '
+                       f'2x noise {2*noise:.4f}): systematics dominate -> trust only the interior '
+                       f'centroid ({best["s"]["centroid_D"]:.3g} um^2/s) as an order of magnitude')
+        elif n_pk[0] > 1 and stable and best['halves_same']:
+            verdict = f'{n_pk[0]} interior populations, stable across lambda and both halves'
+        elif n_pk[0] >= 1:
+            verdict = ('ONE broad interior distribution (peak splitting is regulariser-dependent)'
+                       if not stable else f'{n_pk[0]} interior peak(s), stable')
+        else:
+            verdict = 'no interior mass: dynamics outside the resolvable D window'
+        print(f'  VERDICT: {verdict}')
+        out[tag] = dict(n_px=n_px, noise=noise, D_single=D1, resid_single=r1, g=g.tolist(),
+                        runs=[dict(lam=r['lam'], white=r['nug'], slow_edge=r['s']['slow_edge_frac'],
+                                   fast_edge=r['s']['fast_edge_frac'], peaks=r['s']['peak_D'].tolist(),
+                                   peak_mass=r['s']['peak_mass'], centroid=r['s']['centroid_D'],
+                                   resid=r['resid']) for r in runs],
+                        p_best=best['p'].tolist(), lam_best=best['lam'],
+                        verdict=verdict)
+        for r, ls in zip(runs, ('-', '--', ':')):
+            axp.semilogx(D_um, r['p'] / max(r['p'].max(), 1e-30), ls, label=f'lam {r["lam"]:.0e}')
+        axp.axvspan(D_um[0], D_um[2], color='0.85'); axp.axvspan(D_um[-3], D_um[-1], color='0.85')
+        axp.axvline(0.92, color='gray', lw=0.8, ls=':')
+        axp.set_title(f'{tag} ({n_px} px)', fontsize=9); axp.set_xlabel('D [um^2/s]')
+    axs[0].set_ylabel('P(D) (norm.)'); axs[0].legend(fontsize=7)
+    plt.suptitle(title, fontsize=10)
+    plt.tight_layout(); plt.show()
+    return out
+
+
+@guard('D6')
+def _d6():
+    _d6_kernel()
 
     # ── 1) GEVD noise filter + clustering ──
     G, G1, G2 = CACHE['G'], CACHE['G1'], CACHE['G2']
@@ -908,62 +982,250 @@ def _d6():
     # ── 2) P(D) per group ──
     groups = [('filtered nucleus', good_map)] + [(f'group {k+1}', lab_map == k) for k in range(D6_N_CLUSTERS)]
     out = {'gevd_rel': lam_g.tolist(), 'n_axes_kept': int(len(keep)), 'n_px_kept': int(good.sum())}
-    fig, axs = plt.subplots(1, len(groups), figsize=(4.2 * len(groups), 3.4), sharey=True)
-    for (tag, m), axp in zip(groups, axs):
-        g, n_px = ik.roi_curve(G, CACHE['C0'], m)
-        g1, _ = ik.roi_curve(G1, CACHE['C0_1'], m)
-        g2, _ = ik.roi_curve(G2, CACHE['C0_2'], m)
-        if n_px < 50:
-            print(f'{tag}: only {n_px} px, skipped'); continue
-        noise = float(np.sqrt(((g1 - g2) ** 2).mean()) / 2.0)
-        D1, r1 = ik.best_single_d(g, K_full, D_um)
-        print(f'\n--- {tag} ({n_px} px) ---   G(1)={g[0]:.3f}  G(tau_max)={g[-1]:.3f}  noise {noise:.5f}')
-        print(f'  single-D reference: D = {D1:.3g} um^2/s, residual {r1:.5f}')
-        runs = []
-        for lam in D6_LAMBDAS:
-            p, nug = ik.invert_kernel(g, K_full, lam=lam, return_nugget=True)
-            p1 = ik.invert_kernel(g1, K_half, lam=lam); p2 = ik.invert_kernel(g2, K_half, lam=lam)
-            sm, s1, s2 = (ik.spectrum_summary(x, D_um) for x in (p, p1, p2))
-            resid = float(np.sqrt(((K_full @ p - g) ** 2).mean()))
-            runs.append(dict(lam=lam, p=p, nug=nug, s=sm, resid=resid,
-                             halves_same=len(s1['peak_D']) == len(s2['peak_D']) == len(sm['peak_D'])))
-            print(f'  lam={lam:.0e}: white-noise {nug:.2f} | slow-edge {sm["slow_edge_frac"]:.2f} | '
-                  f'fast-edge {sm["fast_edge_frac"]:.2f} | interior peaks {np.array2string(sm["peak_D"], precision=3)} '
-                  f'(mass {np.round(sm["peak_mass"], 2)}), centroid {sm["centroid_D"]:.3g} | resid {resid:.5f}')
-        n_pk = [len(r['s']['peak_D']) for r in runs]
-        stable = len(set(n_pk)) == 1 and all(
-            np.allclose(np.log10(r['s']['peak_D']), np.log10(runs[0]['s']['peak_D']), atol=0.15)
-            for r in runs) if n_pk[0] else False
-        best = min(runs, key=lambda r: r['resid'])
-        fits = best['resid'] <= 2 * noise
-        if not fits:
-            verdict = (f'NO model in this family fits to the noise (best resid {best["resid"]:.4f} vs '
-                       f'2x noise {2*noise:.4f}): systematics dominate -> trust only the interior '
-                       f'centroid ({best["s"]["centroid_D"]:.3g} um^2/s) as an order of magnitude')
-        elif n_pk[0] > 1 and stable and best['halves_same']:
-            verdict = f'{n_pk[0]} interior populations, stable across lambda and both halves'
-        elif n_pk[0] >= 1:
-            verdict = ('ONE broad interior distribution (peak splitting is regulariser-dependent)'
-                       if not stable else f'{n_pk[0]} interior peak(s), stable')
-        else:
-            verdict = 'no interior mass: dynamics outside the resolvable D window'
-        print(f'  VERDICT: {verdict}')
-        out[tag] = dict(n_px=n_px, noise=noise, D_single=D1, resid_single=r1,
-                        runs=[dict(lam=r['lam'], white=r['nug'], slow_edge=r['s']['slow_edge_frac'],
-                                   fast_edge=r['s']['fast_edge_frac'], peaks=r['s']['peak_D'].tolist(),
-                                   peak_mass=r['s']['peak_mass'], centroid=r['s']['centroid_D'],
-                                   resid=r['resid']) for r in runs],
-                        verdict=verdict)
-        for r, ls in zip(runs, ('-', '--', ':')):
-            axp.semilogx(D_um, r['p'] / max(r['p'].max(), 1e-30), ls, label=f'lam {r["lam"]:.0e}')
-        axp.axvspan(D_um[0], D_um[2], color='0.85'); axp.axvspan(D_um[-3], D_um[-1], color='0.85')
-        axp.axvline(0.92, color='gray', lw=0.8, ls=':')
-        axp.set_title(f'{tag} ({n_px} px)', fontsize=9); axp.set_xlabel('D [um^2/s]')
-    axs[0].set_ylabel('P(D) (norm.)'); axs[0].legend(fontsize=7)
-    plt.suptitle('P(D), iPSF kernel. grey = grid edges (not populations); dotted = paper D* 0.92', fontsize=10)
-    plt.tight_layout(); plt.show()
+    out.update(_pd_groups(groups, 'P(D), iPSF kernel. grey = grid edges (not populations); dotted = paper D* 0.92'))
+    CACHE['d6_good_map'] = good_map
     out['verdict'] = 'ok'
     RESULT['D6'] = out""")
+
+# ─────────────────────────────── cell 9c : D7 ──────────────────────────────
+code(r"""# ══ D7 — ICA-defined ROIs (puncta / large structures / background) -> P(D) + alpha/gamma ══
+# Rebuilds the deliverable's Section 3 ICA (cross-half GEVD on [G(tau), log CV2] -> de-ramp
+# axis 2 -> FastICA, sparse 'condensate' component first, nucleoli forced negative), then
+# cuts ROIs out of ONE component:
+#   puncta            : connected blobs above the threshold with area < PUNCTA_MAX_PX
+#   large structure k : the N_LARGE biggest blobs above the threshold (e.g. the two half-ellipses)
+#   background        : the rest of the nucleus, minus nucleoli and a 2-px guard band around ROIs
+# Check the overlay figure FIRST: if the half-ellipses are on the other component or the other
+# sign, change ICA_ROI_COMP / ICA_ROI_SIGN and re-run only this cell (no reload needed).
+# Or draw your own: ICA_ROI_NPY = path to an int label map (H, W): 0 = none, 1..n = ROIs.
+ICA_ROI_COMP  = 'condensate'   # 'condensate' (sparse comp) or 'other'
+ICA_ROI_SIGN  = +1             # +1: positive tail, -1: negative tail
+ICA_ROI_Z     = 2.0            # threshold in nucleus z-score
+PUNCTA_MAX_PX = 60             # blobs smaller than this are 'puncta' (binned px)
+N_LARGE       = 2              # largest blobs kept as separate ROIs
+ICA_ROI_NPY   = None
+
+from scipy.ndimage import label as _cc_label, binary_dilation
+from scipy.stats import kurtosis as _kurt
+
+@guard('D7')
+def _d7():
+    from sklearn.decomposition import FastICA
+    nuc = CACHE['nuc']
+    G, G1, G2 = CACHE['G'], CACHE['G1'], CACHE['G2']
+    _lg = lambda a: np.log10(np.clip(a, 1e-12, None))
+    if 'g1d' not in CACHE:      # session from an older notebook: no half-record CV2 maps
+        print('note: half-record CV2 maps not cached -> using the full-record CV2 for both halves')
+    Y = _lg(CACHE['dens'])
+    Y1, Y2 = _lg(CACHE.get('g1d', CACHE['dens'])), _lg(CACHE.get('g2d', CACHE['dens']))
+    m = nuc & np.isfinite(G).all(-1) & np.isfinite(G1).all(-1) & np.isfinite(G2).all(-1) \
+        & np.isfinite(Y) & np.isfinite(Y1) & np.isfinite(Y2)
+    feat = lambda g, yl: np.concatenate([g.astype(np.float64), yl[..., None].astype(np.float64)], -1)
+    F1, F2, Ff = feat(G1, Y1)[m], feat(G2, Y2)[m], feat(G, Y)[m]
+    mu = (F1.mean(0) + F2.mean(0)) / 2; sd = (F1.std(0) + F2.std(0)) / 2 + 1e-9
+    a1, a2, af = (F1 - mu) / sd, (F2 - mu) / sd, (Ff - mu) / sd
+    Cg = (a1.T @ a2) / len(a1); Cg = (Cg + Cg.T) / 2
+    Ct = np.cov(np.vstack([a1, a2]).T)
+    ev, U = np.linalg.eigh(Ct); Wh = U / np.sqrt(np.clip(ev, 1e-12, None))
+    lg_, V = np.linalg.eigh(Wh.T @ Cg @ Wh); o = np.argsort(lg_)[::-1]
+    pj = af @ (Wh @ V)[:, o][:, :2]
+    nucleoli_v = Y[m] < np.percentile(Y[m], 12)
+    for k in range(2):
+        if pj[nucleoli_v, k].mean() > pj[~nucleoli_v, k].mean(): pj[:, k] = -pj[:, k]
+    yy, xx = np.mgrid[0:nuc.shape[0], 0:nuc.shape[1]]
+    xa = (xx[m] - xx[m].mean()) / xx[m].std(); ya = (yy[m] - yy[m].mean()) / yy[m].std()
+    Dr = np.vstack([xa, ya, np.ones_like(xa)]).T
+    ax2 = pj[:, 1] - Dr @ np.linalg.lstsq(Dr, pj[:, 1], rcond=None)[0]
+    Sx = FastICA(2, random_state=0, whiten='unit-variance', max_iter=1000).fit_transform(
+        np.stack([pj[:, 0], ax2], 1))
+    Sx = Sx[:, np.argsort([-abs(_kurt(Sx[:, 0])), -abs(_kurt(Sx[:, 1]))])]
+    comps = {}
+    for name, v in (('condensate', Sx[:, 0].copy()), ('other', Sx[:, 1].copy())):
+        if v[nucleoli_v].mean() > v[~nucleoli_v].mean(): v = -v
+        z = (v - v.mean()) / (v.std() + 1e-12)
+        full = np.full(nuc.shape, np.nan); full[m] = z; comps[name] = full
+    CACHE['ica_comps'] = comps
+
+    nucleoli = np.zeros_like(nuc); nucleoli[m] = nucleoli_v
+    if ICA_ROI_NPY:
+        lab = np.load(ICA_ROI_NPY).astype(int)
+        rois = [(f'ROI {k}', (lab == k) & m) for k in range(1, lab.max() + 1)]
+        src = f'user label map {ICA_ROI_NPY}'
+    else:
+        zc = comps[ICA_ROI_COMP] * ICA_ROI_SIGN
+        hot = m & (np.nan_to_num(zc, nan=-np.inf) > ICA_ROI_Z)
+        cc, n_cc = _cc_label(hot)
+        sizes = np.bincount(cc.ravel())[1:] if n_cc else np.array([], int)
+        order = np.argsort(sizes)[::-1]
+        large = [i + 1 for i in order if sizes[i] >= PUNCTA_MAX_PX][:N_LARGE]
+        small = [i + 1 for i in range(n_cc) if sizes[i] < PUNCTA_MAX_PX]
+        rois = [('puncta', np.isin(cc, small))]
+        rois += [(f'large structure {k+1}', cc == i) for k, i in enumerate(large)]
+        rest_large = [i + 1 for i in order if sizes[i] >= PUNCTA_MAX_PX and (i + 1) not in large]
+        if rest_large: rois.append(('other large blobs', np.isin(cc, rest_large)))
+        src = (f'ICA {ICA_ROI_COMP}, sign {ICA_ROI_SIGN:+d}, z > {ICA_ROI_Z}: {n_cc} blobs '
+               f'({len(small)} puncta < {PUNCTA_MAX_PX} px, sizes of largest: {sorted(sizes, reverse=True)[:5]})')
+    any_roi = np.zeros_like(nuc)
+    for _, r in rois: any_roi |= r
+    bg = m & ~nucleoli & ~binary_dilation(any_roi, iterations=2)
+    rois += [('nucleoli', nucleoli & ~any_roi), ('background', bg)]
+    CACHE['d7_rois'] = rois
+    print('ROIs from', src)
+
+    # overlay: both components + the ROI label map
+    lab_map = np.full(nuc.shape, np.nan)
+    for k, (_, r) in enumerate(rois): lab_map[r] = k
+    fig, ax = plt.subplots(1, 3, figsize=(14, 4.4))
+    for a, name in zip(ax[:2], ('condensate', 'other')):
+        im = a.imshow(comps[name], cmap='coolwarm', vmin=-3, vmax=3); plt.colorbar(im, ax=a, fraction=0.046)
+        for k, (_, r) in enumerate(rois[:-2]):
+            a.contour(r, levels=[0.5], colors=[f'C{k}'], linewidths=0.8)
+        a.set_title(f'ICA {name} (z)' + ('  <- ROI source' if name == ICA_ROI_COMP and not ICA_ROI_NPY else ''),
+                    fontsize=9); a.axis('off')
+    im = ax[2].imshow(lab_map, cmap='tab10', vmin=0, vmax=9, interpolation='nearest')
+    ax[2].set_title('ROIs: ' + ', '.join(f'{k}={t}' for k, (t, _) in enumerate(rois)), fontsize=7)
+    ax[2].axis('off'); plt.tight_layout(); plt.show()
+    try: np.save(os.path.join(_out_dir(), 'd7_roi_labels.npy'), np.nan_to_num(lab_map, nan=-1).astype(int))
+    except Exception as e: print('could not save ROI map:', e)
+
+    # alpha / gamma per ROI: c0-weighted ROI curve, naive vs finite-T corrected (utils/finite_t.py)
+    T = CACHE['T']; taus = np.asarray(RECON_TAUS)
+    rows, curves = [], []
+    for tag, r in rois:
+        g, n_px = ik.roi_curve(G, CACHE['C0'], r)
+        if n_px < 20: continue
+        curves.append((tag, g)); rows.append((tag, n_px, r))
+    out = {'source': src}
+    if curves:
+        fitc = ft.debias(np.array([c for _, c in curves]), taus, T, global_alpha=False)
+        print(f'\n{"ROI":22s} {"px":>6s} {"gamma_pix(med)":>14s} {"alpha":>6s} {"gamma":>8s} '
+              f'{"alpha_ft":>8s} {"gamma_ft":>8s} {"white(1-A)":>10s}')
+        for i, (tag, n_px, r) in enumerate(rows):
+            gp = float(np.nanmedian(CACHE['gamma'][r]))
+            print(f'{tag:22s} {n_px:6d} {gp:14.4f} {fitc["alpha_raw"][i]:6.2f} {fitc["gamma_raw"][i]:8.4f} '
+                  f'{fitc["alpha"][i]:8.2f} {fitc["gamma"][i]:8.4f} {1-fitc["A"][i]:10.2f}')
+            out[tag] = dict(n_px=n_px, gamma_pix_median=gp,
+                            alpha_naive=float(fitc['alpha_raw'][i]), gamma_naive=float(fitc['gamma_raw'][i]),
+                            alpha_ft=float(fitc['alpha'][i]), gamma_ft=float(fitc['gamma'][i]),
+                            white=float(1 - fitc['A'][i]))
+        print('  alpha/gamma are per-ROI fits of A/(1+gamma tau^alpha) [gamma in 1/frame^alpha];'
+              ' *_ft = finite-T corrected. Compare ROIs on the *_ft columns.')
+        plt.figure(figsize=(6, 3.8))
+        for tag, g in curves: plt.semilogx(taus, g, 'o-', ms=3, label=tag)
+        plt.xlabel('tau [frames]'); plt.ylabel('G (c0-weighted ROI mean)'); plt.legend(fontsize=7)
+        plt.title('ROI curves', fontsize=10); plt.tight_layout(); plt.show()
+
+    # P(D) per ROI (same CONTIN as D6, same verdict rules)
+    pd_out = _pd_groups([(t, r) for t, r in rois],
+                        'D7: P(D) per ICA ROI. grey = grid edges; dotted = paper D* 0.92')
+    for tag, v in pd_out.items():
+        out.setdefault(tag, {}).update(v)
+    out['verdict'] = 'ok'
+    RESULT['D7'] = out""")
+
+# ─────────────────────────────── cell 9d : D8 ──────────────────────────────
+code(r"""# ══ D8 — fast / slow populations in space: per-pixel 2-population map ══
+# Each pixel's G(tau>=1) is fitted as  a_f K(tau; D_fast) + a_s K(tau; D_slow)  with the SAME
+# finite-T iPSF kernel columns as D6 (white noise only touches tau=0, so it drops out).
+# f_fast = a_f / (a_f + a_s) is the share of the fluctuating signal that is fast.
+#   * f map bimodal + spatially structured  -> two populations sit in different places
+#   * f unimodal around a middle value       -> both populations coexist inside every pixel
+# D_fast / D_slow default to the two largest interior peaks of the D6 'filtered nucleus'
+# spectrum; set them by hand to override. Per-pixel noise is large, so G is lightly smoothed
+# in space first (TWOPOP_SMOOTH_PX, 0 = off) -- the map is a picture, not a per-pixel claim.
+D_FAST_UM = None          # um^2/s, None = from D6
+D_SLOW_UM = None
+TWOPOP_SMOOTH_PX = 1.0
+
+@guard('D8')
+def _d8():
+    K_full, K_half, D_um = _d6_kernel()
+    d6 = (RESULT.get('D6') or {}).get('filtered nucleus') or {}
+    Df, Ds = D_FAST_UM, D_SLOW_UM
+    if (Df is None or Ds is None) and d6:
+        run = min(d6['runs'], key=lambda r: r['resid'])
+        pk = sorted(zip(run['peak_mass'], run['peaks']), reverse=True)[:2]
+        if len(pk) == 2:
+            Ds_, Df_ = sorted(p for _, p in pk)
+            Df = Df if Df is not None else Df_; Ds = Ds if Ds is not None else Ds_
+    assert Df is not None and Ds is not None, 'set D_FAST_UM / D_SLOW_UM (D6 found < 2 peaks)'
+    jf, js = int(np.argmin(abs(np.log(D_um / Df)))), int(np.argmin(abs(np.log(D_um / Ds))))
+    kf, ks = K_full[:, jf], K_full[:, js]
+    print(f'D_fast = {D_um[jf]:.3g} um^2/s, D_slow = {D_um[js]:.3g} um^2/s  '
+          f'(ratio {D_um[jf]/D_um[js]:.0f}x; absolute values scale with the iPSF q, the ratio does not)')
+
+    nuc = CACHE['nuc'] & np.isfinite(CACHE['G']).all(-1)
+    G = CACHE['G'].astype(np.float64).copy()
+    if TWOPOP_SMOOTH_PX:
+        w = gaussian_filter(nuc.astype(float), TWOPOP_SMOOTH_PX)
+        for k in range(G.shape[-1]):
+            G[..., k] = gaussian_filter(np.where(nuc, G[..., k], 0.0), TWOPOP_SMOOTH_PX) / np.maximum(w, 1e-6)
+    g = G[nuc]                                                    # (N, K)
+    # 2x2 non-negative least squares, closed form with clipping
+    M = np.array([[kf @ kf, kf @ ks], [kf @ ks, ks @ ks]]); b = np.stack([g @ kf, g @ ks], 1)
+    a = np.linalg.solve(M, b.T).T
+    neg_f, neg_s = a[:, 0] < 0, a[:, 1] < 0
+    a[neg_f, 0] = 0; a[neg_f, 1] = np.clip(g[neg_f] @ ks / (ks @ ks), 0, None)
+    a[neg_s, 1] = 0; a[neg_s, 0] = np.clip(g[neg_s] @ kf / (kf @ kf), 0, None)
+    tot = a.sum(1)
+    f = np.where(tot > 0, a[:, 0] / np.maximum(tot, 1e-12), np.nan)
+    resid = np.sqrt(((g - a[:, :1] * kf - a[:, 1:] * ks) ** 2).mean(1))
+    fmap = np.full(nuc.shape, np.nan); fmap[nuc] = f
+    amap = np.full(nuc.shape, np.nan); amap[nuc] = tot
+    CACHE['f_fast'] = fmap
+
+    rois = CACHE.get('d7_rois') or []
+    fig, ax = plt.subplots(1, 3, figsize=(15, 4.4))
+    im = ax[0].imshow(fmap, cmap='coolwarm', vmin=0, vmax=1)
+    plt.colorbar(im, ax=ax[0], fraction=0.046, label='fast fraction f')
+    for k, (t, r) in enumerate(rois[:-2]):
+        ax[0].contour(r, levels=[0.5], colors='k', linewidths=0.6)
+    ax[0].set_title(f'fast share  (red = D~{D_um[jf]:.2g}, blue = D~{D_um[js]:.2g} um^2/s)', fontsize=9)
+    ax[0].axis('off')
+    ax[1].hist(f[np.isfinite(f)], bins=50, color='0.4')
+    for k, (t, r) in enumerate(rois):
+        v = fmap[r & nuc]; v = v[np.isfinite(v)]
+        if v.size: ax[1].axvline(np.median(v), color=f'C{k}', lw=1.5, label=f'{t}: {np.median(v):.2f}')
+    ax[1].set_xlabel('fast fraction f'); ax[1].set_ylabel('pixels'); ax[1].legend(fontsize=7)
+    ax[1].set_title('distribution (lines = ROI medians)', fontsize=9)
+    d7 = RESULT.get('D7') or {}
+    for k, (t, r) in enumerate(rois):
+        if t in d7 and 'p_best' in d7[t]:
+            pb = np.asarray(d7[t]['p_best'])
+            ax[2].semilogx(D_um, pb / max(pb.max(), 1e-30), color=f'C{k}', label=t)
+    if not any(t in d7 and 'p_best' in d7[t] for t, _ in rois) and 'p_best' in d6:
+        pb = np.asarray(d6['p_best']); ax[2].semilogx(D_um, pb / pb.max(), 'k', label='filtered nucleus')
+    for Dv in (D_um[jf], D_um[js]): ax[2].axvline(Dv, color='k', ls='--', lw=0.8)
+    ax[2].axvspan(D_um[0], D_um[2], color='0.85'); ax[2].axvspan(D_um[-3], D_um[-1], color='0.85')
+    ax[2].set_xlabel('D [um^2/s]'); ax[2].set_ylabel('P(D) (norm.)'); ax[2].legend(fontsize=7)
+    ax[2].set_title('P(D) per ROI (D7); dashed = D_fast / D_slow', fontsize=9)
+    plt.tight_layout(); plt.show()
+
+    fv = f[np.isfinite(f)]
+    hist, edges = np.histogram(fv, bins=20, range=(0, 1))
+    sm = np.convolve(np.r_[hist[:2][::-1], hist, hist[-2:][::-1]], np.ones(5) / 5, 'valid')
+    pk = [i for i in range(len(sm)) if sm[i] >= 0.3 * sm.max()
+          and sm[i] >= sm[max(i - 1, 0)] and sm[i] >= sm[min(i + 1, len(sm) - 1)]]
+    # two peaks only count as separate modes if the dip between them is < 70% of the lower one
+    modes = pk[:1]
+    for i in pk[1:]:
+        if sm[modes[-1]:i + 1].min() < 0.7 * min(sm[modes[-1]], sm[i]): modes.append(i)
+        elif sm[i] > sm[modes[-1]]: modes[-1] = i
+    n_modes = len(modes)
+    print(f'fast fraction: median {np.median(fv):.2f}, IQR {np.percentile(fv,25):.2f}-{np.percentile(fv,75):.2f}, '
+          f'{n_modes} mode(s); per-pixel 2-pop residual median {np.median(resid):.4f}')
+    out = dict(D_fast=float(D_um[jf]), D_slow=float(D_um[js]), f_median=float(np.median(fv)),
+               f_iqr=[float(np.percentile(fv, 25)), float(np.percentile(fv, 75))], n_modes=n_modes)
+    for t, r in rois:
+        v = fmap[r & nuc]; v = v[np.isfinite(v)]
+        if v.size:
+            out[t] = float(np.median(v)); print(f'  {t:22s} median f = {np.median(v):.2f}  ({v.size} px)')
+    print('VERDICT D8:', 'fast and slow populations are SPATIALLY SEPARATED (bimodal f)' if n_modes >= 2
+          else 'fast and slow populations COEXIST within pixels (unimodal f); compare ROI medians for where each dominates')
+    try: np.save(os.path.join(_out_dir(), 'd8_fast_fraction.npy'), fmap)
+    except Exception as e: print('could not save f map:', e)
+    out['verdict'] = 'ok'
+    RESULT['D8'] = out""")
 
 # ─────────────────────────────── cell 10 ───────────────────────────────────
 code(r"""# ══ scorecard: measured outcome vs the predictions registered in cell 0 ══
@@ -1012,10 +1274,10 @@ print('=' * 96)
 hit = sum(1 for _, ok, _ in rows if ok)
 print(f'  {hit}/{len(rows)} predictions held.')
 print('  Surprises are the useful rows — they are where the model of the experiment was wrong.')
-d6 = RESULT.get('D6') or {}
-for tag, v in d6.items():
-    if isinstance(v, dict) and 'verdict' in v:
-        print(f'  D6 {tag:18s}: {v["verdict"]}')
+for dk in ('D6', 'D7'):
+    for tag, v in (RESULT.get(dk) or {}).items():
+        if isinstance(v, dict) and 'verdict' in v:
+            print(f'  {dk} {tag:18s}: {v["verdict"]}')
 
 # what to do next, driven by what actually came back
 print('\nNEXT STEP:')

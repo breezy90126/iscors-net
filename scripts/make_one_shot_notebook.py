@@ -100,9 +100,8 @@ print('imports ok')""")
 
 # ─────────────────────────────── cell 2 ────────────────────────────────────
 code(r"""# ── config (EDIT paths + the acquisition block) ──
-# Data: the representative-nucleus iSCORS movie + Output_iSCORS_map.mat from the paper's
-# Zenodo record (Hsiao et al., Commun. Biol. 7:763, 2024): https://zenodo.org/records/11182995
-# Download it to Drive and point ZIP_PATH at the zip (or straight at the .tif).
+# Data: the paper's Zenodo record (Hsiao et al., Commun. Biol. 7:763, 2024),
+# iSCORS_map_analysis.zip - the next cell downloads it if it is not on Drive yet.
 ZIP_PATH    = '/content/drive/MyDrive/iscors_test/large_file.zip'   # .zip or a .tif
 VIDEO_FNAME = 'COBRI_rarw_video.tif'
 EXTRACT_DIR = '/content/real_data'
@@ -135,55 +134,42 @@ print(f'config ready.  q_z = {Q_Z:.1f} rad/um  ->  one fringe every '
 print('frame rate:', FRAME_RATE_HZ or '(unset -> cycles/frame)')""")
 
 # ─────────────────────────────── cell 2b : data download ───────────────────
-code(r"""# ── data download (skip if ZIP_PATH already exists on Drive) ──
-# Reads the paper's Zenodo record page (the "SI" link), downloads straight into Colab
-# (fast), then copies to Drive so later runs skip this cell. Only files whose names
-# match DOWNLOAD_PATTERN are fetched; the list of everything in the record is printed.
-import json, re, shutil, urllib.request
-ZENODO_RECORD    = '11182995'                      # https://zenodo.org/records/11182995
-DOWNLOAD_PATTERN = r'\.(zip|tif|tiff|mat)$'        # what to fetch
-DRIVE_DATA_DIR   = os.path.dirname(ZIP_PATH)       # where the copy lands on Drive
-LOCAL_DL_DIR     = '/content/zenodo_dl'
+code(r"""# ── data download (skip if the zip is already on Drive) ──
+# Direct link to the paper's Zenodo data (Hsiao et al. 2024, record 11182995).
+# Downloads straight into Colab (fast), then copies to Drive so later runs skip this.
+import shutil
+DATA_URL       = 'https://zenodo.org/records/11182995/files/iSCORS_map_analysis.zip?download=1'
+DRIVE_DATA_DIR = '/content/drive/MyDrive/iscors_test'
+DRIVE_ZIP      = os.path.join(DRIVE_DATA_DIR, 'iSCORS_map_analysis.zip')
+LOCAL_ZIP      = '/content/iSCORS_map_analysis.zip'
 
-def _zenodo_files(rec):
-    ~~~[(name, url, size)] from the REST API, falling back to scraping the HTML page.~~~
-    try:
-        with urllib.request.urlopen(f'https://zenodo.org/api/records/{rec}', timeout=60) as r:
-            d = json.load(r)
-        return [(f['key'], f['links'].get('content') or f['links']['self'], f.get('size', 0))
-                for f in d.get('files', [])]
-    except Exception as e:
-        print('API failed, scraping the record page instead:', e)
-        with urllib.request.urlopen(f'https://zenodo.org/records/{rec}', timeout=60) as r:
-            html = r.read().decode('utf-8', 'ignore')
-        links = sorted(set(re.findall(rf'/records/{rec}/files/([^"?]+)', html)))
-        return [(urllib.request.unquote(n), f'https://zenodo.org/records/{rec}/files/{n}?download=1', 0)
-                for n in links]
-
-if os.path.exists(ZIP_PATH):
-    print(f'{ZIP_PATH} already on Drive - nothing to download')
+if os.path.exists(DRIVE_ZIP):
+    print('already on Drive:', DRIVE_ZIP)
+    ZIP_PATH = DRIVE_ZIP
+elif os.path.exists(ZIP_PATH):
+    print('using existing ZIP_PATH:', ZIP_PATH)
 else:
-    files = _zenodo_files(ZENODO_RECORD)
-    print('record files:'); [print(f'  {n}  ({sz/1e9:.2f} GB)') for n, _, sz in files]
-    os.makedirs(LOCAL_DL_DIR, exist_ok=True); os.makedirs(DRIVE_DATA_DIR, exist_ok=True)
-    got = []
-    for name, url, sz in files:
-        if not re.search(DOWNLOAD_PATTERN, name, re.I):
-            continue
-        local = os.path.join(LOCAL_DL_DIR, os.path.basename(name))
-        print(f'downloading {name} ...')
-        subprocess.run(['wget', '-q', '--show-progress', '-O', local, url], check=True)
-        shutil.copy(local, os.path.join(DRIVE_DATA_DIR, os.path.basename(name)))
-        got.append(local)
-    # point the loader at what came down: a zip if there is one, else the video tif
-    zips = [g for g in got if g.lower().endswith('.zip')]
-    tifs = [g for g in got if g.lower().endswith(('.tif', '.tiff'))]
-    if zips:
-        ZIP_PATH = zips[0]
-    elif tifs:
-        ZIP_PATH = next((t for t in tifs if os.path.basename(t) == VIDEO_FNAME), tifs[0])
-    print('ZIP_PATH ->', ZIP_PATH, '  (copies saved in', DRIVE_DATA_DIR, ')')
-    print('If the video inside has a different name, set VIDEO_FNAME before the load cell.')""")
+    if not os.path.exists(LOCAL_ZIP):
+        subprocess.run(['wget', '-q', '--show-progress', '-O', LOCAL_ZIP, DATA_URL], check=True)
+    os.makedirs(DRIVE_DATA_DIR, exist_ok=True)
+    shutil.copy(LOCAL_ZIP, DRIVE_ZIP); print('copied to Drive:', DRIVE_ZIP)
+    ZIP_PATH = LOCAL_ZIP                     # read the local copy this session (faster)
+
+# list what is inside, so VIDEO_FNAME can be checked before the long load
+with zipfile.ZipFile(ZIP_PATH) as z:
+    infos = sorted(z.infolist(), key=lambda x: -x.file_size)
+print('zip contents (largest first):')
+for x in infos[:15]:
+    print(f'  {x.file_size/1e9:7.2f} GB  {x.filename}')
+names = [os.path.basename(x.filename) for x in infos]
+if VIDEO_FNAME not in names:
+    tifs = [os.path.basename(x.filename) for x in infos if x.filename.lower().endswith(('.tif', '.tiff'))]
+    if tifs:
+        print(f'VIDEO_FNAME {VIDEO_FNAME!r} not in zip -> using the largest tif {tifs[0]!r}')
+        VIDEO_FNAME = tifs[0]
+    else:
+        print('!! no .tif in the zip - set VIDEO_FNAME / ZIP_PATH by hand')
+print('ZIP_PATH =', ZIP_PATH, '   VIDEO_FNAME =', VIDEO_FNAME)""")
 
 # ─────────────────────────────── cell 3 ────────────────────────────────────
 code(r"""# ── loaders (same full-load convention as iscors_deliverable.ipynb) + diagnostic helpers ──

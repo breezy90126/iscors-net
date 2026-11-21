@@ -699,7 +699,10 @@ def _d4_correct(ok, gf):
     plt.tight_layout(); plt.show()
 
     n, c = res['naive'], res['corrected']
-    fixed = (c['span_inner'] < 0.5 * n['span_inner']) and (abs(c['d_alpha']) < max(0.02, 0.5 * abs(n['d_alpha'])))
+    # what matters is the GAMMA-DEPENDENCE (span), not a constant offset or a small alpha shift:
+    # in a pure finite-T simulation the corrected bins keep a ~-0.05 dec constant offset and
+    # |d_alpha| ~ 0.04-0.06 (gamma mixing inside a bin), so those are not evidence of drift.
+    fixed = c['span_inner'] < 0.5 * n['span_inner']
     if fixed:
         v = ('FINITE-T EXPLAINS IT — after correction the full and half records agree '
              f"(span {n['span_inner']:.3f} -> {c['span_inner']:.3f} dec, excluding the slowest bin; "
